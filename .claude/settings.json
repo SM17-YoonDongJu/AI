@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__notion__notion-search",
+      "mcp__notion__notion-fetch",
+      "mcp__notion__notion-update-page"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo '{\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\",\"additionalContext\":\"[docs-notion-sync] 새 세션이 시작되었습니다. .claude/docs/의 시스템 아키텍처 문서를 Notion과 동기화해야 합니다(Notion→docs, Notion이 원천). docs-notion-sync 스킬을 실행해 각 문서 상단 Notion 링크에서 최신 내용을 가져와 로컬 문서를 갱신하세요. 변경 없으면 건너뛰고 결과를 간단히 보고하세요.\"}}'",
+            "statusMessage": "docs ↔ Notion 동기화 안내 주입"
+          }
+        ]
+      }
+    ]
+  }
+}

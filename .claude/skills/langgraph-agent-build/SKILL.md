@@ -1,0 +1,43 @@
+---
+name: langgraph-agent-build
+description: LLM 소비 컴포넌트를 구현할 때 사용. LangGraph 멀티에이전트 리포트 생성(05번, Kafka 워커)과 챗봇(12번, FastAPI WebSocket 직결·비스트리밍)을 다룬다. RAG·가드레일 공용 모듈과 ai_client(Ollama EXAONE)를 조립한다. LangGraph 그래프·멀티에이전트·리포트 생성·챗봇 WebSocket·세션 작업 시 사용.
+---
+
+# LangGraph / Agent Build
+
+RAG·가드레일·ai_client를 **조립**해 사용자 가치를 만드는 두 컴포넌트. 공용 모듈을 재구현하지 않고 `aicore-engineer`의 공개 API를 호출한다.
+
+## A. 리포트 생성 (05번) — Kafka 워커
+`src/report/` + `src/workers/report_worker.py`.
+
+- 진입: `report-job` Kafka 소비(`kafka-worker-patterns` 따름).
+- 파이프라인: **입력 가드레일 → LangGraph 멀티에이전트 생성(생성 가드레일 적용) → 출력 가드레일(LLM Judge 포함)**.
+- LLM은 `ai_client`(EXAONE, 별도 GPU 노드).
+- 결과: AI 리포트 초안 JSONB로 **영구 보존**(손해사정사 검수 근거).
+- **노션 05번이 미작성** — 그래프 노드 구성(에이전트 역할·엣지·상태)을 먼저 `_workspace/`에 설계해 확인받고 구현한다. 추측으로 구현하지 않는다.
+
+LangGraph 원칙:
+- 상태(State)를 명시적 타입으로 정의. 노드는 단일 책임.
+- 노드 실패는 1회 재시도 후 부분 결과 + 실패 섹션 표기로 진행(전체 실패 회피).
+- 각 사실 주장에 인용을 달도록 생성 가드레일과 맞물린다.
+
+## B. 챗봇 (12번) — FastAPI WebSocket 직결, 비스트리밍
+`src/chatbot/`(순수 로직) + `src/api/chatbot_app.py`(FastAPI·WS·세션).
+
+- ALB(/ws/chat)를 통해 FastAPI가 **WebSocket 직접 수락**. on-connect **JWT(RS256) 스테이트리스 검증**. 동일 session_id 중복 연결 시 기존 해제.
+- **Redis**로 다중 Pod 세션 상태·멀티턴 컨텍스트(이전 N턴 요약) 공유, 24h 만료.
+- 처리 순서: 입력 가드레일 → RAG 검색(멀티턴 컨텍스트 구성) → `ai_client`(EXAONE) **완성 응답 생성** → 출력 가드레일.
+- **비스트리밍**: 완성 응답을 `ChatServerMessage(type="message", citations=...)`로 **1회 전달**. 토큰 청크·`stream`/`done` 신호를 만들지 않는다.
+- 세션 생성·종료는 REST, 대화 이력 PG 저장(90일, 윈도우 초과 시 오래된 턴 요약·압축).
+
+구현 원칙:
+- WebSocket·세션·JWT는 `chatbot_app.py`, 순수 처리(가드레일·RAG·LLM 조립)는 `src/chatbot/`에 분리 — 로직 단위 테스트를 위해.
+- 멀티 Pod 가정: 세션 상태를 인메모리에 두지 않는다(Redis 공유). 재연결이 다른 Pod로 가도 컨텍스트 복구.
+- LLM/RAG 실패 시 안전 폴백 메시지 + 고지문 반환, 연결 유지.
+
+## 검증
+- 리포트: 그래프 end-to-end, 가드레일 3단계 적용, 인용 검증 동작.
+- 챗봇: WS 연결·JWT 거부·중복연결 해제, Redis 세션 복구, 완성 응답 1회 전달(스트리밍 없음 확인), 가드레일 적용.
+
+## 산출물
+`src/report/*`, `src/chatbot/*`, `src/workers/report_worker.py`, `src/api/chatbot_app.py` + 테스트. 요약을 `_workspace/03_agent.md`에 기록.
