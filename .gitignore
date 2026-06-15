@@ -1,0 +1,40 @@
+# ─── Python ───────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+wheels/
+
+# 가상환경 (uv)
+.venv/
+venv/
+env/
+
+# 툴링 캐시
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# ─── 환경변수 / 시크릿 ─────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ─── OS / IDE ─────────────────────────────────────────────
+.DS_Store
+.idea/
+*.iml
+
+# ─── Claude Code ──────────────────────────────────────────
+# .claude는 커밋한다(agents·skills·docs·CODE_CONVENTIONS·settings.json).
+# 개인용 로컬 설정만 제외한다.
+.claude/settings.local.json
+
+# 하네스 중간 산출물(감사용 로컬 보관, 커밋 불필요)
+_workspace/
+_workspace_prev/
