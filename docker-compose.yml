@@ -1,0 +1,43 @@
+#
+# 배포(prod)는 docker-compose로 앱 서비스를 띄우되, 다음은 AWS 관리형을 사용한다:
+#   - Kafka     → AWS MSK
+#   - Redis     → AWS ElastiCache
+
+services:
+
+  # Kafka — redpanda 경량 단일 노드 (prod은 AWS MSK)
+  redpanda:
+    image: redpandadata/redpanda:latest
+    command:
+      - redpanda
+      - start
+      - --smp=1
+      - --overprovisioned
+      - --kafka-addr=PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr=PLAINTEXT://localhost:9092
+    ports:
+      - "9092:9092"
+    volumes:
+      - redpanda:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # Redis — 세션·컨텍스트 캐시 (prod은 ElastiCache)
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  redpanda:
+  redisdata:

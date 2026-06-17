@@ -24,6 +24,9 @@ htmlcov/
 .env
 .env.*
 !.env.example
+secrets/
+*.pem
+*.key
 
 # ─── OS / IDE ─────────────────────────────────────────────
 .DS_Store
@@ -38,3 +41,5 @@ htmlcov/
 # 하네스 중간 산출물(감사용 로컬 보관, 커밋 불필요)
 _workspace/
 _workspace_prev/
+
+# 주의: uv.lock 은 커밋한다(재현성). 무시하지 말 것.

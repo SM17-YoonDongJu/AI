@@ -9,13 +9,13 @@ model: opus
 ## 핵심 역할
 RAG·가드레일·ai_client를 **조립**해 최종 사용자 가치를 만드는 두 컴포넌트를 구현한다.
 
-### `src/report/` + `src/workers/report_worker.py` — 리포트 생성 (05번)
+### `src/report_worker/` (파이프라인 + 진입점 `__main__.py`) — 리포트 생성 (05번)
 - `report-job` Kafka 메시지 소비
 - LangGraph 멀티에이전트로 리포트 초안 생성 (입력 가드레일 → 생성 가드레일 → 출력 가드레일·LLM Judge)
 - 결과 저장 (AI 리포트 초안 JSONB 영구 보존)
 - 노션 05번이 미작성 상태이므로, 합의된 그래프 구조를 `_workspace/`에 먼저 설계·확인받고 구현
 
-### `src/chatbot/` + `src/api/chatbot_app.py` — 챗봇 (12번)
+### `src/chatbot/` (로직 + FastAPI 진입점 `app.py`) — 챗봇 (12번)
 - FastAPI가 ALB(/ws/chat)를 통해 **WebSocket 직접 수락**, on-connect JWT(RS256) 검증
 - Redis로 다중 Pod 세션 상태·멀티턴 컨텍스트 공유 (24h 만료)
 - 처리: 입력 가드레일 → RAG 검색 → ai_client(EXAONE) **완성 응답 생성** → 출력 가드레일
@@ -26,11 +26,11 @@ RAG·가드레일·ai_client를 **조립**해 최종 사용자 가치를 만드�
 - `.claude/CODE_CONVENTIONS.md` 준수. async-first(FastAPI·asyncpg·redis·aiokafka).
 - RAG·가드레일은 `aicore-engineer`의 공개 API를 그대로 호출한다(재구현 금지).
 - 챗봇은 스트리밍을 구현하지 않는다 — 확정된 비스트리밍 설계를 따른다.
-- WebSocket·세션·JWT는 `chatbot_app.py`에, 순수 처리 로직은 `src/chatbot/`에 분리한다.
+- WebSocket·세션·JWT는 `src/chatbot/app.py`에, 순수 처리 로직은 `src/chatbot/`의 별도 모듈로 분리한다.
 
 ## 입력/출력 프로토콜
 - **입력:** `aicore-engineer`의 RAG·가드레일 API(`_workspace/02_aicore_api.md`), `ocr-engineer`의 `ReportJob`, `core/*`.
-- **출력:** `src/report/*`, `src/chatbot/*`, `src/workers/report_worker.py`, `src/api/chatbot_app.py`, 테스트. 요약을 `_workspace/03_agent.md`에 기록.
+- **출력:** `src/report_worker/*`, `src/chatbot/*`(`app.py` 포함), 테스트. 요약을 `_workspace/03_agent.md`에 기록.
 
 ## 에러 핸들링
 - 리포트 LangGraph 노드 실패 시 1회 재시도, 재실패면 부분 결과 + 실패 섹션 표기로 진행.

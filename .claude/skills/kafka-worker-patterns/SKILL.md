@@ -8,12 +8,12 @@ description: aiokafka 기반 비동기 Kafka 워커(consumer/producer)를 구현
 OCR(02)·리포트(05) 워커가 공유하는 비동기 Kafka 패턴. 이 프로젝트의 노드 간 통신은 OCR/리포트가 Kafka(브로커 경유, 인스턴스 분리)다. 항상 `src/core/kafka/` 래퍼를 거치고 직접 클라이언트를 만들지 않는다 — 재시도·역직렬화·로깅이 한 곳에 모여야 하기 때문이다.
 
 ## 핵심 구조
-워커 진입점(`src/workers/*.py`)은 얇게:
+워커 진입점(`src/<worker>/__main__.py`)은 얇게:
 1. config 로드 → 풀(db)·ai_client·producer 초기화
 2. consumer 래퍼에 **pydantic 스키마 + 핸들러 콜백** 등록
 3. 처리 루프 시작, 시그널(SIGTERM) 시 우아한 종료
 
-비즈니스 로직은 `src/ocr/` · `src/report/`에 두고, 워커는 배선만 한다.
+비즈니스 로직은 `src/ocr_worker/` · `src/report_worker/`의 모듈에 두고, `__main__.py`는 배선만 한다.
 
 ## 메시지 처리 원칙
 - **역직렬화 즉시 검증**: raw → `contracts.py`의 pydantic 모델. 검증 실패 메시지는 DLQ로(파이프라인을 막지 않음).
