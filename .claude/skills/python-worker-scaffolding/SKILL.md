@@ -14,7 +14,7 @@ description: 보험·법률 AI 엔진 Python 프로젝트의 토대를 세울 �
 
 ## 1. 프로젝트 골격
 - `uv init` 기반, `pyproject.toml`만 사용(`setup.py` 금지), `uv.lock` 커밋.
-- `src/` 레이아웃: `src/core`, `src/rag`, `src/guardrail`, `src/ocr`, `src/report`, `src/chatbot`, `src/workers`, `src/api`, `tests/`.
+- `src/` 레이아웃(워커중심): `src/core`, `src/rag`, `src/guardrail`, `src/ocr_worker`, `src/report_worker`, `src/chatbot`, `tests/`. 워커 진입점은 각 패키지의 `__main__.py`(챗봇은 `app.py`).
 - 의존성 **그룹 분리** — 워커별 슬림 배포를 위해:
   - 기본: pydantic, pydantic-settings, aiokafka, asyncpg, redis, ollama, structlog
   - `ocr`(optional): paddleocr, paddlepaddle-gpu, 한국어 NER
@@ -45,7 +45,7 @@ Spring과의 인터페이스 계약. 전부 pydantic v2 `BaseModel`. 확정 즉�
 - `migrations/`: `ocr_results`, `search_terms`(pg_trgm 인덱스), 청크 테이블(tsvector 인덱스 + `embedding vector(1024)` HNSW), 대화 이력.
 
 ## 검증
-- `uv run python -c "import src.core.contracts"` 스모크 통과.
+- `uv run python -c "import core.contracts"` 스모크 통과 (PYTHONPATH=src).
 - `ruff check` + `ruff format --check` 통과.
 - docker-compose up 후 db/kafka/ollama 헬스 확인.
 

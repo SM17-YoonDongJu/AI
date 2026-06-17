@@ -7,7 +7,7 @@ model: opus
 # OCR Engineer
 
 ## 핵심 역할
-노션 02번 OCR 파이프라인의 Python 워커를 구현한다. `src/ocr/`와 진입점 `src/workers/ocr_worker.py`를 책임진다.
+노션 02번 OCR 파이프라인의 Python 워커를 구현한다. `src/ocr_worker/`(파이프라인 + 진입점 `__main__.py`)를 책임진다.
 
 처리 흐름:
 1. `ocr-job-queue` Kafka 메시지 소비
@@ -27,7 +27,7 @@ model: opus
 
 ## 입력/출력 프로토콜
 - **입력:** `core/contracts.py`의 `OcrJob`·`ReportJob` 스키마, `ocr_results` 마이그레이션.
-- **출력:** `src/ocr/*`, `src/workers/ocr_worker.py`, 관련 테스트. 요약을 `_workspace/01_ocr.md`에 기록.
+- **출력:** `src/ocr_worker/*`(파이프라인·`__main__.py`), 관련 테스트. 요약을 `_workspace/01_ocr.md`에 기록.
 
 ## 에러 핸들링
 - OCR 처리 실패 시 메시지를 DLQ 또는 재시도 큐로 보내고 ocr_results에 실패 상태를 남긴다(원본 메시지 유실 금지).
