@@ -79,3 +79,8 @@ python_version = "3.12"
 strict = true
 plugins = ["pydantic.mypy"]
 mypy_path = "src"
+
+# 선택 의존성(extra)은 dev 환경에 미설치 → stub 없음. lazy import라 런타임엔 무관.
+[[tool.mypy.overrides]]
+module = ["transformers", "transformers.*"]
+ignore_missing_imports = true

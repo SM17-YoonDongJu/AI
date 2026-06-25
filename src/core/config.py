@@ -52,6 +52,10 @@ class Settings(BaseSettings):
     # ── PII 마스킹 ───────────────────────────────────────────
     # NER 디텍터 활성 여부(미설치/false면 정규식 디텍터만 사용).
     use_ner: bool = False
+    # NER 모델(로컬 실행 — 외부 API로 PII 전송 금지). 이름(PS)만 사용.
+    ner_model: str = "Leo97/KoELECTRA-small-v3-modu-ner"
+    # NER 확률 임계값. 마스킹은 recall 우선이라 낮게; 과잉 마스킹 시 상향(노션 §2).
+    ner_score_threshold: float = 0.5
 
     # ── AI 서빙 (OpenAI 호환: Ollama/vLLM/TEI) — 모델 미정 ────
     ai_base_url: str = "http://localhost:11434/v1"
