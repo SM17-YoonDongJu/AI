@@ -17,7 +17,7 @@ Frontend와 Spring Boot는 직접 관여하지 않는다. FastAPI 내부 모듈�
 
 **[쿼리 라우터]**
 
-LangGraph 에이전트 또는 챗봇으로부터 쿼리 텍스트와 보험 유형 정보를 받아 검색할 namespace 조합과 각 namespace의 top-k를 결정한다. 신체 관련 보험 약관(terms), 후유장해 분류표(level), 분쟁조정사례·판례(case), HIRA 수가·KCD(medical) 4개 namespace를 조합하여 사용한다. 비신체 보험 관련 쿼리(자동차·화재 등)는 범위 외로 안내한다.
+LangGraph 에이전트 또는 챗봇으로부터 쿼리 텍스트와 보험 유형 정보를 받아 검색할 namespace 조합과 각 namespace의 top-k를 결정한다. 현재 구현 대상은 신체 관련 보험 약관(terms, `POLICY_CHUNKS`)·분쟁조정사례(case, `CASE_CHUNKS`) 2개 namespace다. 후유장해 분류표(level)·HIRA 수가·KCD(medical)는 테이블 미존재로 향후 확장한다. `namespace`는 물리 컬럼이 아니라 검색한 소스 테이블로 부여하는 파생값이다. 비신체 보험 관련 쿼리(자동차·화재 등)는 범위 외로 안내한다.
 
 **[trigram 오타 보정]**
 
