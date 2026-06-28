@@ -5,22 +5,31 @@
 
 services:
 
-  # Kafka — redpanda 경량 단일 노드 (prod은 AWS MSK)
-  redpanda:
-    image: redpandadata/redpanda:latest
-    command:
-      - redpanda
-      - start
-      - --smp=1
-      - --overprovisioned
-      - --kafka-addr=PLAINTEXT://0.0.0.0:9092
-      - --advertise-kafka-addr=PLAINTEXT://localhost:9092
+  # Kafka — apache/kafka 단일 노드, KRaft 모드(ZooKeeper 불필요). prod은 AWS MSK.
+  # listener 2개: EXTERNAL(localhost:9092) = 호스트 실행 워커용 / INTERNAL(kafka:29092) = compose 네트워크 내부용.
+  kafka:
+    image: apache/kafka:3.9.0
     ports:
       - "9092:9092"
+    environment:
+      # KRaft 단일 노드 = broker + controller 겸임
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_LISTENERS: CONTROLLER://0.0.0.0:9093,INTERNAL://0.0.0.0:29092,EXTERNAL://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      # 단일 노드 → 복제계수·ISR 1
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
     volumes:
-      - redpanda:/var/lib/redpanda/data
+      - kafka:/var/lib/kafka/data
     healthcheck:
-      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -39,5 +48,5 @@ services:
       retries: 10
 
 volumes:
-  redpanda:
+  kafka:
   redisdata:
