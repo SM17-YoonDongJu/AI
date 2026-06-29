@@ -19,6 +19,21 @@ def _err(state: ReportState, msg: str) -> list[str]:
     return list(state.get("errors", [])) + [msg]
 
 
+def _as_str_list(v: Any) -> list[str]:
+    """LLM이 list[str] 대신 list[dict]/str로 줄 때 안전하게 문자열 리스트로 정규화."""
+    if v is None:
+        return []
+    if isinstance(v, str):
+        return [v]
+    out: list[str] = []
+    for x in v if isinstance(v, list) else [v]:
+        if isinstance(x, dict):
+            out.append(str(x.get("name") or x.get("title") or x.get("특약") or next(iter(x.values()), "")))
+        else:
+            out.append(str(x))
+    return [s for s in out if s]
+
+
 # ── load_context: DB 조회로 사고/약관 컨텍스트 조립 ──────────────
 async def load_context(state: ReportState) -> dict[str, Any]:
     pool = await db.get_pool()
@@ -169,9 +184,9 @@ async def coverage_analysis(state: ReportState) -> dict[str, Any]:
     analysis = analysis if isinstance(analysis, dict) else {}
     return {
         "retrieved_clauses": chunks,
-        "applicable_coverages": analysis.get("applicable", []),
-        "missing_coverages": analysis.get("missing", []),
-        "coverage_analysis": {"analysis": analysis.get("analysis", ""), "citations": res["citations"][:6]},
+        "applicable_coverages": _as_str_list(analysis.get("applicable")),
+        "missing_coverages": _as_str_list(analysis.get("missing")),
+        "coverage_analysis": {"analysis": str(analysis.get("analysis", "")), "citations": res["citations"][:6]},
     }
 
 
