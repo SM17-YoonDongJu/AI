@@ -155,6 +155,18 @@ def test_assert_no_residual_raises_on_leak() -> None:
         assert_no_residual("계좌 미마스킹 901010-1234567")
 
 
+def test_find_residual_detects_account_in_context() -> None:
+    # 문맥 앵커(계좌번호) 뒤 숫자 묶음을 잔류로 추적한다
+    leaks = find_residual_pii("계좌번호 110-1234-567890 누락")
+    assert any(s.label is PiiLabel.ACCOUNT for s in leaks)
+
+
+def test_assert_no_residual_does_not_gate_account_only() -> None:
+    # 계좌는 추적 전용(_TRACK_ONLY) — 잔류해도 하드 실패시키지 않는다.
+    # (이 숫자열은 RRN/카드 패턴엔 안 걸려 ACCOUNT로만 잡힘)
+    assert_no_residual("계좌번호 110-1234-567890")  # 예외 없음
+
+
 # ── 디텍터 직접 호출(이미지 마스킹 B안 스팬 공유) ───────────────
 
 

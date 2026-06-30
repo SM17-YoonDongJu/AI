@@ -29,12 +29,28 @@ _RESIDUAL_PATTERNS: tuple[tuple[re.Pattern[str], PiiLabel], ...] = (
     (re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"), PiiLabel.EMAIL),
     # 휴대폰(고민감은 아니나 누락 추적용)
     (re.compile(r"(?<!\d)01[016789][-.\s]?\d{3,4}[-.\s]?\d{4}(?!\d)"), PiiLabel.PHONE),
+    # 계좌번호(문맥 앵커) — 자유형식이라 단독 숫자로는 오탐↑. 본 디텍터와 같은 키워드 뒤
+    # 25자 안의 숫자 묶음(8~16자리, 구분자에 '.'까지 관대)만 잔류로 본다. 추적 전용(_TRACK_ONLY).
+    (
+        re.compile(
+            r"(?:계좌\s*번호|계좌|예금주|예금|가상계좌|입금|이체|account)"
+            r"[^\d\n]{0,25}(?<![\d-])(?:\d[-.\s]?){7,15}\d(?![\d-])",
+            re.IGNORECASE,
+        ),
+        PiiLabel.ACCOUNT,
+    ),
 )
 
-# 잔류 시 즉시 실패시킬 고민감 분류(확률 모델에 안 맡기는 결정적 항목).
+# 분류상 고민감 PII(확률 모델에 안 맡기는 결정적 항목).
 HIGH_SENSITIVITY: frozenset[PiiLabel] = frozenset(
     {PiiLabel.RRN, PiiLabel.FRN, PiiLabel.CARD, PiiLabel.ACCOUNT}
 )
+# 고민감이나 '추적 전용' — 계좌 잔류 패턴은 문맥 앵커 기반이라 오탐 시 하드 게이트가
+# 정상 마스킹본을 MaskingError로 차단할 위험이 있다. 그래서 find_residual_pii(메트릭)엔
+# 잡되 하드 실패는 안 시킨다. FP율을 계측해 안정되면 이 집합에서 빼 게이트로 승격한다.
+_TRACK_ONLY: frozenset[PiiLabel] = frozenset({PiiLabel.ACCOUNT})
+# assert_no_residual이 하드 실패시키는 대상(고민감에서 추적 전용 제외).
+_GATED: frozenset[PiiLabel] = HIGH_SENSITIVITY - _TRACK_ONLY
 
 
 def find_residual_pii(masked_text: str) -> list[Span]:
@@ -58,12 +74,13 @@ def assert_no_residual(masked_text: str) -> None:
     """고민감 PII가 남아 있으면 ``MaskingError``를 던진다(엄격 모드).
 
     원문 값은 예외 메시지·로그에 넣지 않는다(PII 로깅 금지, CODE_CONVENTIONS §9).
-    분류와 건수만 보고한다.
+    분류와 건수만 보고한다. ``_TRACK_ONLY``(현재 계좌번호)는 메트릭으로만 추적하고
+    하드 실패시키지 않는다 — ``find_residual_pii``로는 잡힌다.
 
     Raises:
-        MaskingError: ``HIGH_SENSITIVITY`` 분류가 1건 이상 잔류한 경우.
+        MaskingError: ``_GATED``(고민감에서 추적 전용 제외) 분류가 1건 이상 잔류한 경우.
     """
-    leaks = [s for s in find_residual_pii(masked_text) if s.label in HIGH_SENSITIVITY]
+    leaks = [s for s in find_residual_pii(masked_text) if s.label in _GATED]
     if leaks:
         counts = ", ".join(sorted({s.label.value for s in leaks}))
         raise MaskingError(f"마스킹 후 고민감 PII 잔류: {counts} ({len(leaks)}건)")
