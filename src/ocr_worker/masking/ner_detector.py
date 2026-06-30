@@ -35,8 +35,11 @@ class NerDetector:
         """
         self._model_name = model_name
         self._score_threshold = score_threshold
-        # 외부 객체(transformers Pipeline) → Any(§3). lazy 로드를 락으로 보호한다.
+        # 외부 객체(transformers Pipeline) → Any(§3).
         self._pipeline: Any = None
+        # 파이프라인 로드·추론(forward)을 직렬화한다 — torch CPU 모델은 동일 인스턴스
+        # 동시 forward가 비안전하고, 스레드별 동시 추론은 CPU 오버서브스크립션을 부른다.
+        # NER은 경량이라 직렬화 비용은 무시 가능(병목은 OCR).
         self._lock = threading.Lock()
 
     def _ensure_pipeline(self) -> Any:
@@ -84,7 +87,10 @@ class NerDetector:
             return []
 
         pipe = self._ensure_pipeline()
-        batch_results = pipe([line for _, line in indexed])  # 라인별 결과 리스트
+        # forward 직렬화(동일 모델 동시 호출 비안전·CPU 오버서브스크립션 방지).
+        # _ensure_pipeline은 이미 락을 풀고 반환하므로 여기서 재획득해도 중첩 아님.
+        with self._lock:
+            batch_results = pipe([line for _, line in indexed])  # 라인별 결과 리스트
 
         spans: list[Span] = []
         for (line_index, _), entities in zip(indexed, batch_results, strict=True):

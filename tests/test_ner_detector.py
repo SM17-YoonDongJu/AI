@@ -82,3 +82,34 @@ def test_empty_text_returns_empty() -> None:
     detector = _detector(_NameFindingPipe())
 
     assert detector.detect("   \n  ") == []
+
+
+def test_inference_is_serialized_across_threads() -> None:
+    # CPU torch 모델 동시 forward 방지 — 여러 스레드가 detect를 동시에 불러도
+    # 파이프라인 호출은 한 번에 하나만 들어가야 한다.
+    import threading
+    import time
+
+    counter = threading.Lock()
+    inside = 0
+    max_inside = 0
+
+    class _ConcurrencyProbe:
+        def __call__(self, lines: list[str]) -> list[list[dict[str, Any]]]:
+            nonlocal inside, max_inside
+            with counter:
+                inside += 1
+                max_inside = max(max_inside, inside)
+            time.sleep(0.02)  # 겹칠 시간 확보
+            with counter:
+                inside -= 1
+            return [[] for _ in lines]
+
+    detector = _detector(_ConcurrencyProbe())
+    threads = [threading.Thread(target=lambda: detector.detect("홍길동")) for _ in range(5)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert max_inside == 1  # 직렬화됨(동시 진입 0건)
