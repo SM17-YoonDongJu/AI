@@ -24,6 +24,9 @@ from ocr_worker.ocr import OcrPage, OcrResult, PageImage
 _LINE_SEPARATOR = "\n"
 # 검은블럭 채움색(불투명 검정).
 _REDACT_FILL = (0, 0, 0)
+# OCR bbox는 글자에 빡빡하게 잡혀 가장자리 획이 샐 수 있다 → 여백을 줘 확실히 덮는다
+# (노션 "이미지 마스킹 상세" 5.1: bbox 여백 = 원본보다 일정 픽셀 확장).
+BBOX_MARGIN_PX = 3
 
 type DetectFn = Callable[[str], list[Span]]
 type RedactFn = Callable[[PageImage, OcrPage, set[int]], PageImage]
@@ -73,22 +76,29 @@ def pii_line_indices(
     return indices
 
 
-def redact_page_image(image: PageImage, page: OcrPage, line_indices: set[int]) -> PageImage:
+def redact_page_image(
+    image: PageImage, page: OcrPage, line_indices: set[int], *, margin_px: int = BBOX_MARGIN_PX
+) -> PageImage:
     """지정 라인을 검은블럭으로 가린 페이지 이미지 **사본**을 반환한다(PIL, lazy).
 
-    polygon이 있으면 polygon을, 없으면 ``bbox`` 사각형을 채운다. 원본 이미지는
-    변형하지 않는다(사본에 그린다).
+    A안(줄 전체 검게): 라인의 축정렬 ``bbox``를 ``margin_px``만큼 확장해 채운다 —
+    축정렬 사각형이라 기울어진 글자도 빠짐없이 덮고(과마스킹 무방), 5.1 커버리지
+    검사에서 bbox 영역이 100%에 가깝게 가려진다. 원본은 변형하지 않는다(사본에 그린다).
     """
     from PIL import ImageDraw
 
     redacted = image.convert("RGB").copy()
     draw = ImageDraw.Draw(redacted)
+    width, height = redacted.size
     for index in line_indices:
-        line = page.lines[index]
-        if line.polygon:
-            draw.polygon([tuple(point) for point in line.polygon], fill=_REDACT_FILL)
-        else:
-            draw.rectangle(list(line.bbox), fill=_REDACT_FILL)
+        x0, y0, x1, y1 = page.lines[index].bbox
+        rect = (
+            max(0, int(x0) - margin_px),
+            max(0, int(y0) - margin_px),
+            min(width, int(x1) + margin_px),
+            min(height, int(y1) + margin_px),
+        )
+        draw.rectangle(rect, fill=_REDACT_FILL)
     return redacted
 
 
