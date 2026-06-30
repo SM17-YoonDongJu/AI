@@ -16,13 +16,15 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# OCR Worker (GPU 노드). paddlepaddle-gpu는 Linux+CUDA 전용 —
-# 로컬(mac/CPU)에선 'paddlepaddle'로 바꾸거나 ocr extra 설치를 생략
+# OCR Worker (GPU 노드). surya-ocr는 PyTorch 기반 전용 OCR 엔진.
+# 0.17.x는 FoundationPredictor로 in-process(워커 내 라이브러리 로드) 실행 —
+# 0.18+는 별도 추론 서버(vllm/llama.cpp)가 필요하므로 in-process 세대로 고정한다.
+# (로컬 CPU/Windows 개발 환경엔 미설치 — 엔진/렌더/S3는 lazy import로 격리한다.)
 ocr = [
-    "paddleocr>=2.7",
-    "paddlepaddle-gpu>=2.6",
-    #"paddlepaddle=3.3.1"
-    "pymupdf>=1.24",
+    "surya-ocr>=0.17,<0.18",
+    "pymupdf>=1.24",   # PDF → 페이지 이미지 렌더
+    "pillow>=10.0",    # surya 입력(PIL.Image)
+    "boto3>=1.34",     # S3 GetObject(원본 다운로드)
 ]
 # LangGraph 멀티에이전트 리포트 생성
 report = [
@@ -82,5 +84,16 @@ mypy_path = "src"
 
 # 선택 의존성(extra)은 dev 환경에 미설치 → stub 없음. lazy import라 런타임엔 무관.
 [[tool.mypy.overrides]]
-module = ["transformers", "transformers.*"]
+module = [
+    "transformers",
+    "transformers.*",
+    "surya.*",
+    "fitz",
+    "boto3",
+    "botocore.*",
+    "PIL.*",
+    "asyncpg",
+    "aiokafka",
+    "aiokafka.*",
+]
 ignore_missing_imports = true

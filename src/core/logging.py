@@ -7,6 +7,7 @@
 
 import logging
 import sys
+from typing import cast
 
 import structlog
 
@@ -37,7 +38,8 @@ def configure_logging() -> None:
 
 def get_logger(name: str | None = None) -> structlog.stdlib.BoundLogger:
     """모듈용 구조적 로거를 반환한다."""
-    return structlog.get_logger(name)
+    # structlog.get_logger는 Any 프록시를 반환 → 선언 타입으로 캐스팅(strict mypy).
+    return cast(structlog.stdlib.BoundLogger, structlog.get_logger(name))
 
 
 def bind_context(**identifiers: str) -> None:
