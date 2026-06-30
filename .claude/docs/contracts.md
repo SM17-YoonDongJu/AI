@@ -35,6 +35,7 @@
 | `content_type` | string | ✓ | `application/pdf` `image/jpeg` `image/png` `image/tiff` |
 | `user_ref` | string | ✓ | 사용자 참조(내부 식별자, PII 아님) |
 | `doc_type_hint` | string \| null | – | 업로드 시 사용자가 고른 문서 유형 힌트 |
+| `claim_id` | string(UUID) \| null | – | `USER_CLAIMS.id` 참조(옵셔널). `ocr_worker`는 가공 없이 `ReportJob`으로 패스스루만 |
 | `uploaded_at` | string(ISO-8601) | ✓ | 업로드 시각(UTC) |
 
 ```json
@@ -44,6 +45,7 @@
   "content_type": "application/pdf",
   "user_ref": "u_4821",
   "doc_type_hint": null,
+  "claim_id": null,
   "uploaded_at": "2026-06-17T05:30:00Z"
 }
 ```
@@ -61,6 +63,7 @@
 | `job_id` | string(UUID) | ✓ | 원 OCR 작업 추적용 |
 | `doc_type` | string | ✓ | 분류된 문서 유형(아래 enum) |
 | `user_ref` | string | ✓ | 사용자 참조 |
+| `claim_id` | string(UUID) \| null | – | `USER_CLAIMS.id` 패스스루(옵셔널). `report_worker`가 DB에서 직접 조회 |
 | `created_at` | string(ISO-8601) | ✓ | 발행 시각(UTC) |
 
 `doc_type` enum: `diagnosis`(진단서) · `policy`(보험증권) · `payout_notice`(지급결과안내문) · `claim`(청구서) · `other`(기타)
@@ -72,6 +75,7 @@
   "job_id": "8f1c2d3e-...-a1",
   "doc_type": "diagnosis",
   "user_ref": "u_4821",
+  "claim_id": null,
   "created_at": "2026-06-17T05:31:10Z"
 }
 ```
@@ -80,15 +84,19 @@
 ---
 
 ## 3. `ocr_results` (DB 교차 계약)
-`ocr_worker`가 **쓰고**, `report_worker`가 `ocr_result_id`로 **읽는다.** 마스킹된 텍스트만 보관(원문·PII 금지).
+`ocr_worker`가 **쓰고**, `report_worker`가 `ocr_result_id`로 **읽는다.** 마스킹된 텍스트·라인좌표·비식별 이미지 참조만 보관(원문·평문 PII 금지).
 
 | 컬럼 | 타입 | 설명 |
 |---|---|---|
 | `id` | uuid PK | `ReportJob.ocr_result_id`로 참조됨 |
 | `job_id` | uuid | OCR 작업 |
 | `doc_type` | text | 분류 결과(`doc_type` enum) |
+| `doc_type_confidence` | real | 분류 신뢰도(0~1) |
+| `ocr_confidence` | real | OCR 라인 평균 신뢰도(0~1) — 저신뢰 QA 플래깅 |
 | `masked_text` | text | **PII 마스킹된** OCR 텍스트 (downstream 입력) |
+| `masked_lines` | jsonb | 라인 단위 `[{masked_text, bbox, polygon, confidence}]` — bbox/polygon/conf 보존, **텍스트는 마스킹본**(이미지 마스킹 좌표 재사용) |
 | `entities` | jsonb | 추출 엔티티(아래) |
+| `masked_image_s3_keys` | jsonb | 검은블럭 비식별 이미지 사본 S3 키(페이지별 리스트) |
 | `created_at` | timestamptz | |
 
 `entities` 예시(문서 유형별 일부):
@@ -100,7 +108,25 @@
   "payout_amount": null              // 단정 금지 — 추출값은 참고용
 }
 ```
-- **보존**: 리포트 확정 전까지만. **손해사정사 서명 완료 이벤트** 시 즉시 삭제(개인정보 최소보존).
+
+`masked_lines` 예시(텍스트는 마스킹본, 좌표·confidence는 원형 — 좌표/신뢰도는 PII 아님):
+```json
+[
+  {"masked_text": "보험계약자 ***", "bbox": [72,140,520,168],
+   "polygon": [[72,140],[520,140],[520,168],[72,168]], "confidence": 0.99}
+]
+```
+
+`masked_image_s3_keys` 예시(비식별 사본 — 원본 키와 분리):
+```json
+["masked/<job_id>/page-0.png", "masked/<job_id>/page-1.png"]
+```
+
+- **이미지 마스킹 트랙(손해사정사 비식별 열람용)**: 디텍터 검출 1회 → 텍스트 마스킹 + 이미지 마스킹 2갈래. 줄 단위 검은블럭으로 렌더한 **비식별 이미지 사본은 S3**, `ocr_results`엔 **키만** 적재. **원본 이미지는 삭제 금지** — KMS·IAM·Lifecycle 자동삭제로 잠금보관(법적 보존·분쟁·재처리).
+- **PII 안전**: 좌표·confidence는 PII가 아니라 보존하나, `masked_lines`의 텍스트는 **마스킹본만**. 원문/평문 PII는 `ocr_results`·로그·타 토픽에 절대 금지.
+- **보존**: 리포트 확정 전까지만. **손해사정사 서명 완료 이벤트** 시 즉시 삭제(개인정보 최소보존). 비식별 이미지 사본도 동일 트리거로 삭제.
+
+> **2026-06-30 (additive):** `doc_type_confidence`·`ocr_confidence`·`masked_lines`·`masked_image_s3_keys` 추가(이미지 마스킹 트랙 도입, #13 범위 확장). `masked_text`·`entities`는 불변 → `report_worker` 측 **비파괴**. 신규 컬럼은 `ocr_worker`만 기록, 비식별 이미지 소비(손해사정사 UI)는 `ocr_result_id`로 조회.
 
 ---
 
