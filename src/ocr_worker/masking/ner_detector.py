@@ -4,8 +4,8 @@
 - **이름(PS)만 NER로 잡는다.** 주소(LC)는 NER 출력이 noisy(precision 0.22)라
   정규식(``ADDRESS_RE``)이 담당 — 여기서는 LC를 쓰지 않는다.
 - **확정 모델**: ``Leo97/KoELECTRA-small-v3-modu-ner`` (small·CPU·~0.067s/샘플,
-  의료용어 오탐 0). 같은 OCR 워커에서 torch **CPU 빌드**로 in-process 실행
-  (paddle-gpu와 CUDA 충돌 없음, 노션 §6 A안).
+  의료용어 오탐 0). 같은 OCR 워커에서 torch **CPU**로 in-process 실행 — OCR(surya)도
+  PyTorch라 프레임워크가 통일되며, NER은 가벼워 CPU로 두고 GPU는 OCR 전용(노션 §6 A안).
 - **로컬 실행 필수**: PII를 외부 API로 보내면 위반(CODE_CONVENTIONS §13).
 
 ``transformers``/``torch``는 ``ner`` extra라 무겁다 → 모듈 import가 아니라 첫
@@ -45,7 +45,7 @@ class NerDetector:
                 model=self._model_name,
                 tokenizer=self._model_name,
                 aggregation_strategy="simple",
-                device=-1,  # CPU 강제 — paddle-gpu와 CUDA 버전 충돌 방지
+                device=-1,  # CPU 강제 — 모델이 가벼워 CPU로 충분, GPU는 OCR(surya) 전용
             )
         return self._pipeline
 

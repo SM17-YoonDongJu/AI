@@ -5,7 +5,7 @@
     spans = regex_detector.detect(text)
     if USE_NER:
         spans += ner_detector.detect(text)   # 합집합(OR)
-    return apply_mask(text, merge_overlaps(spans))
+    return apply_mask(text, spans)           # 겹침 병합(merge_overlaps)은 apply_mask 내부에서 수행
 
 ``Detector`` 프로토콜을 공유하므로 NER 모델 교체·LLM 디텍터 추가에도 ``mask()``는
 불변이다. NER은 무거우니 ``USE_NER``이고 실제로 필요한 첫 호출에서만 lazy 로드한다.
