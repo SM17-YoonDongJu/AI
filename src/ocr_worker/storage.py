@@ -64,3 +64,39 @@ async def get_object(s3_key: str) -> bytes:
         OcrError: 버킷 미설정 또는 S3 호출 실패.
     """
     return await asyncio.to_thread(_get_object_sync, s3_key)
+
+
+def _put_object_sync(s3_key: str, data: bytes, content_type: str) -> None:
+    """S3 PutObject(동기). 비식별 이미지 사본 등 가공 산출물을 올린다.
+
+    Raises:
+        OcrError: 버킷 미설정 또는 S3 호출 실패(원인 예외를 체이닝).
+    """
+    from botocore.exceptions import BotoCoreError, ClientError  # lazy
+
+    settings = get_settings()
+    if not settings.s3_bucket:
+        raise OcrError("S3 버킷이 설정되지 않았습니다(S3_BUCKET).")
+    try:
+        _client().put_object(
+            Bucket=settings.s3_bucket, Key=s3_key, Body=data, ContentType=content_type
+        )
+    except (BotoCoreError, ClientError) as exc:
+        raise OcrError(f"S3 업로드 실패: {s3_key}") from exc
+
+
+async def put_object(s3_key: str, data: bytes, content_type: str) -> None:
+    """가공 산출물(비식별 이미지 사본 등)을 S3에 올린다(비동기 — 스레드 격리).
+
+    원본 키와 분리된 키 공간(예: ``masked/<job_id>/page-N.png``)에 저장한다 —
+    키 네이밍·``ocr_results`` 적재는 호출자(파이프라인 #15)가 정한다.
+
+    Args:
+        s3_key: 저장할 S3 키.
+        data: 파일 바이트(예: PNG).
+        content_type: MIME 타입(예: ``image/png``).
+
+    Raises:
+        OcrError: 버킷 미설정 또는 S3 호출 실패.
+    """
+    await asyncio.to_thread(_put_object_sync, s3_key, data, content_type)
