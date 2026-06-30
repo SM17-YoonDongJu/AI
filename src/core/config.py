@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     # RDS는 TLS를 요구 → CA 번들 경로. 로컬 PG면 비워둠(SSL 끔).
     rds_ca_path: str | None = None
 
-    # ── Kafka (AWS MSK / 로컬 redpanda) ──────────────────────
+    # ── Kafka (AWS MSK / 로컬 apache/kafka KRaft) ────────────
     kafka_bootstrap_servers: str = "localhost:9092"
     kafka_ocr_job_topic: str = "ocr-job-queue"
     kafka_report_job_topic: str = "report-job"
