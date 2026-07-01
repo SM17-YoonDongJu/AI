@@ -30,8 +30,15 @@ EMBED_MODEL = os.environ.get("EMBED_MODEL", "qwen3-embedding:0.6b")
 # qwen3-embedding은 쿼리에 instruction 프리픽스 권장(문서는 raw로 임베딩됨 → 쿼리만 프리픽스).
 _QUERY_INSTRUCT = "Instruct: 보험 약관에서 사용자 질문에 답할 수 있는 관련 조항을 검색한다\nQuery: "
 
-# namespace → 테이블. 현재 terms(약관)만 적재됨. case(판례)는 미적재 → 빈 결과.
+# namespace → 테이블.
 _NS_TABLE = {"terms": "policy_chunks", "case": "case_chunks"}
+
+# 테이블별 컬럼 매핑 → (article_number, article_title, page_number) 자리에 쓸 실제 컬럼.
+# policy_chunks와 case_chunks는 스키마가 달라 검색 SELECT에서 정합용으로 별칭 처리.
+_COLS = {
+    "policy_chunks": ("article_number", "article_title", "page_number"),
+    "case_chunks": ("section", "case_title", "chunk_index"),
+}
 
 # 쿼리 형태소 토큰화(BM25용). content_tokens가 Kiwi 결과라 쿼리도 맞춰야 매칭률↑.
 try:
@@ -83,12 +90,13 @@ def _meta_filter(args: list, insurer: str | None, product: str | None) -> str:
 
 
 async def _vector_search(conn, table, qvec, k, insurer, product) -> list[dict[str, Any]]:
+    a, b, p = _COLS.get(table, _COLS["policy_chunks"])
     args: list = [qvec]
     where = "embedding IS NOT NULL" + _meta_filter(args, insurer, product)
     rows = await conn.fetch(
         f"""
-        SELECT chunk_id, content, article_number, article_title, product_name,
-               page_number, chunk_type,
+        SELECT chunk_id, content, {a} AS article_number, {b} AS article_title, product_name,
+               {p} AS page_number, chunk_type,
                1 - (embedding <=> $1::halfvec) AS score
         FROM {table}
         WHERE {where}
@@ -101,12 +109,13 @@ async def _vector_search(conn, table, qvec, k, insurer, product) -> list[dict[st
 
 
 async def _bm25_search(conn, table, q_tokens, k, insurer, product) -> list[dict[str, Any]]:
+    a, b, p = _COLS.get(table, _COLS["policy_chunks"])
     args: list = [q_tokens]
     extra = _meta_filter(args, insurer, product)
     rows = await conn.fetch(
         f"""
-        SELECT chunk_id, content, article_number, article_title, product_name,
-               page_number, chunk_type,
+        SELECT chunk_id, content, {a} AS article_number, {b} AS article_title, product_name,
+               {p} AS page_number, chunk_type,
                ts_rank(to_tsvector('simple', coalesce(content_tokens,'')),
                        plainto_tsquery('simple', $1)) AS score
         FROM {table}
