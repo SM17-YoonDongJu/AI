@@ -1,22 +1,51 @@
-"""워커·모듈 간 메시지 계약 (단일 출처).
+"""워커·모듈 간 통합 경계 계약 (단일 출처).
 
-Spring↔Python·워커 간 Kafka 페이로드를 pydantic v2로 정의·검증한다. 이 모듈은
-`.claude/docs/contracts.md` 스펙의 코드 구현이며, 변경 시 **발행자·소비자 양쪽과 합의**한다.
+`.claude/docs/contracts.md`를 코드화한 것이다. 이 모듈은 **데이터 모델만** 정의한다
+(함수 시그니처 search/guard_*/chat/embed 는 각 모듈 소관). 발행자·소비자가 동일한
+스키마로 직렬화/검증하도록 강제해 통합 버그(계약 불일치)를 진입점에서 차단한다.
 
-규약: UTF-8 JSON · 시각은 ISO-8601(UTC) 문자열 · 식별자는 UUIDv4 문자열 · PII 평문 금지.
+규약:
+- 모든 메시지는 UTF-8 JSON, 시각은 ISO-8601(UTC), 식별자는 UUIDv4 문자열.
+- PII는 계약에 평문으로 싣지 않는다(마스킹된 값만).
+- 변경 시 contracts.md → 본 파일 → 관련 테스트 순으로 갱신하고 양쪽 담당자와 합의한다.
 """
 
+from datetime import datetime
 from enum import StrEnum
+from typing import Literal
 
 from pydantic import BaseModel
 
-# ── Kafka 토픽 상수 (계약 기본값; 런타임 override는 core.config) ──
+__all__ = [
+    "OCR_JOB_TOPIC",
+    "REPORT_JOB_TOPIC",
+    "Chunk",
+    "Citation",
+    "ContentType",
+    "DocType",
+    "InputGuardResult",
+    "OcrJob",
+    "OutputGuardResult",
+    "RagResult",
+    "ReportJob",
+]
+
+# Kafka 토픽명 — 발행부(ocr_worker)·소비부(report_worker) 공유 상수.
 OCR_JOB_TOPIC = "ocr-job-queue"
 REPORT_JOB_TOPIC = "report-job"
 
 
+# 업로드 허용 MIME 타입. Spring 게이트웨이가 검증하지만 워커도 진입점에서 재확인한다.
+type ContentType = Literal[
+    "application/pdf",
+    "image/jpeg",
+    "image/png",
+    "image/tiff",
+]
+
+
 class DocType(StrEnum):
-    """문서 유형 분류 결과."""
+    """분류된 문서 유형. `ReportJob.doc_type` 및 `ocr_results.doc_type`에 공유된다."""
 
     DIAGNOSIS = "diagnosis"  # 진단서
     POLICY = "policy"  # 보험증권
@@ -25,25 +54,86 @@ class DocType(StrEnum):
     OTHER = "other"  # 기타
 
 
-class OcrJob(BaseModel):
-    """Spring → ocr-job-queue → ocr_worker. 업로드 시 발행되는 OCR 작업."""
+# --------------------------------------------------------------------------- #
+# Kafka 토픽 페이로드
+# --------------------------------------------------------------------------- #
 
-    job_id: str  # UUID, 멱등 키
-    s3_key: str  # 업로드 파일 S3 키(파일명 UUID 치환)
-    content_type: str  # application/pdf | image/jpeg | image/png | image/tiff
-    user_ref: str  # 내부 사용자 참조(PII 아님)
-    doc_type_hint: str | None = None  # 업로드 시 사용자가 고른 유형 힌트
+
+class OcrJob(BaseModel):
+    """Spring → `ocr-job-queue` → `ocr_worker`. 파일 업로드 시 발행되는 OCR 작업.
+
+    토픽 `ocr-job-queue`, 파티션 키 `job_id`, at-least-once + `job_id` 멱등 처리.
+    """
+
+    job_id: str  # OCR 작업 식별자(UUID). 멱등 키
+    s3_key: str  # 업로드 파일 S3 키(파일명은 UUID로 치환됨)
+    content_type: ContentType
+    user_ref: str  # 사용자 참조(내부 식별자, PII 아님)
+    doc_type_hint: str | None = None  # 업로드 시 사용자가 고른 문서 유형 힌트
     claim_id: str | None = None  # USER_CLAIMS.id 참조(옵셔널) — report_worker가 조회
-    uploaded_at: str  # ISO-8601 (UTC)
+    uploaded_at: datetime  # 업로드 시각(UTC, ISO-8601)
 
 
 class ReportJob(BaseModel):
-    """ocr_worker → report-job → report_worker. OCR·마스킹 완료 후 리포트 생성 트리거."""
+    """`ocr_worker` → `report-job` → `report_worker`. OCR·마스킹 완료 후 리포트 트리거.
 
-    report_id: str  # UUID(신규 생성), 멱등 키
-    ocr_result_id: str  # ocr_results.id 참조
-    job_id: str  # 원 OCR 작업 추적용
-    doc_type: DocType  # 분류된 문서 유형
+    토픽 `report-job`, 파티션 키 `report_id`, `report_id` 멱등 처리.
+    """
+
+    report_id: str  # 리포트 식별자(UUID, 신규 생성). 멱등 키
+    ocr_result_id: str  # `ocr_results.id` 참조(UUID)
+    job_id: str  # 원 OCR 작업 추적용(UUID)
+    doc_type: DocType
     user_ref: str  # 사용자 참조
     claim_id: str | None = None  # USER_CLAIMS.id 패스스루(옵셔널)
-    created_at: str  # ISO-8601 (UTC)
+    created_at: datetime  # 발행 시각(UTC, ISO-8601)
+
+
+# --------------------------------------------------------------------------- #
+# RAG 모듈 (`src/rag`) — report_worker·chatbot이 함수 호출로 사용
+# --------------------------------------------------------------------------- #
+
+
+class Chunk(BaseModel):
+    """Hybrid RAG 검색 결과 청크. 임베딩 차원은 1024 고정(config.EMBEDDING_DIM)."""
+
+    text: str  # 청크 원문 (POLICY_CHUNKS.content / CASE_CHUNKS.content)
+    # 검색한 소스 테이블로 부여되는 파생값. 현재 유효값: "terms"(POLICY_CHUNKS) ·
+    # "case"(CASE_CHUNKS). "level"(장해분류)·"medical"(수가·KCD)은 테이블 미존재 → 향후 확장.
+    namespace: str
+    score: float  # RRF 통합 점수
+    source_ref: str  # 원문 위치 참조 (chunk_id)
+
+
+class Citation(BaseModel):
+    """인용 근거(메타데이터 역추적). 출처 URL 컬럼은 보유 테이블에 없어 계약에서 제외."""
+
+    clause_no: str | None = None  # 조항/사례 번호 (article_number / case_number)
+    exhibit: str | None = None  # 별표·항목 (POLICY_CHUNKS.section, 있으면)
+
+
+class RagResult(BaseModel):
+    """`rag.search`의 반환 계약. 비신체보험 쿼리는 빈 결과로 반환된다."""
+
+    ranked_chunks: list[Chunk]
+    citations: list[Citation]
+
+
+# --------------------------------------------------------------------------- #
+# 가드레일 모듈 (`src/guardrail`) — 단계별 함수 결과 모델
+# --------------------------------------------------------------------------- #
+
+
+class InputGuardResult(BaseModel):
+    """입력 가드레일 결과. PII 마스킹 + 도메인 외 질문 차단."""
+
+    masked_text: str  # PII 마스킹된 텍스트(주민번호 앞 6자리만 보존 등)
+    blocked: bool  # 도메인 외 질문 차단 여부
+    reason: str | None = None  # 차단 사유
+
+
+class OutputGuardResult(BaseModel):
+    """출력 가드레일 결과. 법적 고지문 삽입 + (리포트 한정) LLM Judge 인용 검증."""
+
+    final_text: str  # 고지문 삽입된 최종 텍스트
+    judge_failures: list[str]  # 인용 검증 실패 섹션(리포트만, run_judge=True)

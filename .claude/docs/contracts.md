@@ -68,6 +68,8 @@
 
 `doc_type` enum: `diagnosis`(진단서) · `policy`(보험증권) · `payout_notice`(지급결과안내문) · `claim`(청구서) · `other`(기타)
 
+> 토픽명은 `core.contracts`에 상수로 공유된다: `OCR_JOB_TOPIC = "ocr-job-queue"`, `REPORT_JOB_TOPIC = "report-job"`.
+
 ```json
 {
   "report_id": "b2a9...-77",
@@ -162,26 +164,28 @@
 async def search(
     query: str,
     insurance_type: str | None = None,   # 신체보험 유형 힌트(비신체는 범위 외)
-    namespaces: list[str] | None = None, # None이면 라우터가 결정. {terms,level,case,medical}
+    namespaces: list[str] | None = None, # None이면 라우터가 결정. {terms, case} (level·medical 향후)
     top_k: int = 8,
 ) -> RagResult: ...
 
 class Chunk(BaseModel):
-    text: str
-    namespace: str          # terms | level | case | medical
+    text: str               # 청크 원문 (POLICY_CHUNKS.content / CASE_CHUNKS.content)
+    namespace: str          # terms(POLICY_CHUNKS) | case(CASE_CHUNKS). level·medical 향후
     score: float            # RRF 통합 점수
-    source_ref: str         # 원문 위치 참조
+    source_ref: str         # 원문 위치 참조 (chunk_id)
 
 class Citation(BaseModel):
-    clause_no: str | None   # 조항 번호 (예: "제3조")
-    exhibit: str | None     # 별표
-    source_url: str | None
+    clause_no: str | None   # 조항/사례 번호 (POLICY_CHUNKS.article_number / CASE_CHUNKS.case_number)
+    exhibit: str | None     # 별표·항목 (POLICY_CHUNKS.section, 있으면)
 
 class RagResult(BaseModel):
     ranked_chunks: list[Chunk]
     citations: list[Citation]
 ```
 - 임베딩 차원 **1024 고정**. 비신체보험 쿼리는 빈 결과 + 범위 외 사유 반환.
+- **`namespace`는 PG 컬럼이 아니라 파생값** — 검색한 소스 테이블로 부여(`POLICY_CHUNKS`→`terms`, `CASE_CHUNKS`→`case`). 물리 스키마는 ERD(Notion) 참조.
+- 현재 구현 대상은 `terms`·`case` 2종(`POLICY_CHUNKS`·`CASE_CHUNKS`). `level`(장해분류)·`medical`(수가·KCD)은 테이블 미존재 → 향후 확장.
+- 인용 출처 URL 컬럼은 보유 테이블에 없어 계약에서 제외(필요 시 `CASE_CHUNKS.source_id`로 조합).
 
 ---
 
