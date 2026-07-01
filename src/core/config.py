@@ -1,8 +1,11 @@
-"""환경설정 단일 출처 (pydantic-settings).
+"""환경설정 단일 출처 (pydantic-settings) — 정본(canonical) 슈퍼셋.
 
-모든 env 값을 한 곳에서 로드·검증한다. 모델·엔드포인트는 코드에 하드코딩하지 않고
-주입한다(env). 시크릿(DB 비밀번호 등)은 코드·로그·커밋에 두지 않으며 운영에서는 env로
-주입한다. 아래 기본값은 로컬 개발(docker-compose.dev) 편의를 위한 것이며 실제 값이 아니다.
+전 워커·모듈(OCR·RAG·리포트·챗봇·가드레일)이 공유하는 설정을 한 곳에 모은다. 모델·엔드포인트는
+코드에 하드코딩하지 않고 env로 주입하며, 시크릿(DB 비밀번호 등)은 코드·로그·커밋에 두지 않는다.
+아래 기본값은 로컬 개발(docker-compose.dev)용이며 실제 값이 아니다.
+
+필드 네이밍은 팀 정본 규약을 따른다 — 인프라(DB·Kafka·AI)는 서술적 이름, 관측성은 환경/서비스
+식별자. `os.getenv` 산재를 금지하고 여기서만 로드한다.
 """
 
 from functools import lru_cache
@@ -23,28 +26,43 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # --- 데이터스토어 ---
-    db_dsn: str = "postgresql://postgres:postgres@localhost:5432/ai_engine"  # asyncpg DSN
+    # --- 환경·관측성 ---
+    environment: str = "local"  # local | dev | prod
+    log_level: str = ""  # 빈값이면 환경별 결정(local=DEBUG, 그 외=INFO)
+    service_name: str = "ai-engine"  # 워커별 env(SERVICE_NAME)로 덮어씀
+    instance_id: str = ""  # 인스턴스/Pod 식별자(비면 hostname)
+
+    # --- Database (AWS RDS PostgreSQL / 로컬 PG) ---
+    database_url: str = "postgresql://postgres:postgres@localhost:5432/ai_engine"
+    db_pool_min_size: int = 2
+    db_pool_max_size: int = 10
+    rds_ca_path: str | None = None  # RDS TLS CA 번들 경로. 로컬 PG면 비움(SSL 끔)
     redis_url: str = "redis://localhost:6379/0"
 
-    # --- Kafka ---
-    kafka_bootstrap: str = "localhost:9092"  # bootstrap.servers
+    # --- Kafka (AWS MSK / 로컬 redpanda) ---
+    kafka_bootstrap_servers: str = "localhost:9092"
+    kafka_ocr_job_topic: str = "ocr-job-queue"
+    kafka_report_job_topic: str = "report-job"
+    kafka_security_protocol: str = "PLAINTEXT"  # PLAINTEXT | SSL | SASL_SSL
+    kafka_consumer_group: str = "ocr-worker"
+    kafka_dlq_suffix: str = ".dlq"
+    kafka_max_retries: int = 3
 
-    # --- AI 추론 (OpenAI 호환 엔드포인트: Ollama/vLLM/TEI) ---
-    ollama_base_url: str = "http://localhost:11434/v1"  # OpenAI 호환 base_url
-    # 모델명은 미정 → 반드시 env로 주입(하드코딩 금지). 비어 있으면 ai_client 호출 시 실패.
-    chat_model: str = ""  # 예: EXAONE 계열
+    # --- S3 (OCR 원본 — OCR Worker가 GetObject) ---
+    aws_region: str = "ap-northeast-2"
+    s3_bucket: str = ""
+
+    # --- PII 마스킹 ---
+    use_ner: bool = False  # NER 디텍터 활성 여부(false면 정규식만)
+
+    # --- AI 서빙 (OpenAI 호환: Ollama/vLLM/TEI) — 모델 미정, env 주입 ---
+    ai_base_url: str = "http://localhost:11434/v1"  # 챗 추론 엔드포인트
+    ai_api_key: str = "not-needed"  # OpenAI 호환 인증(로컬은 미사용)
+    llm_model: str = ""  # 예: EXAONE 계열
+    embedding_base_url: str = "http://localhost:11434/v1"  # 임베딩 엔드포인트(별도 노드 가능)
     embedding_model: str = ""  # 예: qwen3:embedding (1024d)
     embedding_dim: int = DEFAULT_EMBEDDING_DIM
     ai_timeout_seconds: float = 60.0  # 추론 HTTP 요청 타임아웃
-
-    # --- 관측성(로깅) ---
-    # 로그 리소스 필드. service_name은 워커별로 env(SERVICE_NAME)로 덮어쓴다.
-    environment: str = "local"  # local | dev | prod
-    service_name: str = "ai-engine"
-    instance_id: str = ""  # 인스턴스/Pod 식별자(env 주입). 비면 hostname 사용
-    # 빈값이면 환경별로 결정(local=DEBUG, 그 외=INFO). 명시 시 그 값을 우선한다.
-    log_level: str = ""
 
 
 @lru_cache

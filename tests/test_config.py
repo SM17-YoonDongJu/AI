@@ -18,20 +18,20 @@ def test_model_names_default_empty_to_force_injection() -> None:
     cfg = Settings()
 
     # Assert: 모델 미정 → env 주입 강제(하드코딩 금지)
-    assert cfg.chat_model == ""
+    assert cfg.llm_model == ""
     assert cfg.embedding_model == ""
 
 
 def test_env_overrides_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     # Arrange
-    monkeypatch.setenv("CHAT_MODEL", "exaone-test")
+    monkeypatch.setenv("LLM_MODEL", "exaone-test")
     monkeypatch.setenv("EMBEDDING_DIM", "512")
 
     # Act
     cfg = Settings()
 
     # Assert
-    assert cfg.chat_model == "exaone-test"
+    assert cfg.llm_model == "exaone-test"
     assert cfg.embedding_dim == 512
 
 

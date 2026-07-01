@@ -12,8 +12,12 @@ from core.config import settings
 
 
 def _install_mock(handler) -> None:  # type: ignore[no-untyped-def]
-    """모듈 공유 클라이언트를 MockTransport 기반으로 교체한다."""
-    ai_client._client = httpx.AsyncClient(
+    """챗·임베딩 공유 클라이언트를 모두 MockTransport 기반으로 교체한다."""
+    ai_client._chat_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://test/v1",
+    )
+    ai_client._embed_client = httpx.AsyncClient(
         transport=httpx.MockTransport(handler),
         base_url="http://test/v1",
     )

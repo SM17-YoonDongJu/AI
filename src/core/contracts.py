@@ -17,6 +17,8 @@ from typing import Literal
 from pydantic import BaseModel
 
 __all__ = [
+    "OCR_JOB_TOPIC",
+    "REPORT_JOB_TOPIC",
     "Chunk",
     "Citation",
     "ContentType",
@@ -27,6 +29,10 @@ __all__ = [
     "RagResult",
     "ReportJob",
 ]
+
+# Kafka 토픽명 — 발행부(ocr_worker)·소비부(report_worker) 공유 상수.
+OCR_JOB_TOPIC = "ocr-job-queue"
+REPORT_JOB_TOPIC = "report-job"
 
 
 # 업로드 허용 MIME 타입. Spring 게이트웨이가 검증하지만 워커도 진입점에서 재확인한다.
@@ -64,6 +70,7 @@ class OcrJob(BaseModel):
     content_type: ContentType
     user_ref: str  # 사용자 참조(내부 식별자, PII 아님)
     doc_type_hint: str | None = None  # 업로드 시 사용자가 고른 문서 유형 힌트
+    claim_id: str | None = None  # USER_CLAIMS.id 참조(옵셔널) — report_worker가 조회
     uploaded_at: datetime  # 업로드 시각(UTC, ISO-8601)
 
 
@@ -78,6 +85,7 @@ class ReportJob(BaseModel):
     job_id: str  # 원 OCR 작업 추적용(UUID)
     doc_type: DocType
     user_ref: str  # 사용자 참조
+    claim_id: str | None = None  # USER_CLAIMS.id 패스스루(옵셔널)
     created_at: datetime  # 발행 시각(UTC, ISO-8601)
 
 
