@@ -35,6 +35,7 @@
 | `content_type` | string | ✓ | `application/pdf` `image/jpeg` `image/png` `image/tiff` |
 | `user_ref` | string | ✓ | 사용자 참조(내부 식별자, PII 아님) |
 | `doc_type_hint` | string \| null | – | 업로드 시 사용자가 고른 문서 유형 힌트 |
+| `claim_id` | string(UUID) \| null | – | `USER_CLAIMS.id` 참조. `report_worker`가 조회에 사용 |
 | `uploaded_at` | string(ISO-8601) | ✓ | 업로드 시각(UTC) |
 
 ```json
@@ -44,6 +45,7 @@
   "content_type": "application/pdf",
   "user_ref": "u_4821",
   "doc_type_hint": null,
+  "claim_id": null,
   "uploaded_at": "2026-06-17T05:30:00Z"
 }
 ```
@@ -61,9 +63,12 @@
 | `job_id` | string(UUID) | ✓ | 원 OCR 작업 추적용 |
 | `doc_type` | string | ✓ | 분류된 문서 유형(아래 enum) |
 | `user_ref` | string | ✓ | 사용자 참조 |
+| `claim_id` | string(UUID) \| null | – | `USER_CLAIMS.id` 패스스루(OcrJob에서 전달) |
 | `created_at` | string(ISO-8601) | ✓ | 발행 시각(UTC) |
 
 `doc_type` enum: `diagnosis`(진단서) · `policy`(보험증권) · `payout_notice`(지급결과안내문) · `claim`(청구서) · `other`(기타)
+
+> 토픽명은 `core.contracts`에 상수로 공유된다: `OCR_JOB_TOPIC = "ocr-job-queue"`, `REPORT_JOB_TOPIC = "report-job"`.
 
 ```json
 {
@@ -72,6 +77,7 @@
   "job_id": "8f1c2d3e-...-a1",
   "doc_type": "diagnosis",
   "user_ref": "u_4821",
+  "claim_id": null,
   "created_at": "2026-06-17T05:31:10Z"
 }
 ```
