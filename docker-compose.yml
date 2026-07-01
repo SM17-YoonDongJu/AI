@@ -34,6 +34,26 @@ services:
       timeout: 5s
       retries: 10
 
+  # PostgreSQL — ocr_results·RAG 등 공용 DB (prod은 AWS RDS).
+  # pgvector 이미지 사용 — core.db 풀이 커넥션마다 vector 타입을 등록하므로 확장이 필요하다
+  # (migrations/000_extensions.sql이 CREATE EXTENSION 수행). 기본 접속정보는 config의
+  # database_url 기본값(postgres/postgres@localhost:5432/ai_engine)과 일치시킨다.
+  postgres:
+    image: pgvector/pgvector:pg16
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ai_engine
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ai_engine"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   # Redis — 세션·컨텍스트 캐시 (prod은 ElastiCache)
   redis:
     image: redis:7-alpine
@@ -49,4 +69,5 @@ services:
 
 volumes:
   kafka:
+  pgdata:
   redisdata:

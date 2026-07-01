@@ -1,0 +1,6 @@
+-- 000_extensions.sql — 공용 PG 확장(로컬 PG·RDS 동일 적용).
+--
+-- core.db 풀은 커넥션마다 pgvector 타입을 등록하므로(RAG 벡터 검색), `vector` 확장이
+-- DB에 먼저 존재해야 어떤 워커든 풀 생성이 성공한다. OCR 워커도 이 공용 풀을 쓰므로
+-- 여기서 선행 보장한다. 반복 적용 안전(IF NOT EXISTS).
+CREATE EXTENSION IF NOT EXISTS vector;
