@@ -1,0 +1,68 @@
+# 재사용 Composite Action — 백엔드 레포의 discord-notify와 동일 규격.
+# 상태(success/failure/cancelled)에 따라 색상·아이콘을 정하고 Embed 메시지를 Webhook으로 POST한다.
+name: discord-notify
+description: Discord Webhook으로 CI/배포 결과 알림을 보낸다.
+
+inputs:
+  webhook_url:
+    description: Discord Webhook URL
+    required: true
+  status:
+    description: success | failure | cancelled
+    required: true
+  service:
+    description: 서비스 이름 (ocr / report / chatbot / ci)
+    required: true
+  environment:
+    description: 배포 환경 (dev / prod)
+    required: false
+    default: dev
+  image_tag:
+    description: 배포된 이미지 태그(있으면 표시)
+    required: false
+    default: ""
+  failed_step:
+    description: 실패 스텝 이름(실패 시)
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Send Discord notification
+      shell: bash
+      run: |
+        case "${{ inputs.status }}" in
+          success)   COLOR=3066993;  ICON="✅" ;;
+          failure)   COLOR=15158332; ICON="❌" ;;
+          cancelled) COLOR=9807270;  ICON="⚠️" ;;
+          *)         COLOR=8421504;  ICON="ℹ️" ;;
+        esac
+
+        COMMIT_MSG=$(git log -1 --pretty=%s 2>/dev/null || echo "-")
+        RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+        FIELDS="[
+          {\"name\":\"Service\",\"value\":\"${{ inputs.service }}\",\"inline\":true},
+          {\"name\":\"Env\",\"value\":\"${{ inputs.environment }}\",\"inline\":true},
+          {\"name\":\"Branch\",\"value\":\"${{ github.ref_name }}\",\"inline\":true},
+          {\"name\":\"Commit\",\"value\":\"[\`${GITHUB_SHA::7}\`](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }})\",\"inline\":true},
+          {\"name\":\"Author\",\"value\":\"${{ github.actor }}\",\"inline\":true}"
+        if [ -n "${{ inputs.image_tag }}" ]; then
+          FIELDS="$FIELDS,{\"name\":\"Image Tag\",\"value\":\"\`${{ inputs.image_tag }}\`\",\"inline\":true}"
+        fi
+        if [ -n "${{ inputs.failed_step }}" ]; then
+          FIELDS="$FIELDS,{\"name\":\"Failed Step\",\"value\":\"${{ inputs.failed_step }}\",\"inline\":false}"
+        fi
+        FIELDS="$FIELDS,{\"name\":\"Logs\",\"value\":\"[GitHub Actions]($RUN_URL)\",\"inline\":false}]"
+
+        curl -sf -H "Content-Type: application/json" -X POST "${{ inputs.webhook_url }}" -d @- <<JSON
+        {
+          "embeds": [{
+            "title": "$ICON [${{ inputs.service }}] ${{ inputs.status }}",
+            "description": "$COMMIT_MSG",
+            "color": $COLOR,
+            "fields": $FIELDS
+          }]
+        }
+        JSON
