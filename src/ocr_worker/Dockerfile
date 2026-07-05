@@ -1,7 +1,8 @@
-# OCR Worker — GPU 노드 배포 (PaddleOCR 인프로세스).
+# OCR Worker — GPU 노드 배포 (surya-ocr 인프로세스, PyTorch).
 # build context = 레포 루트:  docker build -f src/ocr_worker/Dockerfile -t ocr-worker .
 #
-# CUDA 런타임 베이스. CUDA/cuDNN 버전은 GPU 노드 및 paddlepaddle-gpu 휠과 맞춰야 한다.
+# CUDA 런타임 베이스. surya는 PyTorch 기반 — torch CUDA 빌드(cu12x)와
+# GPU 노드 드라이버·베이스 CUDA 버전을 맞춰야 한다.
 FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04 AS base
 ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1
 

@@ -23,3 +23,4 @@
 | 2026-06-16 | 코드 컨벤션 문서를 `.claude/` 하위로 이동, 참조 7곳 경로 갱신 | `.claude/CODE_CONVENTIONS.md`, agents·skills | 설정·문서를 .claude로 일원화 |
 | 2026-06-16 | 공유 설정(훅·Notion 권한)을 `settings.json`으로 분리, `.gitignore` 작성 | `.claude/settings.json`, `.gitignore` | .claude 커밋 — 훅은 공유, local.json은 개인용 제외 |
 | 2026-06-17 | 워커중심 구조로 변경 + 하네스 경로 동기화 | agents·skills·CLAUDE.md | 실제 구조(`src/ocr_worker`·`src/report_worker`·`src/chatbot/app.py`)와 정합 |
+| 2026-06-25 | git-committer 스킬 추가 (변경 분석→한국어 커밋, ruff·시크릿 점검, push 안 함) | `skills/git-committer` | 사용자 요청 — 커밋 메시지 작성·커밋 자동화 |

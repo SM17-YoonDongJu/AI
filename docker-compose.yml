@@ -5,24 +5,56 @@
 
 services:
 
-  # Kafka — redpanda 경량 단일 노드 (prod은 AWS MSK)
-  redpanda:
-    image: redpandadata/redpanda:latest
-    command:
-      - redpanda
-      - start
-      - --smp=1
-      - --overprovisioned
-      - --kafka-addr=PLAINTEXT://0.0.0.0:9092
-      - --advertise-kafka-addr=PLAINTEXT://localhost:9092
+  # Kafka — apache/kafka 단일 노드, KRaft 모드(ZooKeeper 불필요). prod은 AWS MSK.
+  # listener 2개: EXTERNAL(localhost:9092) = 호스트 실행 워커용 / INTERNAL(kafka:29092) = compose 네트워크 내부용.
+  kafka:
+    image: apache/kafka:3.9.0
     ports:
       - "9092:9092"
+    environment:
+      # KRaft 단일 노드 = broker + controller 겸임
+      # LISTENERS는 host를 비워(=0.0.0.0) 바인딩하고, ADVERTISED에만 라우팅 가능한
+      # 호스트명을 준다(INTERNAL=compose 내부용 kafka:29092 / EXTERNAL=호스트용 localhost:9092).
+      # advertised에 0.0.0.0을 두면 KRaft 검증에서 거부되므로 절대 넣지 않는다.
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_LISTENERS: CONTROLLER://:29093,INTERNAL://:29092,EXTERNAL://:9092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      # 단일 노드 → 복제계수·ISR 1
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
     volumes:
-      - redpanda:/var/lib/redpanda/data
+      - kafka:/var/lib/kafka/data
     healthcheck:
-      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list"]
       interval: 10s
       timeout: 5s
+      retries: 10
+
+  # PostgreSQL — ocr_results·RAG 등 공용 DB (prod은 AWS RDS).
+  # pgvector 이미지 사용 — core.db 풀이 커넥션마다 vector 타입을 등록하므로 확장이 필요하다
+  # (migrations/000_extensions.sql이 CREATE EXTENSION 수행). 기본 접속정보는 config의
+  # database_url 기본값(postgres/postgres@localhost:5432/ai_engine)과 일치시킨다.
+  postgres:
+    image: pgvector/pgvector:pg16
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ai_engine
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ai_engine"]
+      interval: 5s
+      timeout: 3s
       retries: 10
 
   # Redis — 세션·컨텍스트 캐시 (prod은 ElastiCache)
@@ -39,5 +71,6 @@ services:
       retries: 10
 
 volumes:
-  redpanda:
+  kafka:
+  pgdata:
   redisdata:
