@@ -60,6 +60,14 @@ jobs:
           status: failure
           service: ci
 
+      - name: Notify success
+        if: success() && github.event_name == 'push'
+        uses: ./.github/actions/discord-notify
+        with:
+          webhook_url: ${{ secrets.DISCORD_WEBHOOK_CI_BUILDS }}
+          status: success
+          service: ci
+
   # 2) 변경 감지 — dev push 한정. 빌드할 서비스 목록(JSON matrix)을 만든다.
   #    공용 코드(core/pyproject/uv.lock) 변경 시 3개 전부 재빌드.
   changes:
@@ -76,9 +84,9 @@ jobs:
         with:
           filters: |
             shared: ['pyproject.toml','uv.lock','src/core/**']
-            ocr:    ['src/ocr_worker/**']
+            ocr: ['src/ocr_worker/**']
             report: ['src/report_worker/**','src/rag/**','src/guardrail/**']
-            chatbot:['src/chatbot/**','src/rag/**','src/guardrail/**']
+            chatbot: ['src/chatbot/**','src/rag/**','src/guardrail/**']
       - id: set
         shell: bash
         run: |

@@ -1,7 +1,7 @@
-# 재사용 Composite Action — 백엔드 레포의 discord-notify와 동일 규격.
+# 재사용 Composite Action — 백엔드 레포의 discord-notify와 동일 규격(메시지는 한국어).
 # 상태(success/failure/cancelled)에 따라 색상·아이콘을 정하고 Embed 메시지를 Webhook으로 POST한다.
 name: discord-notify
-description: Discord Webhook으로 CI/배포 결과 알림을 보낸다.
+description: Discord Webhook으로 CI/배포 결과를 한국어로 알린다.
 
 inputs:
   webhook_url:
@@ -32,35 +32,41 @@ runs:
     - name: Send Discord notification
       shell: bash
       run: |
+        # 상태별 색상·아이콘·한국어 라벨. 이미지 태그 유무로 CI/배포를 구분해 제목을 만든다.
         case "${{ inputs.status }}" in
-          success)   COLOR=3066993;  ICON="✅" ;;
-          failure)   COLOR=15158332; ICON="❌" ;;
-          cancelled) COLOR=9807270;  ICON="⚠️" ;;
-          *)         COLOR=8421504;  ICON="ℹ️" ;;
+          success)   COLOR=3066993;  ICON="✅"; STATUS_KO="성공" ;;
+          failure)   COLOR=15158332; ICON="❌"; STATUS_KO="실패" ;;
+          cancelled) COLOR=9807270;  ICON="⚠️"; STATUS_KO="취소" ;;
+          *)         COLOR=8421504;  ICON="ℹ️"; STATUS_KO="알림" ;;
         esac
+        if [ -n "${{ inputs.image_tag }}" ]; then KIND="배포"; else KIND="CI"; fi
+        TITLE="$ICON [${{ inputs.service }}] $KIND $STATUS_KO"
 
-        COMMIT_MSG=$(git log -1 --pretty=%s 2>/dev/null || echo "-")
+        # 커밋 메시지는 JSON 값에 안전하게 넣도록 역슬래시·따옴표를 이스케이프한다.
+        COMMIT_MSG=$(git log -1 --pretty=%s 2>/dev/null | sed 's/\\/\\\\/g; s/"/\\"/g')
+        [ -z "$COMMIT_MSG" ] && COMMIT_MSG="-"
         RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        COMMIT_URL="${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}"
 
         FIELDS="[
-          {\"name\":\"Service\",\"value\":\"${{ inputs.service }}\",\"inline\":true},
-          {\"name\":\"Env\",\"value\":\"${{ inputs.environment }}\",\"inline\":true},
-          {\"name\":\"Branch\",\"value\":\"${{ github.ref_name }}\",\"inline\":true},
-          {\"name\":\"Commit\",\"value\":\"[\`${GITHUB_SHA::7}\`](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }})\",\"inline\":true},
-          {\"name\":\"Author\",\"value\":\"${{ github.actor }}\",\"inline\":true}"
+          {\"name\":\"서비스\",\"value\":\"${{ inputs.service }}\",\"inline\":true},
+          {\"name\":\"환경\",\"value\":\"${{ inputs.environment }}\",\"inline\":true},
+          {\"name\":\"브랜치\",\"value\":\"${{ github.ref_name }}\",\"inline\":true},
+          {\"name\":\"커밋\",\"value\":\"[\`${GITHUB_SHA::7}\`]($COMMIT_URL)\",\"inline\":true},
+          {\"name\":\"작업자\",\"value\":\"${{ github.actor }}\",\"inline\":true}"
         if [ -n "${{ inputs.image_tag }}" ]; then
-          FIELDS="$FIELDS,{\"name\":\"Image Tag\",\"value\":\"\`${{ inputs.image_tag }}\`\",\"inline\":true}"
+          FIELDS="$FIELDS,{\"name\":\"이미지 태그\",\"value\":\"\`${{ inputs.image_tag }}\`\",\"inline\":true}"
         fi
         if [ -n "${{ inputs.failed_step }}" ]; then
-          FIELDS="$FIELDS,{\"name\":\"Failed Step\",\"value\":\"${{ inputs.failed_step }}\",\"inline\":false}"
+          FIELDS="$FIELDS,{\"name\":\"실패 스텝\",\"value\":\"${{ inputs.failed_step }}\",\"inline\":false}"
         fi
-        FIELDS="$FIELDS,{\"name\":\"Logs\",\"value\":\"[GitHub Actions]($RUN_URL)\",\"inline\":false}]"
+        FIELDS="$FIELDS,{\"name\":\"커밋 메시지\",\"value\":\"$COMMIT_MSG\",\"inline\":false}"
+        FIELDS="$FIELDS,{\"name\":\"상세 로그\",\"value\":\"[GitHub Actions]($RUN_URL)\",\"inline\":false}]"
 
         curl -sf -H "Content-Type: application/json" -X POST "${{ inputs.webhook_url }}" -d @- <<JSON
         {
           "embeds": [{
-            "title": "$ICON [${{ inputs.service }}] ${{ inputs.status }}",
-            "description": "$COMMIT_MSG",
+            "title": "$TITLE",
             "color": $COLOR,
             "fields": $FIELDS
           }]
