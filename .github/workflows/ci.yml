@@ -82,6 +82,9 @@ jobs:
       - uses: dorny/paths-filter@v3
         id: filter
         with:
+          # dev의 "이 push 이전 커밋"과 비교한다. base 미지정 시 기본 브랜치(main)와
+          # 비교돼 dev의 거의 모든 파일이 변경으로 잡혀 3개 서비스가 매번 재빌드된다.
+          base: dev
           filters: |
             shared: ['pyproject.toml','uv.lock','src/core/**']
             ocr: ['src/ocr_worker/**']
@@ -93,10 +96,11 @@ jobs:
           shared='${{ steps.filter.outputs.shared }}'
           items=()
           add() { items+=("$1"); }
-          # entry: service|dockerfile|ecr_repo|target|compose_svc
-          [ "$shared" = "true" ] || [ "${{ steps.filter.outputs.ocr }}" = "true" ]     && add '{"service":"ocr","dockerfile":"src/ocr_worker/Dockerfile","repo":"soma/ocr","target":"ocr","svc":"ocr-worker"}'
-          [ "$shared" = "true" ] || [ "${{ steps.filter.outputs.report }}" = "true" ]  && add '{"service":"report","dockerfile":"src/report_worker/Dockerfile","repo":"soma/report","target":"backend","svc":"report"}'
-          [ "$shared" = "true" ] || [ "${{ steps.filter.outputs.chatbot }}" = "true" ] && add '{"service":"chatbot","dockerfile":"src/chatbot/Dockerfile","repo":"soma/chatbot","target":"backend","svc":"chatbot"}'
+          # entry: service|dockerfile|ecr_repo|image_tag|target|compose_svc
+          # ocr는 전용 저장소 soma/ocr(:dev), report·chatbot은 공용 soma/ai에 서비스별 태그로 구분한다.
+          [ "$shared" = "true" ] || [ "${{ steps.filter.outputs.ocr }}" = "true" ]     && add '{"service":"ocr","dockerfile":"src/ocr_worker/Dockerfile","repo":"soma/ocr","tag":"dev","target":"ocr","svc":"ocr-worker"}'
+          [ "$shared" = "true" ] || [ "${{ steps.filter.outputs.report }}" = "true" ]  && add '{"service":"report","dockerfile":"src/report_worker/Dockerfile","repo":"soma/ai","tag":"report-dev","target":"backend","svc":"report"}'
+          [ "$shared" = "true" ] || [ "${{ steps.filter.outputs.chatbot }}" = "true" ] && add '{"service":"chatbot","dockerfile":"src/chatbot/Dockerfile","repo":"soma/ai","tag":"chatbot-dev","target":"backend","svc":"chatbot"}'
           json=$(IFS=,; echo "[${items[*]}]")
           echo "matrix={\"include\":$json}" >> "$GITHUB_OUTPUT"
           echo "will build: $json"
@@ -135,8 +139,8 @@ jobs:
           file: ${{ matrix.dockerfile }}
           push: true
           tags: |
-            ${{ secrets.AWS_ECR_REGISTRY }}/${{ matrix.repo }}:dev
-            ${{ secrets.AWS_ECR_REGISTRY }}/${{ matrix.repo }}:${{ github.sha }}
+            ${{ secrets.AWS_ECR_REGISTRY }}/${{ matrix.repo }}:${{ matrix.tag }}
+            ${{ secrets.AWS_ECR_REGISTRY }}/${{ matrix.repo }}:${{ matrix.tag }}-${{ github.sha }}
           cache-from: type=gha,scope=${{ matrix.service }}
           cache-to: type=gha,mode=max,scope=${{ matrix.service }}
 
@@ -174,8 +178,19 @@ jobs:
             --parameters commands="$CMD" \
             --query "Command.CommandId" --output text)
           echo "SSM CommandId=$CMD_ID"
-          aws ssm wait command-executed --command-id "$CMD_ID" --instance-id "${{ steps.t.outputs.instance }}" || true
-          STATUS=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "${{ steps.t.outputs.instance }}" --query Status --output text)
+          # 기본 waiter(약 100초)는 큰 이미지(OCR=torch/surya) pull 도중 InProgress로 끝나
+          # 배포가 진행 중인데도 실패로 처리됐다 → 최대 12분까지 상태를 직접 폴링한다.
+          INSTANCE="${{ steps.t.outputs.instance }}"
+          STATUS=Pending
+          for i in $(seq 1 72); do
+            STATUS=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE" --query Status --output text 2>/dev/null || echo Pending)
+            case "$STATUS" in
+              Success) break ;;
+              Failed|Cancelled|TimedOut) echo "SSM $STATUS"; exit 1 ;;
+            esac
+            echo "SSM $STATUS ... ($i/72)"
+            sleep 10
+          done
           echo "SSM Status=$STATUS"
           [ "$STATUS" = "Success" ]
 
@@ -186,4 +201,4 @@ jobs:
           webhook_url: ${{ job.status == 'success' && secrets.DISCORD_WEBHOOK_DEPLOYMENT || secrets.DISCORD_WEBHOOK_CI_FAILURES }}
           status: ${{ job.status }}
           service: ${{ matrix.service }}
-          image_tag: ${{ github.sha }}
+          image_tag: ${{ matrix.repo }}:${{ matrix.tag }}
