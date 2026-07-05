@@ -31,10 +31,16 @@ class PoolNotInitializedError(RuntimeError):
     """`init_pool()` 호출 전에 `get_pool()`을 부른 경우."""
 
 
-def _build_ssl(ca_path: str | None) -> ssl.SSLContext | None:
-    """RDS면 CA 번들로 SSL 컨텍스트를, 로컬 PG면 None(SSL 끔)을 반환한다."""
+def _build_ssl(ca_path: str | None) -> ssl.SSLContext | bool:
+    """RDS면 CA 번들로 SSL 컨텍스트를, 로컬 PG면 False(SSL 완전 비활성)를 반환한다.
+
+    asyncpg에서 ``ssl=None``은 'prefer'(SSL 우선 시도)라 로컬 PG에서도 클라이언트
+    인증서 자동탐색(``~/.postgresql/postgresql.crt``)을 시도한다 — 홈 경로가 비-ASCII면
+    그 과정에서 ``load_cert_chain``이 실패할 수 있다. CA 경로가 없으면 명시적으로
+    ``False``를 반환해 SSL을 끈다(로컬 개발). RDS는 항상 ``rds_ca_path``가 있어 검증한다.
+    """
     if not ca_path:
-        return None
+        return False
     return ssl.create_default_context(cafile=ca_path)
 
 

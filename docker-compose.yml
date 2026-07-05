@@ -13,12 +13,15 @@ services:
       - "9092:9092"
     environment:
       # KRaft 단일 노드 = broker + controller 겸임
+      # LISTENERS는 host를 비워(=0.0.0.0) 바인딩하고, ADVERTISED에만 라우팅 가능한
+      # 호스트명을 준다(INTERNAL=compose 내부용 kafka:29092 / EXTERNAL=호스트용 localhost:9092).
+      # advertised에 0.0.0.0을 두면 KRaft 검증에서 거부되므로 절대 넣지 않는다.
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
-      KAFKA_LISTENERS: CONTROLLER://0.0.0.0:9093,INTERNAL://0.0.0.0:29092,EXTERNAL://0.0.0.0:9092
+      KAFKA_LISTENERS: CONTROLLER://:29093,INTERNAL://:29092,EXTERNAL://:9092
       KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:9092
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
       # 단일 노드 → 복제계수·ISR 1
