@@ -185,14 +185,20 @@ jobs:
           for i in $(seq 1 72); do
             STATUS=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE" --query Status --output text 2>/dev/null || echo Pending)
             case "$STATUS" in
-              Success) break ;;
-              Failed|Cancelled|TimedOut) echo "SSM $STATUS"; exit 1 ;;
+              Success | Failed | Cancelled | TimedOut) break ;;
             esac
             echo "SSM $STATUS ... ($i/72)"
             sleep 10
           done
           echo "SSM Status=$STATUS"
-          [ "$STATUS" = "Success" ]
+          if [ "$STATUS" != "Success" ]; then
+            # 호스트에서 왜 실패했는지 드러낸다(compose·이미지·env 문제 진단).
+            echo "----- SSM StandardError (host) -----"
+            aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE" --query StandardErrorContent --output text 2>/dev/null | tail -50
+            echo "----- SSM StandardOutput (host, tail) -----"
+            aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE" --query StandardOutputContent --output text 2>/dev/null | tail -30
+            exit 1
+          fi
 
       - name: Notify deploy result
         if: always()
