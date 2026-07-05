@@ -238,6 +238,28 @@ class OcrProcessor:
         Raises:
             OcrError: 다운로드·렌더·OCR 중 실패.
         """
+        result, _images = await self.process_with_images(s3_key, content_type)
+        return result
+
+    async def process_with_images(
+        self, s3_key: str, content_type: str
+    ) -> tuple[OcrResult, list[PageImage]]:
+        """OCR 결과와 함께 **렌더한 페이지 이미지**를 반환한다(#15 파이프라인용).
+
+        이미지 마스킹 트랙(#18)은 같은 문서를 다시 내려받아 재렌더하지 않고 이 이미지를
+        재사용해 검은블럭 사본을 만든다(S3 GetObject·PDF 래스터화 중복 회피). ``process``는
+        이 메서드에 위임하고 이미지를 버린다(분류·추출·텍스트 마스킹만 필요한 경로).
+
+        Args:
+            s3_key: 원본 파일 S3 키.
+            content_type: ``OcrJob.content_type``(application/pdf | image/*).
+
+        Returns:
+            ``(OcrResult, 페이지 이미지 목록)`` — 순서·길이는 ``result.pages``와 일치한다.
+
+        Raises:
+            OcrError: 다운로드·렌더·OCR 중 실패.
+        """
         data = await self._fetch(s3_key)
         images = await asyncio.to_thread(self._render, data, content_type)
         lines_per_page = await asyncio.to_thread(self._engine.recognize, images)
@@ -248,7 +270,7 @@ class OcrProcessor:
             lines=sum(len(page.lines) for page in result.pages),
             mean_confidence=round(result.mean_confidence, 3),
         )
-        return result
+        return result, images
 
 
 def _build_result(images: list[PageImage], lines_per_page: list[list[OcrLine]]) -> OcrResult:

@@ -27,6 +27,10 @@ from ocr_worker.ocr import OcrResult
 
 logger = get_logger(__name__)
 
+# 진입부 멱등 단락(#15)용 조회 — 이미 처리된 job_id면 무거운 OCR을 건너뛰고
+# 기존 id·doc_type으로 ReportJob만 재발행한다.
+_SELECT_BY_JOB_SQL = "SELECT id, doc_type FROM ocr_results WHERE job_id = $1"
+
 # 여러 문 없이 단일 업서트 — job_id 충돌 시 내용 갱신 + 기존 id 반환(RETURNING이
 # INSERT/UPDATE 어느 경로든 행을 돌려주도록 DO UPDATE를 쓴다). created_at·id는 불변.
 _UPSERT_SQL = """
@@ -98,6 +102,26 @@ def build_masked_lines(result: OcrResult, mask: Callable[[str], str]) -> list[di
                 }
             )
     return lines
+
+
+async def find_ocr_result(pool: asyncpg.Pool, job_id: str) -> tuple[str, DocType] | None:
+    """``job_id``로 이미 저장된 결과의 ``(id, doc_type)``을 찾는다(없으면 None).
+
+    파이프라인(#15)의 진입부 멱등 단락에 쓴다 — at-least-once 재소비로 같은 작업이
+    다시 들어오면, 이미 한 행이 있으므로 OCR·마스킹을 반복하지 않고 이 id·doc_type으로
+    ``ReportJob``만 재발행한다(발행 후 커밋 규약상 crash 시 재발행이 안전).
+
+    Args:
+        pool: asyncpg 연결 풀(core.db).
+        job_id: OCR 작업 식별자(UUID 문자열, 멱등 키).
+
+    Returns:
+        ``(ocr_results.id, doc_type)`` 튜플 또는 미존재 시 ``None``.
+    """
+    row = await pool.fetchrow(_SELECT_BY_JOB_SQL, uuid.UUID(job_id))
+    if row is None:
+        return None
+    return str(row["id"]), DocType(row["doc_type"])
 
 
 async def save_ocr_result(pool: asyncpg.Pool, record: OcrResultRecord) -> str:
