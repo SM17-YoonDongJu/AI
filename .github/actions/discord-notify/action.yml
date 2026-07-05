@@ -40,7 +40,7 @@ runs:
           *)         COLOR=8421504;  ICON="ℹ️"; STATUS_KO="알림" ;;
         esac
         if [ -n "${{ inputs.image_tag }}" ]; then KIND="배포"; else KIND="CI"; fi
-        TITLE="$ICON [${{ inputs.service }}] $KIND $STATUS_KO"
+        TITLE="$ICON AI $KIND $STATUS_KO"
 
         # 커밋 메시지는 JSON 값에 안전하게 넣도록 역슬래시·따옴표를 이스케이프한다.
         COMMIT_MSG=$(git log -1 --pretty=%s 2>/dev/null | sed 's/\\/\\\\/g; s/"/\\"/g')
