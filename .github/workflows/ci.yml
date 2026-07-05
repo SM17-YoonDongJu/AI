@@ -3,7 +3,8 @@ name: CI
 
 on:
   push:
-    branches: [dev]
+    # dev 상시 + 기능 브랜치 push도 CI 검증(워크플로가 dev에 병합되기 전까지 PR 자체 검증용).
+    branches: [dev, "13-feature-ocr-worker-구현"]
   pull_request:
     branches: [dev]
 
