@@ -144,11 +144,15 @@ jobs:
           docker image prune -f
           EOF
           )
+          # 스크립트 전체를 base64로 감싸 전달한다. compose 기록 블록의 따옴표·콤마가 base64 안으로
+          # 들어가므로, --parameters(shorthand/JSON) 파싱이 특수문자로 깨지지 않는다.
+          B64=$(printf '%s' "$CMD" | base64 -w0)
+          printf '{"commands":["echo %s | base64 -d | bash"]}' "$B64" > /tmp/ssm-params.json
           CMD_ID=$(aws ssm send-command \
             --instance-ids "${{ steps.t.outputs.instance }}" \
             --document-name "AWS-RunShellScript" \
             --comment "deploy ${{ matrix.svc }} ${{ github.sha }}" \
-            --parameters commands="$CMD" \
+            --parameters file:///tmp/ssm-params.json \
             --query "Command.CommandId" --output text)
           echo "SSM CommandId=$CMD_ID"
           # 기본 waiter(약 100초)는 큰 이미지(OCR=torch/surya) pull 도중 InProgress로 끝나
