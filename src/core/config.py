@@ -15,6 +15,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # 임베딩 차원은 계약상 고정값(qwen3:embedding 1024d, BGE-M3 폴백도 1024d).
 DEFAULT_EMBEDDING_DIM = 1024
 
+# CD 스모크: shared(core) 변경으로 3개 서비스 배포 경로 검증(값·동작 무변경).
+
 
 class Settings(BaseSettings):
     """전 워커가 공유하는 환경설정. env 변수명은 필드명과 동일(대소문자 무시)."""
