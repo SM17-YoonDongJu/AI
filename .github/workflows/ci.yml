@@ -97,10 +97,10 @@ jobs:
           items=()
           add() { items+=("$1"); }
           # entry: service|dockerfile|ecr_repo|image_tag|target|compose_svc
-          # ocr는 전용 저장소 soma/ocr(:dev), report·chatbot은 공용 soma/ai에 서비스별 태그로 구분한다.
+          # 서비스별 전용 저장소(soma/ocr·soma/report·soma/chatbot)에 각각 :dev 태그로 push한다.
           [ "$shared" = "true" ] || [ "${{ steps.filter.outputs.ocr }}" = "true" ]     && add '{"service":"ocr","dockerfile":"src/ocr_worker/Dockerfile","repo":"soma/ocr","tag":"dev","target":"ocr","svc":"ocr-worker"}'
-          [ "$shared" = "true" ] || [ "${{ steps.filter.outputs.report }}" = "true" ]  && add '{"service":"report","dockerfile":"src/report_worker/Dockerfile","repo":"soma/ai","tag":"report-dev","target":"backend","svc":"report"}'
-          [ "$shared" = "true" ] || [ "${{ steps.filter.outputs.chatbot }}" = "true" ] && add '{"service":"chatbot","dockerfile":"src/chatbot/Dockerfile","repo":"soma/ai","tag":"chatbot-dev","target":"backend","svc":"chatbot"}'
+          [ "$shared" = "true" ] || [ "${{ steps.filter.outputs.report }}" = "true" ]  && add '{"service":"report","dockerfile":"src/report_worker/Dockerfile","repo":"soma/report","tag":"dev","target":"backend","svc":"report"}'
+          [ "$shared" = "true" ] || [ "${{ steps.filter.outputs.chatbot }}" = "true" ] && add '{"service":"chatbot","dockerfile":"src/chatbot/Dockerfile","repo":"soma/chatbot","tag":"dev","target":"backend","svc":"chatbot"}'
           json=$(IFS=,; echo "[${items[*]}]")
           echo "matrix={\"include\":$json}" >> "$GITHUB_OUTPUT"
           echo "will build: $json"
