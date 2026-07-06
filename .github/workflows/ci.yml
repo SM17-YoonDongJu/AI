@@ -1,19 +1,15 @@
-# CI/CD(dev) — dev PR/push 시 lint(ruff)+테스트(pytest). dev push(=병합) 성공 시
-# 변경된 서비스만 ECR 빌드→push→SSM 배포까지 한 워크플로에서 test→deploy로 잇는다.
-#
-# 왜 통합했나: 배포를 별도 파일 + workflow_run으로 두면 그 워크플로는 저장소 "기본
-# 브랜치(main)"에 있어야만 트리거된다(GitHub 제약). 워크플로가 dev에만 올라가는
-# 현 구조에선 dev 병합으로 CD가 안 붙는다 → test→deploy를 한 워크플로 needs로 잇는다.
-name: CI/CD Dev
+# CI — lint(ruff)+테스트(pytest). dev/main PR에서 직접 실행되고,
+# deploy.yml(push)에서 workflow_call로 재사용돼 "테스트 통과 후에만 배포"를 게이팅한다.
+# 배포 로직은 deploy.yml로 분리했다(Actions 사이드바 tab을 CI/Deploy로 나누기 위함).
+name: CI
 
 on:
-  push:
-    branches: [dev]
   pull_request:
-    branches: [dev]
+    branches: [dev, main]
+  # deploy.yml이 `uses: ./.github/workflows/ci.yml`로 호출한다. secrets: inherit로 웹훅 전달.
+  workflow_call:
 
 jobs:
-  # 1) 테스트 — PR·push 공통. deploy의 전제(needs)다. 실패하면 배포는 시작되지 않는다.
   test:
     runs-on: ubuntu-latest
     services:
@@ -60,6 +56,7 @@ jobs:
           status: failure
           service: ci
 
+      # push(=deploy.yml 경유 호출)일 때만 성공 알림. PR 직접 실행에선 조용히 통과.
       - name: Notify success
         if: success() && github.event_name == 'push'
         uses: ./.github/actions/discord-notify
@@ -67,151 +64,3 @@ jobs:
           webhook_url: ${{ secrets.DISCORD_WEBHOOK_CI_BUILDS }}
           status: success
           service: ci
-
-  # 2) 변경 감지 — dev push 한정. 빌드할 서비스 목록(JSON matrix)을 만든다.
-  #    공용 코드(core/pyproject/uv.lock) 변경 시 3개 전부 재빌드.
-  changes:
-    needs: test
-    if: github.event_name == 'push'
-    runs-on: ubuntu-latest
-    outputs:
-      matrix: ${{ steps.set.outputs.matrix }}
-    steps:
-      - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
-      - uses: dorny/paths-filter@v3
-        id: filter
-        with:
-          # dev의 "이 push 이전 커밋"과 비교한다. base 미지정 시 기본 브랜치(main)와
-          # 비교돼 dev의 거의 모든 파일이 변경으로 잡혀 3개 서비스가 매번 재빌드된다.
-          base: dev
-          filters: |
-            shared: ['pyproject.toml','uv.lock','src/core/**']
-            ocr: ['src/ocr_worker/**']
-            report: ['src/report_worker/**','src/rag/**','src/guardrail/**']
-            chatbot: ['src/chatbot/**','src/rag/**','src/guardrail/**']
-      - id: set
-        shell: bash
-        run: |
-          shared='${{ steps.filter.outputs.shared }}'
-          items=()
-          add() { items+=("$1"); }
-          # entry: service|dockerfile|ecr_repo|image_tag|target|compose_svc
-          # 서비스별 전용 저장소(soma/ocr·soma/report·soma/chatbot)에 각각 :dev 태그로 push한다.
-          # target=ocr: GPU EC2에 SSM 배포 / target=backend: backend EC2에 SSM 배포(둘 다 이 리포가 직접).
-          [ "$shared" = "true" ] || [ "${{ steps.filter.outputs.ocr }}" = "true" ]     && add '{"service":"ocr","dockerfile":"src/ocr_worker/Dockerfile","repo":"soma/ocr","tag":"dev","target":"ocr","svc":"ocr-worker"}'
-          [ "$shared" = "true" ] || [ "${{ steps.filter.outputs.report }}" = "true" ]  && add '{"service":"report","dockerfile":"src/report_worker/Dockerfile","repo":"soma/report","tag":"dev","target":"backend","svc":"report"}'
-          [ "$shared" = "true" ] || [ "${{ steps.filter.outputs.chatbot }}" = "true" ] && add '{"service":"chatbot","dockerfile":"src/chatbot/Dockerfile","repo":"soma/chatbot","tag":"dev","target":"backend","svc":"chatbot"}'
-          json=$(IFS=,; echo "[${items[*]}]")
-          echo "matrix={\"include\":$json}" >> "$GITHUB_OUTPUT"
-          echo "will build: $json"
-
-  # 3) 빌드→push→SSM 배포 (서비스별 병렬). dev push + 변경분 존재 시에만.
-  deploy:
-    needs: changes
-    if: ${{ github.event_name == 'push' && needs.changes.outputs.matrix != '{"include":[]}' }}
-    runs-on: ubuntu-latest
-    permissions:
-      id-token: write   # OIDC
-      contents: read
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJson(needs.changes.outputs.matrix) }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Compute short sha
-        id: v
-        shell: bash
-        run: echo "sha7=$(echo ${{ github.sha }} | cut -c1-7)" >> "$GITHUB_OUTPUT"
-
-      - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ secrets.AWS_REGION }}
-
-      - name: Login to ECR
-        id: ecr
-        uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Set up Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build & push (${{ matrix.service }})
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ${{ matrix.dockerfile }}
-          push: true
-          # :dev = 가변(latest, compose가 pull) / :<sha7> = 불변(커밋별, 감사·롤백용).
-          tags: |
-            ${{ secrets.AWS_ECR_REGISTRY }}/${{ matrix.repo }}:${{ matrix.tag }}
-            ${{ secrets.AWS_ECR_REGISTRY }}/${{ matrix.repo }}:${{ steps.v.outputs.sha7 }}
-          cache-from: type=gha,scope=${{ matrix.service }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
-
-      # 대상 EC2/compose 경로를 target에 따라 결정. ocr=GPU EC2 / backend=범용 EC2, 둘 다 SSM 직접 배포.
-      - name: Resolve deploy target
-        id: t
-        shell: bash
-        run: |
-          if [ "${{ matrix.target }}" = "ocr" ]; then
-            echo "instance=${{ vars.OCR_EC2_INSTANCE_ID }}" >> "$GITHUB_OUTPUT"
-            echo "compose=/opt/ocr/docker-compose.ocr.yml" >> "$GITHUB_OUTPUT"
-            echo "envfile=/opt/ocr/.env.ocr" >> "$GITHUB_OUTPUT"
-          else
-            echo "instance=${{ vars.BACKEND_EC2_INSTANCE_ID }}" >> "$GITHUB_OUTPUT"
-            echo "compose=/home/ubuntu/backend/docker-compose.yml" >> "$GITHUB_OUTPUT"
-            echo "envfile=/home/ubuntu/backend/.env.dev" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Deploy via SSM (${{ matrix.svc }})
-        shell: bash
-        run: |
-          CMD=$(cat <<EOF
-          set -e
-          cd \$(dirname ${{ steps.t.outputs.compose }})
-          aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | docker login --username AWS --password-stdin ${{ secrets.AWS_ECR_REGISTRY }}
-          docker compose -f ${{ steps.t.outputs.compose }} --env-file ${{ steps.t.outputs.envfile }} pull ${{ matrix.svc }}
-          docker compose -f ${{ steps.t.outputs.compose }} --env-file ${{ steps.t.outputs.envfile }} up -d --no-deps ${{ matrix.svc }}
-          docker image prune -f
-          EOF
-          )
-          CMD_ID=$(aws ssm send-command \
-            --instance-ids "${{ steps.t.outputs.instance }}" \
-            --document-name "AWS-RunShellScript" \
-            --comment "deploy ${{ matrix.svc }} ${{ github.sha }}" \
-            --parameters commands="$CMD" \
-            --query "Command.CommandId" --output text)
-          echo "SSM CommandId=$CMD_ID"
-          # 기본 waiter(약 100초)는 큰 이미지(OCR=torch/surya) pull 도중 InProgress로 끝나
-          # 배포가 진행 중인데도 실패로 처리됐다 → 최대 12분까지 상태를 직접 폴링한다.
-          INSTANCE="${{ steps.t.outputs.instance }}"
-          STATUS=Pending
-          for i in $(seq 1 72); do
-            STATUS=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE" --query Status --output text 2>/dev/null || echo Pending)
-            case "$STATUS" in
-              Success | Failed | Cancelled | TimedOut) break ;;
-            esac
-            echo "SSM $STATUS ... ($i/72)"
-            sleep 10
-          done
-          echo "SSM Status=$STATUS"
-          if [ "$STATUS" != "Success" ]; then
-            # 호스트에서 왜 실패했는지 드러낸다(compose·이미지·env 문제 진단).
-            echo "----- SSM StandardError (host) -----"
-            aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE" --query StandardErrorContent --output text 2>/dev/null | tail -50
-            echo "----- SSM StandardOutput (host, tail) -----"
-            aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE" --query StandardOutputContent --output text 2>/dev/null | tail -30
-            exit 1
-          fi
-
-      - name: Notify deploy result
-        if: always()
-        uses: ./.github/actions/discord-notify
-        with:
-          webhook_url: ${{ job.status == 'success' && secrets.DISCORD_WEBHOOK_DEPLOYMENT || secrets.DISCORD_WEBHOOK_CI_FAILURES }}
-          status: ${{ job.status }}
-          service: ${{ matrix.service }}
-          image_tag: ${{ matrix.repo }}:${{ matrix.tag }}
