@@ -24,6 +24,7 @@ htmlcov/
 .env
 .env.*
 !.env.example
+!.env.ocr.example
 secrets/
 *.pem
 *.key
