@@ -214,15 +214,36 @@ jobs:
           # repo scope PAT — backend 리포에 dispatch 권한. 대상: <org>/backend (vars.BACKEND_REPO).
           DISPATCH_TOKEN: ${{ secrets.BACKEND_DISPATCH_PAT }}
         run: |
-          HTTP=$(curl -sS -o /tmp/resp -w "%{http_code}" -X POST \
-            -H "Authorization: token ${DISPATCH_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ vars.BACKEND_REPO }}/dispatches" \
-            -d "{\"event_type\":\"${{ matrix.event }}\",\"client_payload\":{\"tag\":\"${{ steps.v.outputs.sha7 }}\"}}")
-          echo "dispatch ${{ matrix.event }} tag=${{ steps.v.outputs.sha7 }} -> HTTP $HTTP"
-          # 성공은 204 No Content. 그 외는 응답 본문을 드러내고 실패 처리.
+          set -euo pipefail
+          REPO="${{ vars.BACKEND_REPO }}"
+          # 사전 가드: 설정 누락 시 빈 URL·빈 토큰으로 요청해 엉뚱한 결과가 나기 전에 명확히 실패시킨다.
+          if [ -z "${DISPATCH_TOKEN}" ]; then
+            echo "::error::BACKEND_DISPATCH_PAT secret이 비어 있음 — dispatch 불가"; exit 1
+          fi
+          if [ -z "$REPO" ]; then
+            echo "::error::BACKEND_REPO variable이 비어 있음 — dispatch 대상 미지정"; exit 1
+          fi
+
+          # 일시 오류(000=연결 실패, 5xx)는 재시도. 성공은 204 No Content만 인정한다.
+          HTTP=000
+          for attempt in 1 2 3; do
+            HTTP=$(curl -sS -o /tmp/resp -w "%{http_code}" -X POST \
+              -H "Authorization: token ${DISPATCH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/dispatches" \
+              -d "{\"event_type\":\"${{ matrix.event }}\",\"client_payload\":{\"tag\":\"${{ steps.v.outputs.sha7 }}\"}}" || echo 000)
+            echo "dispatch ${{ matrix.event }} -> ${REPO} tag=${{ steps.v.outputs.sha7 }} (attempt $attempt) -> HTTP $HTTP"
+            # 204=성공, 4xx=재시도해도 동일(설정/권한 문제)하므로 즉시 중단, 000/5xx만 재시도.
+            case "$HTTP" in
+              204) break ;;
+              4*)  break ;;
+            esac
+            [ "$attempt" -lt 3 ] && sleep 5
+          done
+          # 204가 아니면 응답 본문을 드러내고 실패 처리(가짜 성공 방지).
           if [ "$HTTP" != "204" ]; then
-            cat /tmp/resp
+            echo "::error::dispatch 실패 (HTTP $HTTP) — backend 배포가 트리거되지 않음"
+            cat /tmp/resp || true
             exit 1
           fi
 
