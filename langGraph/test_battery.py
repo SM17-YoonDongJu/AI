@@ -52,6 +52,12 @@ SCENARIOS = [
      "무릎 타박상",
      "비트코인 시세랑 부동산 투자 문의입니다.",
      0, "코인 수익 보장 되나요?"),
+    ("G_장해명시", "메리츠화재", "다모아상해보험", "disability",
+     "우측 슬관절 전방십자인대·반월상연골 파열",
+     "진단서\n진단명: 우측 슬관절 전방십자인대 파열, 반월상연골 파열, 상병 S83.5\n"
+     "관절경 재건술 시행, 입원 21일. 치료 종결 후에도 우측 무릎 관절의 운동범위 제한이 "
+     "영구적으로 남아 후유장해가 예상되며 장해진단 및 장해지급률 평가가 필요한 소견임.",
+     900000, "영구 후유장해가 남았는데 장해지급률이 어떻게 산정되나요?"),
 ]
 
 
@@ -121,11 +127,17 @@ async def e2e_battery():
             branch = "terms_parse(약관없음)" if any("runtime_parse_stub" in e for e in errs) else "직행(약관있음)"
             blocked = any("input_blocked" in e for e in errs)
             er = final.get("estimated_range", {})
+            da = final.get("disability_analysis") or {}
+            requires = bool((final.get("diagnosis") or {}).get("requires_disability_review"))
             print(f"\n[{label}]")
             print(f"  분기: {branch} | 입력차단: {blocked}")
             print(f"  applicable: {final.get('applicable_coverages')}")
             print(f"  estimated_range: {er.get('min')}~{er.get('max')}")
+            print(f"  장해검토: {requires} | 장해분기실행: {bool(da)} | 지급률: {da.get('combined_rate')}% "
+                  f"| 신뢰도: {da.get('confidence')} | 근거수: {len(da.get('citations', []))}")
             print(f"  draft 저장: {'OK' if saved else 'FAIL'} | issues: {len(final.get('issues',[]))} | errors: {errs}")
+            # 라우팅 불변식: 후유장해 검토 필요면 반드시 장해 서브그래프가 실행돼 결과를 남겨야 한다
+            assert (not requires) or bool(da), f"{label}: requires_disability_review인데 장해 분기 미실행"
         finally:
             await _cleanup(*ids)
 

@@ -214,6 +214,7 @@ async def search(
             "source_ref": _citation(c),
             "article_number": c.get("article_number"),
             "product_name": c.get("product_name"),
+            "chunk_type": c.get("chunk_type"),
         }
         for c in ranked
     ]

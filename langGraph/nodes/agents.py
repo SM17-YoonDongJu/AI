@@ -14,6 +14,7 @@ from typing import Any
 
 import guardrail
 from core import ai_client, db
+from report_worker.disability_rules import combine_disability_rate
 
 from ..rag import hybrid
 from ..state import ReportState
@@ -244,14 +245,139 @@ async def case_search(state: ReportState) -> dict[str, Any]:
     return {"legal_references": refs}
 
 
+# ── 분기: 후유장해 검토 필요 시 장해 서브그래프로 ──────────────
+def route_after_case(state: ReportState) -> str:
+    """진단이 requires_disability_review면 장해 노드로, 아니면 보험금 계산 직행."""
+    if (state.get("diagnosis") or {}).get("requires_disability_review"):
+        return "disability"
+    return "payment_calc"
+
+
+# ── 장해 분류·지급률 추출 (RAG + LLM, 숫자는 약관에서만) ────────
+@safe_node
+async def disability_rag(state: ReportState) -> dict[str, Any]:
+    ci = state.get("case_info", {})
+    dx = state.get("diagnosis") or {}
+    dx_name = dx.get("diagnosis") or ci.get("diagnosis") or ""
+    icd = " ".join(dx.get("icd_codes") or [])
+    query = f"{dx_name} {icd} 후유장해 장해분류표 지급률".strip()
+    res = await hybrid.search(
+        query, namespaces=["terms"], top_k=8,
+        insurer=ci.get("insurer"), product=ci.get("product_name"),
+    )
+    ranked = res.get("ranked_chunks", [])
+    # 장해분류표(schedule) 청크 선별 — chunk_type 우선, 없으면 헤더 휴리스틱
+    sched = [c for c in ranked if c.get("chunk_type") == "schedule"]
+    if not sched:
+        sched = [c for c in ranked if "장해의 분류" in (c.get("text") or "")]
+
+    caveat = "가입금액 미보유로 절대 보험금 불가·약관표 위치정렬 한계 — 지급률은 추정"
+    existing = state.get("retrieved_clauses", [])
+    if not sched:
+        return {
+            "disability_analysis": {
+                "items": [], "combined_rate": 0.0, "rule_notes": [],
+                "citations": [], "confidence": "low", "caveat": "장해분류표 미검색",
+            },
+            "retrieved_clauses": existing,
+            "errors": _err(state, "disability_schedule_missing"),
+        }
+
+    sched_text = "\n".join((c.get("text") or "") for c in sched)
+    ctx = "\n---\n".join(f"{c['source_ref']}\n{(c.get('text') or '')[:800]}" for c in sched[:6])
+    raw = await ai_client.chat_json(
+        [
+            {"role": "system", "content": (
+                "너는 보험 약관 장해분류표 분석가다. 제공된 [약관 장해분류표 원문]에서만 근거를 찾아 "
+                "사고를 분류하고 지급률을 추출한다. 표에 없는 지급률은 절대 만들지 마라. JSON만 출력한다."
+            )},
+            {"role": "user", "content": (
+                f"[사고/진단]\n{dx_name} / ICD {icd}\n\n[약관 장해분류표 원문]\n{ctx}\n\n"
+                'JSON 키: items(배열, 각 원소 = injury(str), '
+                'body_region(눈·귀·코·씹기말하기·척추·체간골·팔·다리·손가락·발가락·흉복부장기·신경계정신 중 하나), '
+                'category_label(원문 항목 텍스트 그대로 복사), rate(number 지급률 %), '
+                'rate_quote(rate 숫자가 등장한 원문 구절 그대로 복사), temporary(bool 한시장해), '
+                'temporary_years(number 또는 null), citation(위 원문 source_ref 중 하나)), '
+                'uncertain(bool), notes(str).\n'
+                '규칙: rate는 원문에 실제 등장하는 숫자만. category_label·rate_quote는 요약 말고 복사. '
+                '적합 항목 없으면 items=[] uncertain=true. 추측으로 숫자 만들지 마라.'
+            )},
+        ]
+    )
+    raw = raw if isinstance(raw, dict) else {}
+    uncertain = bool(raw.get("uncertain"))
+
+    items: list[dict[str, Any]] = []
+    notes: list[str] = []
+    for it in raw.get("items", []) if isinstance(raw.get("items"), list) else []:
+        if not isinstance(it, dict):
+            continue
+        try:
+            rate_f = float(it.get("rate"))
+        except (TypeError, ValueError):
+            continue
+        quote = str(it.get("rate_quote") or "")
+        # 결정론 백스톱: 지급률 숫자가 인용 원문에 실제로 존재해야 인정
+        verified = bool(quote) and (str(int(rate_f)) in sched_text)
+        injury = str(it.get("injury") or "")
+        if not verified:
+            notes.append(f"미검증 지급률 제외: {injury} {rate_f}%")
+        items.append({
+            "injury": injury,
+            "body_region": str(it.get("body_region") or "기타"),
+            "category_label": str(it.get("category_label") or ""),
+            "rate": rate_f,
+            "rate_quote": quote,
+            "temporary": bool(it.get("temporary")),
+            "temporary_years": it.get("temporary_years"),
+            "citation": str(it.get("citation") or ""),
+            "verified": verified,
+        })
+
+    verified_n = sum(1 for i in items if i["verified"])
+    confidence = "high" if (items and verified_n == len(items) and not uncertain) else (
+        "medium" if verified_n else "low"
+    )
+    citations = list(dict.fromkeys(i["citation"] for i in items if i["citation"])) or res.get("citations", [])[:6]
+
+    seen = {c.get("source_ref") for c in existing}
+    merged = existing + [c for c in sched if c.get("source_ref") not in seen]
+    return {
+        "disability_analysis": {
+            "items": items, "rule_notes": notes, "citations": citations,
+            "confidence": confidence, "caveat": caveat,
+        },
+        "retrieved_clauses": merged,
+    }
+
+
+# ── 장해지급률 결정론 합산 (LLM 없음) ──────────────────────────
+@safe_node
+async def disability_calc(state: ReportState) -> dict[str, Any]:
+    da = state.get("disability_analysis", {})
+    verified = [i for i in da.get("items", []) if i.get("verified")]
+    result = combine_disability_rate(verified)
+    return {
+        "disability_analysis": {
+            **da,
+            "combined_rate": result["combined_rate"],
+            "normalized_items": result["normalized_items"],
+            "rule_notes": list(da.get("rule_notes", [])) + result["rule_notes"],
+        }
+    }
+
+
 # ── 보험금 계산 (추정 범위, 단정 금지) ─────────────────────────
 @safe_node
 async def payment_calc(state: ReportState) -> dict[str, Any]:
     offered = state.get("case_info", {}).get("offered_amount") or 0
-    # 실험 간이 추정: 제안액 기반 ±범위 (실제는 특약별 가입금액·지급률·장해율 반영)
     base = max(offered, 0)
+    # 가입금액 미보유 → 절대 보험금은 못 냄. 장해지급률이 있으면 상단 배수를 지급률에 비례해
+    # 확장(0%→×1.0, 100%→×1.8)하고, 없으면 기존 ±범위(×1.8)로 폴백. 모두 '추정'.
+    rate = float((state.get("disability_analysis") or {}).get("combined_rate") or 0.0)
+    factor_hi = 1.0 + min(rate, 100.0) / 100.0 * 0.8 if rate > 0 else 1.8
     lo = int(base * 1.0)
-    hi = int(base * 1.8) if base else 0
+    hi = int(base * factor_hi) if base else 0
     return {"estimated_range": {"min": lo, "max": hi}}
 
 
@@ -262,6 +388,14 @@ async def report_compose(state: ReportState) -> dict[str, Any]:
     ca = state.get("coverage_analysis", {})
     dx = state.get("diagnosis") or {}
     dx_name = dx.get("diagnosis") or ci.get("diagnosis") or ""
+    da = state.get("disability_analysis") or {}
+    disability_line = (
+        f"추정 합산 장해지급률 {da.get('combined_rate', 0)}% "
+        f"(신뢰도 {da.get('confidence', '-')}, 근거 {', '.join(da.get('citations', []))}) — "
+        f"규칙 {'; '.join(da.get('rule_notes', [])) or '-'}. ※ {da.get('caveat', '')}"
+        if da.get("items")
+        else "해당 없음(후유장해 미검토)"
+    )
     body = await ai_client.chat(
         [
             {"role": "system", "content": "너는 보험 손해사정 리포트 작성자다. 사실 주장에는 약관 조항 인용을 포함하고, 금액은 단정하지 말고 범위로 쓴다."},
@@ -273,6 +407,7 @@ async def report_compose(state: ReportState) -> dict[str, Any]:
                     f"누락 가능: {state.get('missing_coverages')}\n"
                     f"분석: {ca.get('analysis')}\n"
                     f"추정범위: {state.get('estimated_range')}\n"
+                    f"장해지급률: {disability_line}\n"
                     f"인용: {ca.get('citations')}\n\n"
                     "위 내용으로 손해사정 리포트 본문을 작성하라(사건요약/적용특약/분쟁포인트/추가확인 필요)."
                 ),
@@ -306,6 +441,7 @@ async def report_compose(state: ReportState) -> dict[str, Any]:
             for c in state.get("legal_references", [])[:5]
         ) or "관련 판례 없음",
         "5_추정보상범위": str(state.get("estimated_range", {})),
+        "5b_장해지급률": disability_line,
         "6_본문": body,
         "7_추가확인필요": "; ".join(state.get("errors", [])) or "없음",
     }
@@ -328,7 +464,8 @@ async def persist(state: ReportState) -> dict[str, Any]:
     # 약관 인용 + 판례 근거를 합쳐 basis_terms_precedents 구성
     terms_cites = state.get("coverage_analysis", {}).get("citations", [])
     case_refs = [c.get("source_ref") for c in state.get("legal_references", []) if c.get("source_ref")]
-    basis = terms_cites + case_refs
+    da_cites = (state.get("disability_analysis") or {}).get("citations", [])
+    basis = terms_cites + case_refs + da_cites
 
     draft = {
         "sections": state.get("sections", {}),
@@ -340,6 +477,7 @@ async def persist(state: ReportState) -> dict[str, Any]:
         "omitted_special_contract": state.get("missing_coverages", []),
         "basis_terms_precedents": basis,
         "legal_references": case_refs,   # 판례·분쟁조정 근거(별도 보존)
+        "disability": state.get("disability_analysis", {}),   # 장해지급률·근거(P1)
         "errors": state.get("errors", []),
     }
     rid = uuid.UUID(state["report_id"])
