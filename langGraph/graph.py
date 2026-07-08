@@ -28,7 +28,13 @@ def build_graph():
 
     g.add_edge(START, "load_context")
     g.add_edge("load_context", "input_guardrail")
-    g.add_edge("input_guardrail", "diagnosis")
+
+    # 차단(도메인외·PII정책 등) 시 LLM 파이프라인을 건너뛰고 즉시 종료 → 비용/오출력 방지
+    g.add_conditional_edges(
+        "input_guardrail",
+        agents.route_after_input,
+        {"blocked": END, "diagnosis": "diagnosis"},
+    )
 
     # 분기: 사용자 약관이 우리 DB(policy_chunks)에 있나?
     #   없음 → terms_parse(런타임 파싱 스텁) → coverage_parse

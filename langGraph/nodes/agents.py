@@ -6,17 +6,38 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import uuid
+from collections.abc import Awaitable, Callable
 from typing import Any
 
-from .. import ai_client, db, guardrail
+import guardrail
+from core import ai_client, db
+
 from ..rag import hybrid
 from ..state import ReportState
 
 
 def _err(state: ReportState, msg: str) -> list[str]:
     return list(state.get("errors", [])) + [msg]
+
+
+def safe_node(fn: Callable[[ReportState], Awaitable[dict[str, Any]]]):
+    """노드 예외를 삼켜 errors에 기록하고 부분결과로 진행한다(이슈 #11 방침).
+
+    노드 본문이 던지면 그래프 전체가 죽는 대신 {"errors": [...]}만 머지된다.
+    다운스트림 노드는 전부 state.get(key, default)로 읽으므로 누락 키에 안전하다.
+    """
+
+    @functools.wraps(fn)
+    async def wrapper(state: ReportState) -> dict[str, Any]:
+        try:
+            return await fn(state)
+        except Exception as e:
+            return {"errors": _err(state, f"{fn.__name__}_failed:{type(e).__name__}:{e}")}
+
+    return wrapper
 
 
 def _as_str_list(v: Any) -> list[str]:
@@ -35,8 +56,9 @@ def _as_str_list(v: Any) -> list[str]:
 
 
 # ── load_context: DB 조회로 사고/약관 컨텍스트 조립 ──────────────
+@safe_node
 async def load_context(state: ReportState) -> dict[str, Any]:
-    pool = await db.get_pool()
+    pool = db.get_pool()
     async with pool.acquire() as c:
         ocr = await c.fetchrow(
             "SELECT masked_text, entities FROM ocr_results WHERE id = $1",
@@ -86,6 +108,7 @@ async def load_context(state: ReportState) -> dict[str, Any]:
 
 
 # ── 입력 가드레일 ──────────────────────────────────────────────
+@safe_node
 async def input_guardrail(state: ReportState) -> dict[str, Any]:
     g = await guardrail.guard_input(state.get("masked_text", ""))
     out: dict[str, Any] = {"masked_text": g.masked_text}
@@ -98,6 +121,7 @@ async def input_guardrail(state: ReportState) -> dict[str, Any]:
 _ACCIDENT_TYPES = "medical_indemnity, traffic, disability, cancer_diagnosis, fire, liability, other"
 
 
+@safe_node
 async def diagnosis(state: ReportState) -> dict[str, Any]:
     text = state.get("masked_text", "")
     res = await ai_client.chat_json(
@@ -116,12 +140,12 @@ async def diagnosis(state: ReportState) -> dict[str, Any]:
     )
     if not isinstance(res, dict) or not res:
         return {
-            "medical_analysis": {"diagnosis": state.get("case_info", {}).get("diagnosis"), "accident_type": "other", "requires_disability_review": False},
+            "diagnosis": {"diagnosis": state.get("case_info", {}).get("diagnosis"), "accident_type": "other", "requires_disability_review": False},
             "errors": _err(state, "diagnosis_llm_failed"),
         }
     res.setdefault("accident_type", state.get("case_info", {}).get("accident_type") or "other")
     res.setdefault("requires_disability_review", False)
-    return {"medical_analysis": res}
+    return {"diagnosis": res}
 
 
 # ── 분기: 사용자 약관이 우리 DB(policy_chunks)에 있나? ──────────
@@ -130,19 +154,31 @@ async def policy_in_db(state: ReportState) -> str:
     product = state.get("case_info", {}).get("product_name")
     if not insurer:
         return "terms_parse"
-    pool = await db.get_pool()
-    async with pool.acquire() as c:
-        if product:
-            n = await c.fetchval(
-                "SELECT count(*) FROM policy_chunks WHERE insurer = $1 AND product_name = $2",
-                insurer, product,
-            )
-        else:
-            n = await c.fetchval("SELECT count(*) FROM policy_chunks WHERE insurer = $1", insurer)
+    try:
+        pool = db.get_pool()
+        async with pool.acquire() as c:
+            if product:
+                n = await c.fetchval(
+                    "SELECT count(*) FROM policy_chunks WHERE insurer = $1 AND product_name = $2",
+                    insurer, product,
+                )
+            else:
+                n = await c.fetchval("SELECT count(*) FROM policy_chunks WHERE insurer = $1", insurer)
+    except Exception:  # DB 조회 실패 시 안전하게 런타임 파싱 경로로
+        return "terms_parse"
     return "coverage_parse" if (n or 0) > 0 else "terms_parse"
 
 
+# ── 분기: 입력 가드레일 차단 여부 → 차단 시 파이프라인 단락 ─────
+def route_after_input(state: ReportState) -> str:
+    """input_guardrail이 도메인외/차단을 표시하면 LLM 파이프라인을 건너뛴다."""
+    if any(str(e).startswith("input_blocked") for e in state.get("errors", [])):
+        return "blocked"
+    return "diagnosis"
+
+
 # ── 약관 파싱 (분기 No 전용, 실험은 스텁) ──────────────────────
+@safe_node
 async def terms_parse(state: ReportState) -> dict[str, Any]:
     # 실제: 사용자 업로드 약관을 PDFPlumber/VLM 파싱 → 청킹 → 임시 임베딩.
     # 실험에서는 무거워 스킵하고 폴백 기록.
@@ -150,14 +186,19 @@ async def terms_parse(state: ReportState) -> dict[str, Any]:
 
 
 # ── 특약 파싱 (가입 특약 확정) ─────────────────────────────────
+@safe_node
 async def coverage_parse(state: ReportState) -> dict[str, Any]:
     return {"subscribed_coverages": state.get("subscribed_coverages", [])}
 
 
 # ── 특약·약관 분석 (Hybrid RAG + LLM) ──────────────────────────
+@safe_node
 async def coverage_analysis(state: ReportState) -> dict[str, Any]:
     ci = state.get("case_info", {})
-    query = f"{ci.get('diagnosis','')} {ci.get('question','')}".strip()
+    dx = state.get("diagnosis") or {}
+    dx_name = dx.get("diagnosis") or ci.get("diagnosis") or ""
+    icd = " ".join(dx.get("icd_codes") or [])
+    query = f"{dx_name} {icd} {ci.get('question','')}".strip()
     res = await hybrid.search(
         query, namespaces=["terms"], top_k=8,
         insurer=ci.get("insurer"), product=ci.get("product_name"),
@@ -174,7 +215,7 @@ async def coverage_analysis(state: ReportState) -> dict[str, Any]:
                 "role": "user",
                 "content": (
                     f"[가입 특약]\n{state.get('subscribed_coverages', [])}\n\n"
-                    f"[사고]\n{ci.get('diagnosis')}\n\n[약관 조항]\n{ctx}\n\n"
+                    f"[사고]\n{dx_name}\n\n[약관 조항]\n{ctx}\n\n"
                     'JSON 키: applicable(적용 가능 특약 list), missing(청구 누락 가능 특약 list), '
                     'analysis(면책·감액 등 분석 str).'
                 ),
@@ -191,9 +232,12 @@ async def coverage_analysis(state: ReportState) -> dict[str, Any]:
 
 
 # ── 판례 검색 (case_chunks 미적재 → 폴백) ──────────────────────
+@safe_node
 async def case_search(state: ReportState) -> dict[str, Any]:
     ci = state.get("case_info", {})
-    res = await hybrid.search(ci.get("diagnosis", "") or "", namespaces=["case"], top_k=4)
+    dx = state.get("diagnosis") or {}
+    dx_name = dx.get("diagnosis") or ci.get("diagnosis") or ""
+    res = await hybrid.search(dx_name, namespaces=["case"], top_k=4)
     refs = res["ranked_chunks"]
     if not refs:
         return {"legal_references": [], "errors": _err(state, "case_data_missing")}
@@ -201,6 +245,7 @@ async def case_search(state: ReportState) -> dict[str, Any]:
 
 
 # ── 보험금 계산 (추정 범위, 단정 금지) ─────────────────────────
+@safe_node
 async def payment_calc(state: ReportState) -> dict[str, Any]:
     offered = state.get("case_info", {}).get("offered_amount") or 0
     # 실험 간이 추정: 제안액 기반 ±범위 (실제는 특약별 가입금액·지급률·장해율 반영)
@@ -211,16 +256,19 @@ async def payment_calc(state: ReportState) -> dict[str, Any]:
 
 
 # ── 리포트 통합 (8섹션 + issues, 생성 가드레일) ────────────────
+@safe_node
 async def report_compose(state: ReportState) -> dict[str, Any]:
     ci = state.get("case_info", {})
     ca = state.get("coverage_analysis", {})
+    dx = state.get("diagnosis") or {}
+    dx_name = dx.get("diagnosis") or ci.get("diagnosis") or ""
     body = await ai_client.chat(
         [
             {"role": "system", "content": "너는 보험 손해사정 리포트 작성자다. 사실 주장에는 약관 조항 인용을 포함하고, 금액은 단정하지 말고 범위로 쓴다."},
             {
                 "role": "user",
                 "content": (
-                    f"사고: {ci.get('diagnosis')} / 질문: {ci.get('question')}\n"
+                    f"사고: {dx_name} / 질문: {ci.get('question')}\n"
                     f"적용 특약: {state.get('applicable_coverages')}\n"
                     f"누락 가능: {state.get('missing_coverages')}\n"
                     f"분석: {ca.get('analysis')}\n"
@@ -249,10 +297,14 @@ async def report_compose(state: ReportState) -> dict[str, Any]:
     issue_list = issues.get("issues", []) if isinstance(issues, dict) else []
 
     sections = {
-        "1_사건요약": ci.get("diagnosis") or "",
+        "1_사건요약": dx_name,
         "2_적용특약": ", ".join(state.get("applicable_coverages", [])),
         "3_누락가능특약": ", ".join(state.get("missing_coverages", [])),
         "4_약관근거": ", ".join(ca.get("citations", [])),
+        "4b_판례근거": "; ".join(
+            f"{c.get('article_number') or ''} {c.get('product_name') or ''}".strip()
+            for c in state.get("legal_references", [])[:5]
+        ) or "관련 판례 없음",
         "5_추정보상범위": str(state.get("estimated_range", {})),
         "6_본문": body,
         "7_추가확인필요": "; ".join(state.get("errors", [])) or "없음",
@@ -262,6 +314,7 @@ async def report_compose(state: ReportState) -> dict[str, Any]:
 
 
 # ── 출력 가드레일 (고지문 + LLM Judge) ─────────────────────────
+@safe_node
 async def output_guardrail(state: ReportState) -> dict[str, Any]:
     g = await guardrail.guard_output(
         state.get("report", ""), run_judge=True, chunks=state.get("retrieved_clauses", [])
@@ -270,7 +323,13 @@ async def output_guardrail(state: ReportState) -> dict[str, Any]:
 
 
 # ── 영구 저장 (report_drafts/reports/report_issues) ────────────
+@safe_node
 async def persist(state: ReportState) -> dict[str, Any]:
+    # 약관 인용 + 판례 근거를 합쳐 basis_terms_precedents 구성
+    terms_cites = state.get("coverage_analysis", {}).get("citations", [])
+    case_refs = [c.get("source_ref") for c in state.get("legal_references", []) if c.get("source_ref")]
+    basis = terms_cites + case_refs
+
     draft = {
         "sections": state.get("sections", {}),
         "estimated_range": state.get("estimated_range", {}),
@@ -279,12 +338,13 @@ async def persist(state: ReportState) -> dict[str, Any]:
         "issues": state.get("issues", []),
         "applicable_guarantees": state.get("applicable_coverages", []),
         "omitted_special_contract": state.get("missing_coverages", []),
-        "basis_terms_precedents": state.get("coverage_analysis", {}).get("citations", []),
+        "basis_terms_precedents": basis,
+        "legal_references": case_refs,   # 판례·분쟁조정 근거(별도 보존)
         "errors": state.get("errors", []),
     }
     rid = uuid.UUID(state["report_id"])
     er = state.get("estimated_range", {})
-    pool = await db.get_pool()
+    pool = db.get_pool()
     async with pool.acquire() as c:
         async with c.transaction():
             await c.execute(
@@ -302,7 +362,7 @@ async def persist(state: ReportState) -> dict[str, Any]:
                 rid,
                 state.get("applicable_coverages", []),
                 state.get("missing_coverages", []),
-                state.get("coverage_analysis", {}).get("citations", []),
+                basis,
                 er.get("min"), er.get("max"),
             )
             await c.execute("DELETE FROM report_issues WHERE report_id = $1", rid)

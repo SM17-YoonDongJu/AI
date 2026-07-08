@@ -9,7 +9,8 @@ from __future__ import annotations
 import asyncio
 import uuid
 
-from .db import close_pool, get_pool
+from core.db import close_pool, get_pool, init_pool
+
 from .graph import build_graph
 from .rag.hybrid import close_pool as close_rag_pool
 from .rag.hybrid import search
@@ -56,7 +57,7 @@ SCENARIOS = [
 
 async def _seed(label, insurer, product, atype, diagnosis, masked, offered, question):
     rid, oid, cid, uid = uuid.uuid4(), uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
-    pool = await get_pool()
+    pool = get_pool()
     async with pool.acquire() as c:
         await c.execute(
             "INSERT INTO ocr_results (id, job_id, doc_type, masked_text, entities) VALUES ($1,$2,'diagnosis',$3,'{}'::jsonb)",
@@ -80,7 +81,7 @@ async def _seed(label, insurer, product, atype, diagnosis, masked, offered, ques
 
 
 async def _cleanup(rid, oid, cid, uid):
-    pool = await get_pool()
+    pool = get_pool()
     async with pool.acquire() as c:
         await c.execute("DELETE FROM report_issues WHERE report_id=$1", uuid.UUID(rid))
         await c.execute("DELETE FROM report_drafts WHERE report_id=$1", uuid.UUID(rid))
@@ -105,7 +106,7 @@ async def search_battery():
 async def e2e_battery():
     print("\n########## e2e 시나리오 배터리 ##########")
     app = build_graph()
-    pool = await get_pool()
+    pool = get_pool()
     for sc in SCENARIOS:
         label = sc[0]
         ids = await _seed(*sc)
@@ -130,6 +131,7 @@ async def e2e_battery():
 
 
 async def main():
+    await init_pool()
     await search_battery()
     await e2e_battery()
     await close_pool()

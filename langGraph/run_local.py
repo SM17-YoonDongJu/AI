@@ -9,7 +9,8 @@ from __future__ import annotations
 import asyncio
 import json
 
-from .db import close_pool
+from core.db import close_pool, init_pool
+
 from .graph import build_graph
 from .rag.hybrid import close_pool as close_rag_pool
 
@@ -24,6 +25,7 @@ SAMPLE_JOB = {
 
 
 async def main() -> None:
+    await init_pool()
     app = build_graph()
     final = await app.ainvoke(SAMPLE_JOB)
     print("=== 그래프 실행 완료 ===")
