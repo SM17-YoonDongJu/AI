@@ -1,6 +1,6 @@
 """노드 한 바퀴 돌면서 각 노드가 state에 얹는 키/값을 찍는 실험 스크립트.
 
-    python -m langGraph.trace_state
+    PYTHONPATH=src python scripts/trace_state.py
 시나리오 A(약관있음_상해)를 시드→astream(updates)로 노드별 델타 출력→정리.
 """
 
@@ -9,11 +9,10 @@ from __future__ import annotations
 import asyncio
 import sys
 
+from battery import SCENARIOS, _cleanup, _seed
 from core.db import close_pool, init_pool
-
-from .graph import build_graph
-from .rag.hybrid import close_pool as close_rag_pool
-from .test_battery import SCENARIOS, _cleanup, _seed
+from report_worker.graph import build_graph
+from report_worker.rag.hybrid import close_pool as close_rag_pool
 
 sys.stdout.reconfigure(encoding="utf-8")
 
@@ -29,8 +28,13 @@ async def main():
     ids = await _seed(*sc)
     rid, oid, cid, uid = ids
     app = build_graph()
-    job = {"report_id": rid, "ocr_result_id": oid, "claim_id": cid,
-           "user_ref": str(uid), "doc_type": "diagnosis"}
+    job = {
+        "report_id": rid,
+        "ocr_result_id": oid,
+        "claim_id": cid,
+        "user_ref": str(uid),
+        "doc_type": "diagnosis",
+    }
     try:
         print(f"### 시나리오 {sc[0]} — 노드별 state 델타 ###\n")
         step = 0

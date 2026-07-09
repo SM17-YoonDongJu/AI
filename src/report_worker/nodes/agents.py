@@ -21,7 +21,7 @@ from ..state import ReportState
 
 
 def _err(state: ReportState, msg: str) -> list[str]:
-    return list(state.get("errors", [])) + [msg]
+    return [*state.get("errors", []), msg]
 
 
 def safe_node(fn: Callable[[ReportState], Awaitable[dict[str, Any]]]):
