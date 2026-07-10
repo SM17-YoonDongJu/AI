@@ -26,7 +26,9 @@
 ---
 
 ## 1. `OcrJob`
-**Spring → `ocr-job-queue` → `ocr_worker`.** 파일 업로드 시 발행되는 OCR 작업.
+**Spring → `ocr-job-queue` → `ocr_worker`.** 문서 1건마다 발행되는 OCR 작업.
+
+**소유권(2026-07-10 변경, 발행측 `OcrJob.java` 정본):** Spring이 `reports`·`report_attachments` shell 행을 먼저 생성하고, 워커는 OCR·AI 결과로 그 행을 **UPDATE(생성 아님)** 한다. `report_id`·`attachment_id`가 그 UPDATE 대상 참조 키다. 한 청구의 문서를 **1건씩** 발행하므로 `doc_index`/`doc_total`로 워커가 리포트 생성(**fan-in**) 시점을 판별한다.
 
 | 필드 | 타입 | 필수 | 설명 |
 |---|---|---|---|
@@ -36,6 +38,10 @@
 | `user_ref` | string | ✓ | 사용자 참조(내부 식별자, PII 아님) |
 | `doc_type_hint` | string \| null | – | 업로드 시 사용자가 고른 문서 유형 힌트 |
 | `claim_id` | string(UUID) \| null | – | `USER_CLAIMS.id` 참조(옵셔널). `ocr_worker`는 가공 없이 `ReportJob`으로 패스스루만 |
+| `report_id` | string(UUID) | ✓ | `REPORTS.id` 참조 — 결과 UPDATE 대상(Spring이 shell 생성) |
+| `attachment_id` | string(UUID) | ✓ | `REPORT_ATTACHMENTS.id` 참조 — 결과 UPDATE 대상 |
+| `doc_index` | int \| null | – | 청구 내 문서 순번(1-based) |
+| `doc_total` | int \| null | – | 청구 총 문서 수 — 워커의 fan-in(리포트 생성) 판별용 |
 | `uploaded_at` | string(ISO-8601) | ✓ | 업로드 시각(UTC) |
 
 ```json
@@ -43,13 +49,18 @@
   "job_id": "8f1c2d3e-...-a1",
   "s3_key": "uploads/8f1c2d3e.pdf",
   "content_type": "application/pdf",
-  "user_ref": "u_4821",
-  "doc_type_hint": null,
-  "claim_id": null,
-  "uploaded_at": "2026-06-17T05:30:00Z"
+  "user_ref": "3f0e...-uid",
+  "doc_type_hint": "diagnosis",
+  "claim_id": "c1a1...-cl",
+  "report_id": "r2b2...-rp",
+  "attachment_id": "a3c3...-at",
+  "doc_index": 1,
+  "doc_total": 3,
+  "uploaded_at": "2026-07-10T09:21:16.123Z"
 }
 ```
 - **토픽**: `ocr-job-queue` · **파티션 키**: `job_id` · **처리**: at-least-once, `job_id` 기준 멱등 처리.
+- **본 변경 범위(#33)**: 계약(필드) 추가·검증에 한정한다. 워커가 `report_id`를 자체 파생하는 현행 로직(`pipeline._derive_report_id`)을 `job.report_id` 패스스루로 바꾸고 fan-in으로 `ReportJob` 발행을 게이팅하는 작업, §2 `ReportJob` 의미 정정은 **후속(fan-in 설계 결정 필요)** 으로 분리한다.
 
 ---
 

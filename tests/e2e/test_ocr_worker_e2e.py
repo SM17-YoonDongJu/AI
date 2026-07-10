@@ -83,6 +83,10 @@ def _job(job_id: str, **overrides: Any) -> OcrJob:
         "user_ref": "user-e2e",
         "doc_type_hint": None,
         "claim_id": None,
+        "report_id": "bbbbbbbb-0000-0000-0000-000000000001",
+        "attachment_id": "bbbbbbbb-0000-0000-0000-000000000002",
+        "doc_index": 1,
+        "doc_total": 1,
         "uploaded_at": datetime(2026, 1, 1, tzinfo=UTC),
     }
     base.update(overrides)

@@ -18,13 +18,18 @@ from core.contracts import (
 
 
 def test_ocr_job_validates_contract_example() -> None:
-    # Arrange: contracts.md §1 JSON 예시
+    # Arrange: contracts.md §1 JSON 예시(소유권/fan-in 필드 포함)
     payload = {
         "job_id": "8f1c2d3e-a1",
         "s3_key": "uploads/8f1c2d3e.pdf",
         "content_type": "application/pdf",
-        "user_ref": "u_4821",
-        "doc_type_hint": None,
+        "user_ref": "3f0e-uid",
+        "doc_type_hint": "diagnosis",
+        "claim_id": "c1a1-cl",
+        "report_id": "r2b2-rp",
+        "attachment_id": "a3c3-at",
+        "doc_index": 1,
+        "doc_total": 3,
         "uploaded_at": "2026-06-17T05:30:00Z",
     }
 
@@ -33,23 +38,63 @@ def test_ocr_job_validates_contract_example() -> None:
 
     # Assert
     assert job.job_id == "8f1c2d3e-a1"
-    assert job.doc_type_hint is None
+    assert job.report_id == "r2b2-rp"
+    assert job.attachment_id == "a3c3-at"
+    assert job.doc_index == 1
+    assert job.doc_total == 3
     assert job.uploaded_at.isoformat() == "2026-06-17T05:30:00+00:00"
 
 
 def test_ocr_job_rejects_unknown_content_type() -> None:
-    # Arrange
+    # Arrange: content_type만 계약 외 — 나머지 필수 필드는 채운다
     payload = {
         "job_id": "x",
         "s3_key": "y",
         "content_type": "text/plain",  # 계약 외
         "user_ref": "u",
+        "report_id": "r",
+        "attachment_id": "a",
         "uploaded_at": "2026-06-17T05:30:00Z",
     }
 
     # Act / Assert
     with pytest.raises(ValidationError):
         OcrJob.model_validate(payload)
+
+
+def test_ocr_job_requires_report_and_attachment_refs() -> None:
+    # Arrange: report_id·attachment_id 누락(구 계약 페이로드) — UPDATE 대상 참조 키는 필수
+    payload = {
+        "job_id": "j",
+        "s3_key": "s",
+        "content_type": "application/pdf",
+        "user_ref": "u",
+        "uploaded_at": "2026-06-17T05:30:00Z",
+    }
+
+    # Act / Assert: 참조 키 누락은 진입점에서 거른다(→ DLQ)
+    with pytest.raises(ValidationError):
+        OcrJob.model_validate(payload)
+
+
+def test_ocr_job_doc_index_total_default_to_none() -> None:
+    # Arrange: doc_index·doc_total 없이도 통과(옵셔널)
+    payload = {
+        "job_id": "j",
+        "s3_key": "s",
+        "content_type": "image/png",
+        "user_ref": "u",
+        "report_id": "r",
+        "attachment_id": "a",
+        "uploaded_at": "2026-06-17T05:30:00Z",
+    }
+
+    # Act
+    job = OcrJob.model_validate(payload)
+
+    # Assert
+    assert job.doc_index is None
+    assert job.doc_total is None
 
 
 def test_report_job_doc_type_is_enum() -> None:

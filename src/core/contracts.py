@@ -60,9 +60,14 @@ class DocType(StrEnum):
 
 
 class OcrJob(BaseModel):
-    """Spring → `ocr-job-queue` → `ocr_worker`. 파일 업로드 시 발행되는 OCR 작업.
+    """Spring → `ocr-job-queue` → `ocr_worker`. 문서 1건마다 발행되는 OCR 작업.
 
     토픽 `ocr-job-queue`, 파티션 키 `job_id`, at-least-once + `job_id` 멱등 처리.
+
+    소유권(2026-07-10, 발행측 `OcrJob.java` 정본): Spring이 `reports`·`report_attachments`
+    shell 행을 먼저 생성하고, 워커는 OCR·AI 결과로 그 행을 UPDATE(생성 아님)한다 →
+    `report_id`·`attachment_id`가 그 참조 키다. 한 청구의 문서를 1건씩 발행하므로
+    `doc_index`/`doc_total`로 워커가 리포트 생성(fan-in) 시점을 판별한다.
     """
 
     job_id: str  # OCR 작업 식별자(UUID). 멱등 키
@@ -71,6 +76,10 @@ class OcrJob(BaseModel):
     user_ref: str  # 사용자 참조(내부 식별자, PII 아님)
     doc_type_hint: str | None = None  # 업로드 시 사용자가 고른 문서 유형 힌트
     claim_id: str | None = None  # USER_CLAIMS.id 참조(옵셔널) — report_worker가 조회
+    report_id: str  # REPORTS.id(UUID) — 결과 UPDATE 대상(Spring이 shell 생성)
+    attachment_id: str  # REPORT_ATTACHMENTS.id(UUID) — 결과 UPDATE 대상
+    doc_index: int | None = None  # 청구 내 문서 순번(1-based)
+    doc_total: int | None = None  # 청구 총 문서 수 — 워커의 fan-in(리포트 생성) 판별용
     uploaded_at: datetime  # 업로드 시각(UTC, ISO-8601)
 
 
