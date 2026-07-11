@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import datetime
 from typing import Any
 
 from core.contracts import Chunk
@@ -28,14 +29,24 @@ async def search(
     *,
     insurer: str | None = None,
     product: str | None = None,
+    contract_date: datetime.date | None = None,
 ) -> dict[str, Any]:
     """canonical `rag.search` 호출 후 리포트 노드용 dict로 매핑.
 
     반환: {"ranked_chunks": [{text, namespace, score, source_ref, article_number,
     product_name, chunk_type}], "citations": [str]}. namespaces 기본 ["terms"].
+
+    `contract_date`는 `namespaces=["level"]`(표준 장해분류표) 검색 시 계약일이 속하는 버전만
+    반환하도록 canonical `rag.search`로 패스스루한다(None이면 현행판).
     """
     res = await _rag_search(
-        query, insurance_type, namespaces or ["terms"], top_k, insurer=insurer, product=product
+        query,
+        insurance_type,
+        namespaces or ["terms"],
+        top_k,
+        insurer=insurer,
+        product=product,
+        contract_date=contract_date,
     )
     chunks = [
         {

@@ -83,7 +83,7 @@ async def load_context(state: ReportState) -> dict[str, Any]:
                 rep["claim_id"],
             )
         ins = await c.fetchrow(
-            "SELECT insurer_name, product_name, coverages FROM user_insurances "
+            "SELECT insurer_name, product_name, coverages, enrolled_at FROM user_insurances "
             "WHERE user_id = (SELECT user_id FROM reports WHERE id = $1) LIMIT 1",
             uuid.UUID(state["report_id"]),
         )
@@ -106,6 +106,9 @@ async def load_context(state: ReportState) -> dict[str, Any]:
         "description": (claim["description"] if claim else None),
         "insurer": ins["insurer_name"] if ins else None,
         "product_name": ins["product_name"] if ins else None,
+        "enrolled_at": ins["enrolled_at"]
+        if ins
+        else None,  # 가입일(date|None) — 표준표 버전 매칭용
     }
     return {
         "case_info": case_info,
@@ -280,43 +283,30 @@ def route_after_case(state: ReportState) -> str:
     return "payment_calc"
 
 
-# ── 장해 분류·지급률 추출 (RAG + LLM, 숫자는 약관에서만) ────────
-@safe_node
-async def disability_rag(state: ReportState) -> dict[str, Any]:
-    ci = state.get("case_info", {})
-    dx = state.get("diagnosis") or {}
-    dx_name = dx.get("diagnosis") or ci.get("diagnosis") or ""
-    icd = " ".join(dx.get("icd_codes") or [])
-    query = f"{dx_name} {icd} 후유장해 장해분류표 지급률".strip()
-    res = await hybrid.search(
-        query,
-        namespaces=["terms"],
-        top_k=8,
-        insurer=ci.get("insurer"),
-        product=ci.get("product_name"),
-    )
-    ranked = res.get("ranked_chunks", [])
-    # 장해분류표(schedule) 청크 선별 — chunk_type 우선, 없으면 헤더 휴리스틱
+# 폴백 시 캐비앗·신뢰도 캡 상수(약관 미확보 → 표준표 추정임을 명시).
+_TERMS_CAVEAT = "가입금액 미보유로 절대 보험금 불가·약관표 위치정렬 한계 — 지급률은 추정"
+_STANDARD_CAVEAT = "표준 장해분류표 기준(가입 약관 미확보) — 개별 약관 확인 필요"
+_STANDARD_NO_DATE_CAVEAT = "가입일 미상 — 현행판 기준"
+
+
+def _select_schedule(ranked: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """장해분류표(schedule) 청크 선별 — chunk_type 우선, 없으면 헤더 휴리스틱."""
     sched = [c for c in ranked if c.get("chunk_type") == "schedule"]
     if not sched:
         sched = [c for c in ranked if "장해의 분류" in (c.get("text") or "")]
+    return sched
 
-    caveat = "가입금액 미보유로 절대 보험금 불가·약관표 위치정렬 한계 — 지급률은 추정"
-    existing = state.get("retrieved_clauses", [])
-    if not sched:
-        return {
-            "disability_analysis": {
-                "items": [],
-                "combined_rate": 0.0,
-                "rule_notes": [],
-                "citations": [],
-                "confidence": "low",
-                "caveat": "장해분류표 미검색",
-            },
-            "retrieved_clauses": existing,
-            "errors": _err(state, "disability_schedule_missing"),
-        }
 
+async def _extract_schedule_items(
+    dx_name: str, icd: str, sched: list[dict[str, Any]], fallback_citations: list[str]
+) -> dict[str, Any]:
+    """장해분류표 원문에서 LLM 추출 + 결정론 백스톱.
+
+    terms(가입 약관)·level(표준표) 어느 소스든 동일한 추출·검증 흐름을 태운다.
+
+    Returns:
+        {"items": list, "notes": list[str], "confidence": str, "citations": list[str]}.
+    """
     sched_text = "\n".join((c.get("text") or "") for c in sched)
     ctx = "\n---\n".join(f"{c['source_ref']}\n{(c.get('text') or '')[:800]}" for c in sched[:6])
     raw = await ai_client.chat_json(
@@ -383,22 +373,83 @@ async def disability_rag(state: ReportState) -> dict[str, Any]:
         else ("medium" if verified_n else "low")
     )
     citations = (
-        list(dict.fromkeys(i["citation"] for i in items if i["citation"]))
-        or res.get("citations", [])[:6]
+        list(dict.fromkeys(i["citation"] for i in items if i["citation"])) or fallback_citations[:6]
     )
+    return {"items": items, "notes": notes, "confidence": confidence, "citations": citations}
+
+
+# ── 장해 분류·지급률 추출 (RAG + LLM, 숫자는 약관에서만) ────────
+@safe_node
+async def disability_rag(state: ReportState) -> dict[str, Any]:
+    ci = state.get("case_info", {})
+    dx = state.get("diagnosis") or {}
+    dx_name = dx.get("diagnosis") or ci.get("diagnosis") or ""
+    icd = " ".join(dx.get("icd_codes") or [])
+    query = f"{dx_name} {icd} 후유장해 장해분류표 지급률".strip()
+    res = await hybrid.search(
+        query,
+        namespaces=["terms"],
+        top_k=8,
+        insurer=ci.get("insurer"),
+        product=ci.get("product_name"),
+    )
+    sched = _select_schedule(res.get("ranked_chunks", []))
+    existing = state.get("retrieved_clauses", [])
+
+    # 폴백: 가입 약관에 장해분류표가 없으면 금감원 표준 장해분류표(level)로 재검색.
+    # 계약일(enrolled_at)이 속하는 버전만 반환된다(None이면 현행판).
+    enrolled_at = ci.get("enrolled_at")
+    is_fallback = False
+    if not sched:
+        res = await hybrid.search(query, namespaces=["level"], top_k=8, contract_date=enrolled_at)
+        # level 청크는 전부 스케줄 행 그룹이므로 chunk_type 선별 없이 그대로 사용.
+        sched = res.get("ranked_chunks", [])
+        is_fallback = bool(sched)
+
+    if not sched:
+        # terms·level 둘 다 비면 기존 동작 유지(빈 결과 + 마커).
+        return {
+            "disability_analysis": {
+                "items": [],
+                "combined_rate": 0.0,
+                "rule_notes": [],
+                "citations": [],
+                "confidence": "low",
+                "caveat": "장해분류표 미검색",
+            },
+            "retrieved_clauses": existing,
+            "errors": _err(state, "disability_schedule_missing"),
+        }
+
+    extracted = await _extract_schedule_items(dx_name, icd, sched, res.get("citations", []))
+    confidence = extracted["confidence"]
+
+    if is_fallback:
+        caveat = _STANDARD_CAVEAT
+        if enrolled_at is None:
+            caveat = f"{caveat} · {_STANDARD_NO_DATE_CAVEAT}"
+        # 표준표는 개별 약관과 다를 수 있으므로 신뢰도를 medium으로 캡한다.
+        if confidence == "high":
+            confidence = "medium"
+    else:
+        caveat = _TERMS_CAVEAT
 
     seen = {c.get("source_ref") for c in existing}
     merged = existing + [c for c in sched if c.get("source_ref") not in seen]
-    return {
+    out: dict[str, Any] = {
         "disability_analysis": {
-            "items": items,
-            "rule_notes": notes,
-            "citations": citations,
+            "items": extracted["items"],
+            "rule_notes": extracted["notes"],
+            "citations": extracted["citations"],
             "confidence": confidence,
             "caveat": caveat,
         },
         "retrieved_clauses": merged,
     }
+    if is_fallback:
+        # 운영 추적용 마커(표준표 폴백이 실제로 탔음을 남긴다).
+        out["errors"] = _err(state, "disability_fallback_standard_schedule")
+    return out
 
 
 # ── 장해지급률 결정론 합산 (LLM 없음) ──────────────────────────
