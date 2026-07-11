@@ -27,15 +27,17 @@ def build_graph():
     g.add_node("report_compose", agents.report_compose)
     g.add_node("output_guardrail", agents.output_guardrail)
     g.add_node("persist", agents.persist)
+    g.add_node("persist_blocked", agents.persist_blocked)
 
     g.add_edge(START, "load_context")
     g.add_edge("load_context", "input_guardrail")
 
-    # 차단(도메인외·PII정책 등) 시 LLM 파이프라인을 건너뛰고 즉시 종료 → 비용/오출력 방지
+    # 차단(도메인외·PII정책 등) 시 LLM 파이프라인을 건너뛰고 persist_blocked로 → 비용/오출력
+    # 방지. persist_blocked가 reports.status='BLOCKED'만 기록해 상태 미갱신(무한 처리중)을 막는다.
     g.add_conditional_edges(
         "input_guardrail",
         agents.route_after_input,
-        {"blocked": END, "diagnosis": "diagnosis"},
+        {"blocked": "persist_blocked", "diagnosis": "diagnosis"},
     )
 
     # 분기: 사용자 약관이 우리 DB(policy_chunks)에 있나?
@@ -65,5 +67,6 @@ def build_graph():
     g.add_edge("report_compose", "output_guardrail")
     g.add_edge("output_guardrail", "persist")
     g.add_edge("persist", END)
+    g.add_edge("persist_blocked", END)
 
     return g.compile()

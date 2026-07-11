@@ -14,10 +14,13 @@ from typing import Any
 
 import guardrail
 from core import ai_client, db
+from core.logging import get_logger
 from report_worker.disability_rules import combine_disability_rate
 
 from ..rag import hybrid
 from ..state import ReportState
+
+logger = get_logger(__name__)
 
 
 def _err(state: ReportState, msg: str) -> list[str]:
@@ -50,7 +53,9 @@ def _as_str_list(v: Any) -> list[str]:
     out: list[str] = []
     for x in v if isinstance(v, list) else [v]:
         if isinstance(x, dict):
-            out.append(str(x.get("name") or x.get("title") or x.get("특약") or next(iter(x.values()), "")))
+            out.append(
+                str(x.get("name") or x.get("title") or x.get("특약") or next(iter(x.values()), ""))
+            )
         else:
             out.append(str(x))
     return [s for s in out if s]
@@ -88,10 +93,13 @@ async def load_context(state: ReportState) -> dict[str, Any]:
         errors.append("ocr_result_missing")
     entities = {}
     if ocr and ocr["entities"]:
-        entities = ocr["entities"] if isinstance(ocr["entities"], dict) else json.loads(ocr["entities"])
+        entities = (
+            ocr["entities"] if isinstance(ocr["entities"], dict) else json.loads(ocr["entities"])
+        )
 
     case_info = {
-        "accident_type": (rep["accident_type"] if rep else None) or (claim["accident_type"] if claim else None),
+        "accident_type": (rep["accident_type"] if rep else None)
+        or (claim["accident_type"] if claim else None),
         "diagnosis": (claim["diagnosis"] if claim else None) or (rep["treatment"] if rep else None),
         "offered_amount": (rep["offered_amount"] if rep else None),
         "question": (rep["question"] if rep else None),
@@ -127,7 +135,10 @@ async def diagnosis(state: ReportState) -> dict[str, Any]:
     text = state.get("masked_text", "")
     res = await ai_client.chat_json(
         [
-            {"role": "system", "content": "너는 보험 손해사정 진단 분석가다. 의료문서에서 정보를 추출해 JSON만 출력한다."},
+            {
+                "role": "system",
+                "content": "너는 보험 손해사정 진단 분석가다. 의료문서에서 정보를 추출해 JSON만 출력한다.",
+            },
             {
                 "role": "user",
                 "content": (
@@ -141,7 +152,11 @@ async def diagnosis(state: ReportState) -> dict[str, Any]:
     )
     if not isinstance(res, dict) or not res:
         return {
-            "diagnosis": {"diagnosis": state.get("case_info", {}).get("diagnosis"), "accident_type": "other", "requires_disability_review": False},
+            "diagnosis": {
+                "diagnosis": state.get("case_info", {}).get("diagnosis"),
+                "accident_type": "other",
+                "requires_disability_review": False,
+            },
             "errors": _err(state, "diagnosis_llm_failed"),
         }
     res.setdefault("accident_type", state.get("case_info", {}).get("accident_type") or "other")
@@ -161,10 +176,13 @@ async def policy_in_db(state: ReportState) -> str:
             if product:
                 n = await c.fetchval(
                     "SELECT count(*) FROM policy_chunks WHERE insurer = $1 AND product_name = $2",
-                    insurer, product,
+                    insurer,
+                    product,
                 )
             else:
-                n = await c.fetchval("SELECT count(*) FROM policy_chunks WHERE insurer = $1", insurer)
+                n = await c.fetchval(
+                    "SELECT count(*) FROM policy_chunks WHERE insurer = $1", insurer
+                )
     except Exception:  # DB 조회 실패 시 안전하게 런타임 파싱 경로로
         return "terms_parse"
     return "coverage_parse" if (n or 0) > 0 else "terms_parse"
@@ -199,10 +217,13 @@ async def coverage_analysis(state: ReportState) -> dict[str, Any]:
     dx = state.get("diagnosis") or {}
     dx_name = dx.get("diagnosis") or ci.get("diagnosis") or ""
     icd = " ".join(dx.get("icd_codes") or [])
-    query = f"{dx_name} {icd} {ci.get('question','')}".strip()
+    query = f"{dx_name} {icd} {ci.get('question', '')}".strip()
     res = await hybrid.search(
-        query, namespaces=["terms"], top_k=8,
-        insurer=ci.get("insurer"), product=ci.get("product_name"),
+        query,
+        namespaces=["terms"],
+        top_k=8,
+        insurer=ci.get("insurer"),
+        product=ci.get("product_name"),
     )
     chunks = res["ranked_chunks"]
     if not chunks:
@@ -211,14 +232,17 @@ async def coverage_analysis(state: ReportState) -> dict[str, Any]:
     ctx = "\n---\n".join(f"{c['source_ref']} {c['text'][:300]}" for c in chunks[:6])
     analysis = await ai_client.chat_json(
         [
-            {"role": "system", "content": "너는 보험 약관 분석가다. 가입 특약과 약관 조항을 대조해 JSON만 출력한다."},
+            {
+                "role": "system",
+                "content": "너는 보험 약관 분석가다. 가입 특약과 약관 조항을 대조해 JSON만 출력한다.",
+            },
             {
                 "role": "user",
                 "content": (
                     f"[가입 특약]\n{state.get('subscribed_coverages', [])}\n\n"
                     f"[사고]\n{dx_name}\n\n[약관 조항]\n{ctx}\n\n"
-                    'JSON 키: applicable(적용 가능 특약 list), missing(청구 누락 가능 특약 list), '
-                    'analysis(면책·감액 등 분석 str).'
+                    "JSON 키: applicable(적용 가능 특약 list), missing(청구 누락 가능 특약 list), "
+                    "analysis(면책·감액 등 분석 str)."
                 ),
             },
         ]
@@ -228,7 +252,10 @@ async def coverage_analysis(state: ReportState) -> dict[str, Any]:
         "retrieved_clauses": chunks,
         "applicable_coverages": _as_str_list(analysis.get("applicable")),
         "missing_coverages": _as_str_list(analysis.get("missing")),
-        "coverage_analysis": {"analysis": str(analysis.get("analysis", "")), "citations": res["citations"][:6]},
+        "coverage_analysis": {
+            "analysis": str(analysis.get("analysis", "")),
+            "citations": res["citations"][:6],
+        },
     }
 
 
@@ -262,8 +289,11 @@ async def disability_rag(state: ReportState) -> dict[str, Any]:
     icd = " ".join(dx.get("icd_codes") or [])
     query = f"{dx_name} {icd} 후유장해 장해분류표 지급률".strip()
     res = await hybrid.search(
-        query, namespaces=["terms"], top_k=8,
-        insurer=ci.get("insurer"), product=ci.get("product_name"),
+        query,
+        namespaces=["terms"],
+        top_k=8,
+        insurer=ci.get("insurer"),
+        product=ci.get("product_name"),
     )
     ranked = res.get("ranked_chunks", [])
     # 장해분류표(schedule) 청크 선별 — chunk_type 우선, 없으면 헤더 휴리스틱
@@ -276,8 +306,12 @@ async def disability_rag(state: ReportState) -> dict[str, Any]:
     if not sched:
         return {
             "disability_analysis": {
-                "items": [], "combined_rate": 0.0, "rule_notes": [],
-                "citations": [], "confidence": "low", "caveat": "장해분류표 미검색",
+                "items": [],
+                "combined_rate": 0.0,
+                "rule_notes": [],
+                "citations": [],
+                "confidence": "low",
+                "caveat": "장해분류표 미검색",
             },
             "retrieved_clauses": existing,
             "errors": _err(state, "disability_schedule_missing"),
@@ -287,21 +321,27 @@ async def disability_rag(state: ReportState) -> dict[str, Any]:
     ctx = "\n---\n".join(f"{c['source_ref']}\n{(c.get('text') or '')[:800]}" for c in sched[:6])
     raw = await ai_client.chat_json(
         [
-            {"role": "system", "content": (
-                "너는 보험 약관 장해분류표 분석가다. 제공된 [약관 장해분류표 원문]에서만 근거를 찾아 "
-                "사고를 분류하고 지급률을 추출한다. 표에 없는 지급률은 절대 만들지 마라. JSON만 출력한다."
-            )},
-            {"role": "user", "content": (
-                f"[사고/진단]\n{dx_name} / ICD {icd}\n\n[약관 장해분류표 원문]\n{ctx}\n\n"
-                'JSON 키: items(배열, 각 원소 = injury(str), '
-                'body_region(눈·귀·코·씹기말하기·척추·체간골·팔·다리·손가락·발가락·흉복부장기·신경계정신 중 하나), '
-                'category_label(원문 항목 텍스트 그대로 복사), rate(number 지급률 %), '
-                'rate_quote(rate 숫자가 등장한 원문 구절 그대로 복사), temporary(bool 한시장해), '
-                'temporary_years(number 또는 null), citation(위 원문 source_ref 중 하나)), '
-                'uncertain(bool), notes(str).\n'
-                '규칙: rate는 원문에 실제 등장하는 숫자만. category_label·rate_quote는 요약 말고 복사. '
-                '적합 항목 없으면 items=[] uncertain=true. 추측으로 숫자 만들지 마라.'
-            )},
+            {
+                "role": "system",
+                "content": (
+                    "너는 보험 약관 장해분류표 분석가다. 제공된 [약관 장해분류표 원문]에서만 근거를 찾아 "
+                    "사고를 분류하고 지급률을 추출한다. 표에 없는 지급률은 절대 만들지 마라. JSON만 출력한다."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"[사고/진단]\n{dx_name} / ICD {icd}\n\n[약관 장해분류표 원문]\n{ctx}\n\n"
+                    "JSON 키: items(배열, 각 원소 = injury(str), "
+                    "body_region(눈·귀·코·씹기말하기·척추·체간골·팔·다리·손가락·발가락·흉복부장기·신경계정신 중 하나), "
+                    "category_label(원문 항목 텍스트 그대로 복사), rate(number 지급률 %), "
+                    "rate_quote(rate 숫자가 등장한 원문 구절 그대로 복사), temporary(bool 한시장해), "
+                    "temporary_years(number 또는 null), citation(위 원문 source_ref 중 하나)), "
+                    "uncertain(bool), notes(str).\n"
+                    "규칙: rate는 원문에 실제 등장하는 숫자만. category_label·rate_quote는 요약 말고 복사. "
+                    "적합 항목 없으면 items=[] uncertain=true. 추측으로 숫자 만들지 마라."
+                ),
+            },
         ]
     )
     raw = raw if isinstance(raw, dict) else {}
@@ -322,30 +362,40 @@ async def disability_rag(state: ReportState) -> dict[str, Any]:
         injury = str(it.get("injury") or "")
         if not verified:
             notes.append(f"미검증 지급률 제외: {injury} {rate_f}%")
-        items.append({
-            "injury": injury,
-            "body_region": str(it.get("body_region") or "기타"),
-            "category_label": str(it.get("category_label") or ""),
-            "rate": rate_f,
-            "rate_quote": quote,
-            "temporary": bool(it.get("temporary")),
-            "temporary_years": it.get("temporary_years"),
-            "citation": str(it.get("citation") or ""),
-            "verified": verified,
-        })
+        items.append(
+            {
+                "injury": injury,
+                "body_region": str(it.get("body_region") or "기타"),
+                "category_label": str(it.get("category_label") or ""),
+                "rate": rate_f,
+                "rate_quote": quote,
+                "temporary": bool(it.get("temporary")),
+                "temporary_years": it.get("temporary_years"),
+                "citation": str(it.get("citation") or ""),
+                "verified": verified,
+            }
+        )
 
     verified_n = sum(1 for i in items if i["verified"])
-    confidence = "high" if (items and verified_n == len(items) and not uncertain) else (
-        "medium" if verified_n else "low"
+    confidence = (
+        "high"
+        if (items and verified_n == len(items) and not uncertain)
+        else ("medium" if verified_n else "low")
     )
-    citations = list(dict.fromkeys(i["citation"] for i in items if i["citation"])) or res.get("citations", [])[:6]
+    citations = (
+        list(dict.fromkeys(i["citation"] for i in items if i["citation"]))
+        or res.get("citations", [])[:6]
+    )
 
     seen = {c.get("source_ref") for c in existing}
     merged = existing + [c for c in sched if c.get("source_ref") not in seen]
     return {
         "disability_analysis": {
-            "items": items, "rule_notes": notes, "citations": citations,
-            "confidence": confidence, "caveat": caveat,
+            "items": items,
+            "rule_notes": notes,
+            "citations": citations,
+            "confidence": confidence,
+            "caveat": caveat,
         },
         "retrieved_clauses": merged,
     }
@@ -398,7 +448,10 @@ async def report_compose(state: ReportState) -> dict[str, Any]:
     )
     body = await ai_client.chat(
         [
-            {"role": "system", "content": "너는 보험 손해사정 리포트 작성자다. 사실 주장에는 약관 조항 인용을 포함하고, 금액은 단정하지 말고 범위로 쓴다."},
+            {
+                "role": "system",
+                "content": "너는 보험 손해사정 리포트 작성자다. 사실 주장에는 약관 조항 인용을 포함하고, 금액은 단정하지 말고 범위로 쓴다.",
+            },
             {
                 "role": "user",
                 "content": (
@@ -418,7 +471,10 @@ async def report_compose(state: ReportState) -> dict[str, Any]:
 
     issues = await ai_client.chat_json(
         [
-            {"role": "system", "content": "보험 리포트의 핵심 쟁점을 JSON 배열로 추출한다. JSON만."},
+            {
+                "role": "system",
+                "content": "보험 리포트의 핵심 쟁점을 JSON 배열로 추출한다. JSON만.",
+            },
             {
                 "role": "user",
                 "content": (
@@ -439,7 +495,8 @@ async def report_compose(state: ReportState) -> dict[str, Any]:
         "4b_판례근거": "; ".join(
             f"{c.get('article_number') or ''} {c.get('product_name') or ''}".strip()
             for c in state.get("legal_references", [])[:5]
-        ) or "관련 판례 없음",
+        )
+        or "관련 판례 없음",
         "5_추정보상범위": str(state.get("estimated_range", {})),
         "5b_장해지급률": disability_line,
         "6_본문": body,
@@ -463,7 +520,9 @@ async def output_guardrail(state: ReportState) -> dict[str, Any]:
 async def persist(state: ReportState) -> dict[str, Any]:
     # 약관 인용 + 판례 근거를 합쳐 basis_terms_precedents 구성
     terms_cites = state.get("coverage_analysis", {}).get("citations", [])
-    case_refs = [c.get("source_ref") for c in state.get("legal_references", []) if c.get("source_ref")]
+    case_refs = [
+        c.get("source_ref") for c in state.get("legal_references", []) if c.get("source_ref")
+    ]
     da_cites = (state.get("disability_analysis") or {}).get("citations", [])
     basis = terms_cites + case_refs + da_cites
 
@@ -476,8 +535,8 @@ async def persist(state: ReportState) -> dict[str, Any]:
         "applicable_guarantees": state.get("applicable_coverages", []),
         "omitted_special_contract": state.get("missing_coverages", []),
         "basis_terms_precedents": basis,
-        "legal_references": case_refs,   # 판례·분쟁조정 근거(별도 보존)
-        "disability": state.get("disability_analysis", {}),   # 장해지급률·근거(P1)
+        "legal_references": case_refs,  # 판례·분쟁조정 근거(별도 보존)
+        "disability": state.get("disability_analysis", {}),  # 장해지급률·근거(P1)
         "errors": state.get("errors", []),
     }
     rid = uuid.UUID(state["report_id"])
@@ -489,7 +548,8 @@ async def persist(state: ReportState) -> dict[str, Any]:
                 """INSERT INTO report_drafts (report_id, draft, status)
                    VALUES ($1, $2::jsonb, 'draft')
                    ON CONFLICT (report_id) DO UPDATE SET draft = EXCLUDED.draft, status = 'draft'""",
-                rid, json.dumps(draft, ensure_ascii=False),
+                rid,
+                json.dumps(draft, ensure_ascii=False),
             )
             await c.execute(
                 """UPDATE reports SET
@@ -501,16 +561,47 @@ async def persist(state: ReportState) -> dict[str, Any]:
                 state.get("applicable_coverages", []),
                 state.get("missing_coverages", []),
                 basis,
-                er.get("min"), er.get("max"),
+                er.get("min"),
+                er.get("max"),
             )
             await c.execute("DELETE FROM report_issues WHERE report_id = $1", rid)
             for it in state.get("issues", []):
                 await c.execute(
                     """INSERT INTO report_issues (id, report_id, title, description, ai_status, tags)
                        VALUES ($1,$2,$3,$4,$5,$6)""",
-                    uuid.uuid4(), rid,
-                    str(it.get("title", ""))[:200], str(it.get("description", "")),
+                    uuid.uuid4(),
+                    rid,
+                    str(it.get("title", ""))[:200],
+                    str(it.get("description", "")),
                     (it.get("ai_status") or "INFO"),
                     [str(t) for t in (it.get("tags") or [])],
                 )
+    return {"errors": state.get("errors", [])}
+
+
+# ── 차단 경로 저장 (초안 없음, reports.status만 갱신) ───────────
+@safe_node
+async def persist_blocked(state: ReportState) -> dict[str, Any]:
+    """입력 가드레일 차단 시 reports.status만 'BLOCKED'로 갱신한다(초안 없음).
+
+    차단은 내용이 없으므로 report_drafts는 만들지 않고, 사유는 로그로만 남긴다(state.errors의
+    'input_blocked:...' 항목). 이 노드가 없으면 status가 영원히 갱신되지 않아 Spring/사용자
+    쪽에서 리포트가 처리중으로 보인다.
+
+    TODO(spring-contract): reports.status enum에 'BLOCKED'를 추가해 정렬해야 한다
+    (현재 계약: AWAITING_INSPECTION|AWAITING_ADOPTION|...). BLOCKED는 여기서 신설한 값이다.
+    """
+    reasons = [str(e) for e in state.get("errors", []) if str(e).startswith("input_blocked")]
+    # 사유는 초안이 아니라 로그로만 보존한다(초안 = 내용물이므로 차단 시 미생성).
+    logger.info(
+        "report blocked by input guardrail", report_id=state.get("report_id"), reasons=reasons
+    )
+
+    rid = uuid.UUID(state["report_id"])
+    pool = db.get_pool()
+    async with pool.acquire() as c:
+        await c.execute(
+            "UPDATE reports SET status = 'BLOCKED', updated_at = now() WHERE id = $1",
+            rid,
+        )
     return {"errors": state.get("errors", [])}

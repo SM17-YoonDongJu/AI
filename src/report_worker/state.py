@@ -18,30 +18,34 @@ class ReportState(TypedDict, total=False):
     doc_type: str
 
     # ── load_context: DB 조회로 조립한 사고 컨텍스트 ───────
-    case_info: dict[str, Any]        # accident_type, accident_date, diagnosis, offered_amount, question ...
-    masked_text: str                 # ocr_results.masked_text
-    entities: dict[str, Any]         # ocr_results.entities
+    case_info: dict[
+        str, Any
+    ]  # accident_type, accident_date, diagnosis, offered_amount, question ...
+    masked_text: str  # ocr_results.masked_text
+    entities: dict[str, Any]  # ocr_results.entities
     subscribed_coverages: list[str]  # 가입 특약 (user_insurances.coverages)
 
     # ── 진단/분류 ─────────────────────────────────────────
-    diagnosis: dict[str, Any]        # {diagnosis, icd_codes, accident_type, requires_disability_review}
+    diagnosis: dict[str, Any]  # {diagnosis, icd_codes, accident_type, requires_disability_review}
 
     # ── 약관/특약 분석 ────────────────────────────────────
-    retrieved_clauses: list[dict[str, Any]]   # rag.search 결과 청크
-    applicable_coverages: list[str]           # → reports.applicable_guarantees
-    missing_coverages: list[str]              # → reports.omitted_special_contract
-    coverage_analysis: dict[str, Any]         # 면책/할증 + citations
+    retrieved_clauses: list[dict[str, Any]]  # rag.search 결과 청크
+    applicable_coverages: list[str]  # → reports.applicable_guarantees
+    missing_coverages: list[str]  # → reports.omitted_special_contract
+    coverage_analysis: dict[str, Any]  # 면책/할증 + citations
 
     # ── 분석 결과 ─────────────────────────────────────────
-    disability_analysis: dict[str, Any]       # 장해 분기 시만 채움 (P1)
-    legal_references: list[dict[str, Any]]    # 판례 → reports.basis_terms_precedents
-    estimated_range: dict[str, int]           # {"min": .., "max": ..} (단정 금지)
+    disability_analysis: dict[str, Any]  # 장해 분기 시만 채움 (P1)
+    legal_references: list[dict[str, Any]]  # 판례 → reports.basis_terms_precedents
+    estimated_range: dict[str, int]  # {"min": .., "max": ..} (단정 금지)
 
     # ── 최종 산출 ─────────────────────────────────────────
-    sections: dict[str, str]                  # 8섹션 본문
-    issues: list[dict[str, Any]]              # report_issues[] {title, description, ai_status, tags, impact_amount}
-    report: str                               # 통합 Markdown
-    judge_failures: list[str]                 # 출력 가드레일 인용검증 실패 섹션
+    sections: dict[str, str]  # 8섹션 본문
+    issues: list[
+        dict[str, Any]
+    ]  # report_issues[] {title, description, ai_status, tags, impact_amount}
+    report: str  # 통합 Markdown
+    judge_failures: list[str]  # 출력 가드레일 인용검증 실패 섹션
 
     # ── 운영 ──────────────────────────────────────────────
-    errors: list[str]                         # 노드별 fallback/실패 기록 (부분결과 표기)
+    errors: list[str]  # 노드별 fallback/실패 기록 (부분결과 표기)
