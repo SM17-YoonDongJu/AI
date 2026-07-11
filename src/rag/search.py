@@ -32,38 +32,41 @@ DEFAULT_TOP_K = 8
 # BGE-M3 폴백 모델(qwen3:embedding 실패 시). 1024d로 차원 일치.
 _BGE_MODEL_NAME = "BAAI/bge-m3"
 
-# namespace별 검색 SQL. clause_no/exhibit 별칭으로 행 파싱을 통일한다.
-# 테이블·컬럼명은 내부 상수(사용자 입력 아님) — SQL 인젝션 위험 없음.
-_KEYWORD_SQL: dict[str, str] = {
-    "terms": (
-        "SELECT chunk_id, content, article_number AS clause_no, section AS exhibit, "
-        "ts_rank(content_tsv, plainto_tsquery('simple', $1)) AS rank "
-        "FROM policy_chunks "
-        "WHERE content_tsv @@ plainto_tsquery('simple', $1) "
-        "ORDER BY rank DESC LIMIT $2"
-    ),
-    "case": (
-        "SELECT chunk_id, content, case_number AS clause_no, NULL::text AS exhibit, "
-        "ts_rank(content_tsv, plainto_tsquery('simple', $1)) AS rank "
-        "FROM case_chunks "
-        "WHERE content_tsv @@ plainto_tsquery('simple', $1) "
-        "ORDER BY rank DESC LIMIT $2"
-    ),
+# qwen3-embedding은 쿼리에 instruction 프리픽스 권장(문서는 raw 적재 → 쿼리만 비대칭 프리픽스).
+_QUERY_INSTRUCT = "Instruct: 보험 약관에서 사용자 질문에 답할 수 있는 관련 조항을 검색한다\nQuery: "
+
+# namespace → 테이블.
+_NS_TABLE: dict[str, str] = {"terms": "policy_chunks", "case": "case_chunks"}
+
+# namespace별 SELECT 소스식: (clause_no, exhibit, article_number, product_name, chunk_type).
+# policy_chunks·case_chunks 스키마가 달라 별칭으로 정합. 값은 내부 상수(사용자 입력 아님).
+_NS_COLS: dict[str, tuple[str, str, str, str, str]] = {
+    "terms": ("article_number", "section", "article_number", "product_name", "chunk_type"),
+    "case": ("case_no", "NULL::text", "section", "product_name", "chunk_type"),
 }
-_VECTOR_SQL: dict[str, str] = {
-    "terms": (
-        "SELECT chunk_id, content, article_number AS clause_no, section AS exhibit "
-        "FROM policy_chunks "
-        "WHERE embedding IS NOT NULL "
-        "ORDER BY embedding <=> $1 LIMIT $2"
-    ),
-    "case": (
-        "SELECT chunk_id, content, case_number AS clause_no, NULL::text AS exhibit "
-        "FROM case_chunks "
-        "WHERE embedding IS NOT NULL "
-        "ORDER BY embedding <=> $1 LIMIT $2"
-    ),
-}
+
+
+def _select_cols(namespace: str) -> str:
+    """namespace의 표준 SELECT 컬럼식(별칭 포함)."""
+    clause_no, exhibit, article_number, product_name, chunk_type = _NS_COLS[namespace]
+    return (
+        f"chunk_id, content, {clause_no} AS clause_no, {exhibit} AS exhibit, "
+        f"{article_number} AS article_number, {product_name} AS product_name, "
+        f"{chunk_type} AS chunk_type"
+    )
+
+
+def _meta_filter(args: list, insurer: str | None, product: str | None) -> str:
+    """insurer/product 메타 필터 절을 만들고 args에 파라미터를 덧붙인다(다음 $N)."""
+    clause = ""
+    if insurer:
+        args.append(insurer)
+        clause += f" AND insurer = ${len(args)}"
+    if product:
+        args.append(product)
+        clause += f" AND product_name = ${len(args)}"
+    return clause
+
 
 # RRF 통합 시 namespace+chunk_id를 합쳐 충돌을 방지하는 구분자(id에 없는 NUL 문자).
 _KEY_SEP = "\x00"
@@ -84,6 +87,9 @@ class ChunkRow:
     content: str
     clause_no: str | None
     exhibit: str | None
+    article_number: str | None = None
+    product_name: str | None = None
+    chunk_type: str | None = None
 
 
 def _row_to_chunk_row(row: asyncpg.Record, namespace: str) -> ChunkRow:
@@ -94,6 +100,9 @@ def _row_to_chunk_row(row: asyncpg.Record, namespace: str) -> ChunkRow:
         content=row["content"],
         clause_no=row["clause_no"],
         exhibit=row["exhibit"],
+        article_number=row["article_number"],
+        product_name=row["product_name"],
+        chunk_type=row["chunk_type"],
     )
 
 
@@ -127,20 +136,51 @@ def build_citations(rows: list[ChunkRow]) -> list[Citation]:
 
 
 async def _keyword_search(
-    pool: asyncpg.Pool, namespace: str, query: str, top_k: int
+    pool: asyncpg.Pool,
+    namespace: str,
+    query: str,
+    top_k: int,
+    insurer: str | None = None,
+    product: str | None = None,
 ) -> list[ChunkRow]:
-    """namespace의 tsvector 키워드 검색 상위 top_k."""
+    """namespace의 키워드(BM25) 검색 상위 top_k. content_tokens 함수식으로 매칭."""
     if not query.strip():
         return []
-    rows = await pool.fetch(_KEYWORD_SQL[namespace], query, top_k)
+    args: list = [query]
+    meta = _meta_filter(args, insurer, product)
+    args.append(top_k)
+    sql = (
+        f"SELECT {_select_cols(namespace)}, "
+        f"ts_rank(to_tsvector('simple', coalesce(content_tokens,'')), "
+        f"plainto_tsquery('simple', $1)) AS rank "
+        f"FROM {_NS_TABLE[namespace]} "
+        f"WHERE to_tsvector('simple', coalesce(content_tokens,'')) "
+        f"@@ plainto_tsquery('simple', $1){meta} "
+        f"ORDER BY rank DESC LIMIT ${len(args)}"
+    )
+    rows = await pool.fetch(sql, *args)
     return [_row_to_chunk_row(row, namespace) for row in rows]
 
 
 async def _vector_search(
-    pool: asyncpg.Pool, namespace: str, embedding: list[float], top_k: int
+    pool: asyncpg.Pool,
+    namespace: str,
+    embedding: list[float],
+    top_k: int,
+    insurer: str | None = None,
+    product: str | None = None,
 ) -> list[ChunkRow]:
-    """namespace의 pgvector 코사인 유사도 검색 상위 top_k."""
-    rows = await pool.fetch(_VECTOR_SQL[namespace], embedding, top_k)
+    """namespace의 pgvector 코사인 유사도 검색 상위 top_k. 캐스트 없음(halfvec/vector 코덱)."""
+    args: list = [embedding]
+    meta = _meta_filter(args, insurer, product)
+    args.append(top_k)
+    sql = (
+        f"SELECT {_select_cols(namespace)} "
+        f"FROM {_NS_TABLE[namespace]} "
+        f"WHERE embedding IS NOT NULL{meta} "
+        f"ORDER BY embedding <=> $1 LIMIT ${len(args)}"
+    )
+    rows = await pool.fetch(sql, *args)
     return [_row_to_chunk_row(row, namespace) for row in rows]
 
 
@@ -172,7 +212,7 @@ async def _embed_query(text: str) -> list[float] | None:
         1024d 임베딩 벡터, 또는 둘 다 실패 시 None(키워드 검색만으로 진행).
     """
     try:
-        return await ai_client.embed(text)
+        return await ai_client.embed(_QUERY_INSTRUCT + text)
     except ai_client.AiClientError as exc:
         logger.warning("rag.embed.primary_failed", exc_info=exc)
 
@@ -189,6 +229,9 @@ async def search(
     insurance_type: str | None = None,
     namespaces: list[str] | None = None,
     top_k: int = DEFAULT_TOP_K,
+    *,
+    insurer: str | None = None,
+    product: str | None = None,
 ) -> RagResult:
     """Hybrid RAG 검색 진입점. ranked chunks + citations를 반환한다.
 
@@ -197,6 +240,8 @@ async def search(
         insurance_type: 신체보험 유형 힌트(비신체는 범위 외 빈 결과).
         namespaces: 검색 namespace. None이면 라우터가 결정(terms·case).
         top_k: 반환 청크 최대 개수.
+        insurer: 가입 보험사로 결과를 좁히는 메타 필터(선택).
+        product: 가입 상품명으로 결과를 좁히는 메타 필터(선택).
 
     Returns:
         통합 순위 청크와 인용 근거를 담은 `RagResult`. 범위 밖이면 빈 결과.
@@ -209,16 +254,25 @@ async def search(
     pool = get_pool()
     corrected = await correct_query(pool, query)
 
+    # RRF 통합 전 후보 풀은 넉넉히 긁는다(top_k만 긁으면 메타필터 좁은 집합에서 recall 손실).
+    candidate_k = max(top_k * 3, 20)
+
     # 키워드 검색(namespace별)과 임베딩 생성을 동시에 시작한다(독립 I/O 병렬화).
     embed_task = asyncio.create_task(_embed_query(corrected.embed_text))
     keyword_results = await asyncio.gather(
-        *(_keyword_search(pool, ns, corrected.keyword_query, top_k) for ns in decision.namespaces)
+        *(
+            _keyword_search(pool, ns, corrected.keyword_query, candidate_k, insurer, product)
+            for ns in decision.namespaces
+        )
     )
     embedding = await embed_task
 
     if embedding is not None:
         vector_results = await asyncio.gather(
-            *(_vector_search(pool, ns, embedding, top_k) for ns in decision.namespaces)
+            *(
+                _vector_search(pool, ns, embedding, candidate_k, insurer, product)
+                for ns in decision.namespaces
+            )
         )
     else:
         # 임베딩 degrade: 키워드 검색만으로 진행.
@@ -243,6 +297,9 @@ async def search(
             namespace=row.namespace,
             score=score,
             source_ref=row.chunk_id,
+            article_number=row.article_number,
+            product_name=row.product_name,
+            chunk_type=row.chunk_type,
         )
         for (_, score), row in zip(top, top_rows, strict=True)
     ]
