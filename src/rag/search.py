@@ -56,8 +56,19 @@ def _select_cols(namespace: str) -> str:
     )
 
 
-def _meta_filter(args: list, insurer: str | None, product: str | None) -> str:
-    """insurer/product 메타 필터 절을 만들고 args에 파라미터를 덧붙인다(다음 $N)."""
+# insurer/product 필터가 유효한 namespace. case_chunks의 insurer/product_name은 nullable
+# 참고 메타일 뿐 필터 키가 아니라(적재기가 채우지 않음), 걸면 case 결과가 항상 0건이 된다.
+_META_FILTER_NS: frozenset[str] = frozenset({"terms"})
+
+
+def _meta_filter(namespace: str, args: list, insurer: str | None, product: str | None) -> str:
+    """insurer/product 메타 필터 절을 만들고 args에 파라미터를 덧붙인다(다음 $N).
+
+    필터는 policy_chunks(terms)에만 적용한다 — case_chunks의 insurer/product_name은
+    nullable 참고 메타일 뿐 필터 키가 아니므로 걸면 case recall이 0으로 붕괴한다.
+    """
+    if namespace not in _META_FILTER_NS:
+        return ""
     clause = ""
     if insurer:
         args.append(insurer)
@@ -147,7 +158,7 @@ async def _keyword_search(
     if not query.strip():
         return []
     args: list = [query]
-    meta = _meta_filter(args, insurer, product)
+    meta = _meta_filter(namespace, args, insurer, product)
     args.append(top_k)
     sql = (
         f"SELECT {_select_cols(namespace)}, "
@@ -172,7 +183,7 @@ async def _vector_search(
 ) -> list[ChunkRow]:
     """namespace의 pgvector 코사인 유사도 검색 상위 top_k. 캐스트 없음(halfvec/vector 코덱)."""
     args: list = [embedding]
-    meta = _meta_filter(args, insurer, product)
+    meta = _meta_filter(namespace, args, insurer, product)
     args.append(top_k)
     sql = (
         f"SELECT {_select_cols(namespace)} "

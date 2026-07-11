@@ -53,12 +53,14 @@ class _FakePool:
 
     def __init__(self) -> None:
         self.fetch_args: list[tuple[object, ...]] = []
+        self.fetch_calls: list[tuple[str, tuple[object, ...]]] = []
 
     async def fetchrow(self, sql: str, *args: object) -> None:
         return None
 
     async def fetch(self, sql: str, *args: object) -> list[dict[str, object]]:
         self.fetch_args.append(args)
+        self.fetch_calls.append((sql, args))
         is_keyword = "plainto_tsquery" in sql
         if "policy_chunks" in sql:
             return _TERMS_KEYWORD if is_keyword else _TERMS_VECTOR
@@ -149,3 +151,37 @@ async def test_insurer_product_filter_reaches_sql(
     flat = [a for args in fake_pool.fetch_args for a in args]
     assert "메리츠화재" in flat
     assert "다모아상해보험" in flat
+
+
+async def test_insurer_product_filter_skips_case_namespace(
+    fake_pool: _FakePool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Arrange
+    async def fake_embed(text: str) -> list[float]:
+        return [0.0] * settings.embedding_dim
+
+    monkeypatch.setattr(ai_client, "embed", fake_embed)
+
+    # Act: terms·case 동시 검색에 insurer/product 필터를 건다
+    await search_mod.search(
+        "후유장해",
+        namespaces=["terms", "case"],
+        top_k=8,
+        insurer="메리츠화재",
+        product="다모아상해보험",
+    )
+
+    # Assert: case_chunks SQL에는 insurer/product 절도, 그 파라미터도 붙지 않는다
+    # (case의 insurer/product_name은 nullable 참고 메타 — 걸면 recall이 0으로 붕괴).
+    case_calls = [(sql, args) for sql, args in fake_pool.fetch_calls if "case_chunks" in sql]
+    assert case_calls, "case_chunks 검색이 실행돼야 한다"
+    for sql, args in case_calls:
+        assert "insurer =" not in sql
+        assert "product_name =" not in sql
+        assert "메리츠화재" not in args
+        assert "다모아상해보험" not in args
+
+    # 반대로 policy_chunks(terms) SQL에는 필터가 정상 적용된다
+    terms_calls = [(sql, args) for sql, args in fake_pool.fetch_calls if "policy_chunks" in sql]
+    assert terms_calls, "policy_chunks 검색이 실행돼야 한다"
+    assert any("메리츠화재" in args and "다모아상해보험" in args for _, args in terms_calls)

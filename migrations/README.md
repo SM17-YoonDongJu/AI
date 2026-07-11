@@ -8,12 +8,23 @@ Hybrid RAG(04)용 PostgreSQL 스키마. **마이그레이션 프레임워크 없
 | 순서 | 파일 | 내용 |
 |------|------|------|
 | 001 | `001_extensions.sql` | `vector`(pgvector), `pg_trgm` 확장 |
-| 002 | `002_policy_chunks.sql` | `policy_chunks`(약관, namespace=terms) + HNSW·tsvector 인덱스 |
-| 003 | `003_case_chunks.sql` | `case_outcome`/`case_block_type` enum + `case_chunks`(분쟁조정, namespace=case) + HNSW·tsvector·필터 인덱스 |
+| 002 | `002_policy_chunks.sql` | `policy_chunks`(약관, namespace=terms) + HNSW(halfvec)·tsvector·필터 인덱스 |
+| 003 | `003_case_chunks.sql` | `case_chunks`(판례·금감원 분쟁조정례, namespace=case) + HNSW(halfvec)·tsvector·메타·태그 인덱스 |
 | 004 | `004_search_terms.sql` | `search_terms`(정규 용어 사전) + trigram GIN |
 
 `namespace`는 물리 컬럼이 아니라 검색한 소스 테이블로 부여하는 파생값이다
 (`policy_chunks` -> `terms`, `case_chunks` -> `case`).
+
+## 정본(canonical) 관계
+
+`002`/`003`은 **실DB 초기화 스크립트 `tempVectorDB/init/`(01_schema.sql·03_case_chunks.sql)를
+정본으로 삼아 동일 스키마**를 재현한다. 적재기(`tempVectorDB/load_cases.py`)와 검색기
+(`src/rag/search.py`)가 이 스키마에 맞춰 있으므로, 두 소스는 항상 일치해야 한다.
+
+- `embedding`은 두 테이블 모두 `halfvec(1024)`이고 HNSW는 `halfvec_cosine_ops`를 쓴다.
+- `003`의 구버전 스키마(`case_number`/`block_type` enum/`court_level` 등)는 폐기됐다.
+  구버전 테이블이 이미 있는 DB는 `case_chunks`(및 `case_outcome`·`case_block_type` enum)를
+  `DROP` 후 재적용해야 한다 — 파일 상단 주석 참조.
 
 ## 적용 방법
 
@@ -52,8 +63,9 @@ asyncio.run(main())
 ## 키워드 검색 전략 (tsvector)
 
 04 문서의 "앱단 토큰화 -> `content_tokens` 저장 -> simple tsvector" 전략을 따른다.
-각 청크 테이블은 STORED generated 컬럼 `content_tsv`
-( `to_tsvector('simple', coalesce(content_tokens, ''))` )를 두고 그 위에 GIN 인덱스를 건다.
+각 청크 테이블은 `content_tokens` 위에 **함수식 GIN 인덱스**
+( `gin (to_tsvector('simple', coalesce(content_tokens, '')))` )를 둔다. 검색기
+(`src/rag/search.py`)가 바로 이 함수식으로 `@@` 매칭하므로 인덱스 표현식과 정확히 일치한다.
 형태소 분석은 적재/쿼리 시 앱단(`kiwipiepy`)에서 수행해 `content_tokens`(공백 구분 토큰)에
 저장하고, DB는 `'simple'` 구성으로 단순 토큰 매칭만 한다.
 
