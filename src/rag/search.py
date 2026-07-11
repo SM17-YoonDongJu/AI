@@ -12,6 +12,7 @@ report_worker·chatbot이 함수 호출로 공유하는 단일 진입점 `search
 """
 
 import asyncio
+import datetime
 from dataclasses import dataclass
 
 import asyncpg
@@ -36,13 +37,20 @@ _BGE_MODEL_NAME = "BAAI/bge-m3"
 _QUERY_INSTRUCT = "Instruct: 보험 약관에서 사용자 질문에 답할 수 있는 관련 조항을 검색한다\nQuery: "
 
 # namespace → 테이블.
-_NS_TABLE: dict[str, str] = {"terms": "policy_chunks", "case": "case_chunks"}
+_NS_TABLE: dict[str, str] = {
+    "terms": "policy_chunks",
+    "case": "case_chunks",
+    "level": "schedule_chunks",
+}
 
 # namespace별 SELECT 소스식: (clause_no, exhibit, article_number, product_name, chunk_type).
-# policy_chunks·case_chunks 스키마가 달라 별칭으로 정합. 값은 내부 상수(사용자 입력 아님).
+# 세 테이블 스키마가 달라 별칭으로 정합한다. 값은 내부 상수(사용자 입력 아님).
+# level: 인용의 조항 자리에는 표 내 section(clause_no·article_number), 별표 자리에는 개정판
+#   라벨(version_label)을 실어 어느 버전 분류표인지 역추적한다. product_name은 없음(NULL).
 _NS_COLS: dict[str, tuple[str, str, str, str, str]] = {
     "terms": ("article_number", "section", "article_number", "product_name", "chunk_type"),
     "case": ("case_no", "NULL::text", "section", "product_name", "chunk_type"),
+    "level": ("section", "version_label", "section", "NULL::text", "chunk_type"),
 }
 
 
@@ -77,6 +85,37 @@ def _meta_filter(namespace: str, args: list, insurer: str | None, product: str |
         args.append(product)
         clause += f" AND product_name = ${len(args)}"
     return clause
+
+
+# 버전(개정판) 필터가 유효한 namespace. 후유장해분류표(schedule_chunks)는 시행세칙 개정마다
+# 판이 갈려, 계약 체결일이 속하는 버전만 검색해야 한다.
+_VERSION_FILTER_NS: frozenset[str] = frozenset({"level"})
+
+
+def _version_filter(namespace: str, args: list, contract_date: datetime.date | None) -> str:
+    """level namespace의 개정 버전(적용기간) 필터 절을 만들고 args에 파라미터를 덧붙인다.
+
+    후유장해분류표는 개정 버전별로 적용되므로, 계약 체결일이 속하는 판만 남긴다.
+    `contract_date=None`이면 현행판(`applies_to IS NULL`)만 검색한다. level 외 namespace에는
+    적용하지 않는다(terms 버전매칭은 별도 작업).
+
+    Args:
+        namespace: 검색 namespace.
+        args: SQL 파라미터 리스트(제자리 수정 — contract_date를 덧붙일 수 있다).
+        contract_date: 계약 체결일. None이면 현행판만.
+
+    Returns:
+        WHERE 뒤에 이어붙일 필터 절(해당 없으면 빈 문자열).
+    """
+    if namespace not in _VERSION_FILTER_NS:
+        return ""
+    if contract_date is None:
+        # 현행판만: 종료일이 없는(적용 중인) 버전.
+        return " AND applies_to IS NULL"
+    # 파라미터 1개를 바인딩해 시작·종료 경계 두 곳에서 재사용($N)한다(SQL 인젝션 없음).
+    args.append(contract_date)
+    idx = len(args)
+    return f" AND applies_from <= ${idx} AND (applies_to IS NULL OR ${idx} < applies_to)"
 
 
 # RRF 통합 시 namespace+chunk_id를 합쳐 충돌을 방지하는 구분자(id에 없는 NUL 문자).
@@ -153,12 +192,14 @@ async def _keyword_search(
     top_k: int,
     insurer: str | None = None,
     product: str | None = None,
+    contract_date: datetime.date | None = None,
 ) -> list[ChunkRow]:
     """namespace의 키워드(BM25) 검색 상위 top_k. content_tokens 함수식으로 매칭."""
     if not query.strip():
         return []
     args: list = [query]
     meta = _meta_filter(namespace, args, insurer, product)
+    version = _version_filter(namespace, args, contract_date)
     args.append(top_k)
     sql = (
         f"SELECT {_select_cols(namespace)}, "
@@ -166,7 +207,7 @@ async def _keyword_search(
         f"plainto_tsquery('simple', $1)) AS rank "
         f"FROM {_NS_TABLE[namespace]} "
         f"WHERE to_tsvector('simple', coalesce(content_tokens,'')) "
-        f"@@ plainto_tsquery('simple', $1){meta} "
+        f"@@ plainto_tsquery('simple', $1){meta}{version} "
         f"ORDER BY rank DESC LIMIT ${len(args)}"
     )
     rows = await pool.fetch(sql, *args)
@@ -180,15 +221,17 @@ async def _vector_search(
     top_k: int,
     insurer: str | None = None,
     product: str | None = None,
+    contract_date: datetime.date | None = None,
 ) -> list[ChunkRow]:
     """namespace의 pgvector 코사인 유사도 검색 상위 top_k. 캐스트 없음(halfvec/vector 코덱)."""
     args: list = [embedding]
     meta = _meta_filter(namespace, args, insurer, product)
+    version = _version_filter(namespace, args, contract_date)
     args.append(top_k)
     sql = (
         f"SELECT {_select_cols(namespace)} "
         f"FROM {_NS_TABLE[namespace]} "
-        f"WHERE embedding IS NOT NULL{meta} "
+        f"WHERE embedding IS NOT NULL{meta}{version} "
         f"ORDER BY embedding <=> $1 LIMIT ${len(args)}"
     )
     rows = await pool.fetch(sql, *args)
@@ -243,6 +286,7 @@ async def search(
     *,
     insurer: str | None = None,
     product: str | None = None,
+    contract_date: datetime.date | None = None,
 ) -> RagResult:
     """Hybrid RAG 검색 진입점. ranked chunks + citations를 반환한다.
 
@@ -251,8 +295,11 @@ async def search(
         insurance_type: 신체보험 유형 힌트(비신체는 범위 외 빈 결과).
         namespaces: 검색 namespace. None이면 라우터가 결정(terms·case).
         top_k: 반환 청크 최대 개수.
-        insurer: 가입 보험사로 결과를 좁히는 메타 필터(선택).
-        product: 가입 상품명으로 결과를 좁히는 메타 필터(선택).
+        insurer: 가입 보험사로 결과를 좁히는 메타 필터(선택). terms에만 적용.
+        product: 가입 상품명으로 결과를 좁히는 메타 필터(선택). terms에만 적용.
+        contract_date: 계약 체결일. `level`(후유장해분류표) namespace 검색 시 이 날짜가 속하는
+            개정판만 남긴다(`applies_from <= contract_date < applies_to`). None이면 현행판만.
+            terms·case에는 영향이 없다(향후 terms 버전매칭은 별도 작업).
 
     Returns:
         통합 순위 청크와 인용 근거를 담은 `RagResult`. 범위 밖이면 빈 결과.
@@ -272,7 +319,9 @@ async def search(
     embed_task = asyncio.create_task(_embed_query(corrected.embed_text))
     keyword_results = await asyncio.gather(
         *(
-            _keyword_search(pool, ns, corrected.keyword_query, candidate_k, insurer, product)
+            _keyword_search(
+                pool, ns, corrected.keyword_query, candidate_k, insurer, product, contract_date
+            )
             for ns in decision.namespaces
         )
     )
@@ -281,7 +330,7 @@ async def search(
     if embedding is not None:
         vector_results = await asyncio.gather(
             *(
-                _vector_search(pool, ns, embedding, candidate_k, insurer, product)
+                _vector_search(pool, ns, embedding, candidate_k, insurer, product, contract_date)
                 for ns in decision.namespaces
             )
         )

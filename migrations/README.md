@@ -11,6 +11,7 @@ Hybrid RAG(04)용 PostgreSQL 스키마. **마이그레이션 프레임워크 없
 | 002 | `002_policy_chunks.sql` | `policy_chunks`(약관, namespace=terms) + HNSW(halfvec)·tsvector·필터 인덱스 |
 | 003 | `003_case_chunks.sql` | `case_chunks`(판례·금감원 분쟁조정례, namespace=case) + HNSW(halfvec)·tsvector·메타·태그 인덱스 |
 | 004 | `004_search_terms.sql` | `search_terms`(정규 용어 사전) + trigram GIN |
+| 005 | `005_schedule_chunks.sql` | `schedule_chunks`(후유장해분류표, namespace=level) + HNSW(halfvec)·tsvector·버전(applies_from,applies_to)·body_part 인덱스 |
 
 `namespace`는 물리 컬럼이 아니라 검색한 소스 테이블로 부여하는 파생값이다
 (`policy_chunks` -> `terms`, `case_chunks` -> `case`).
@@ -69,6 +70,14 @@ asyncio.run(main())
 형태소 분석은 적재/쿼리 시 앱단(`kiwipiepy`)에서 수행해 `content_tokens`(공백 구분 토큰)에
 저장하고, DB는 `'simple'` 구성으로 단순 토큰 매칭만 한다.
 
+## 버전 매칭 (schedule_chunks / level)
+
+후유장해분류표는 시행세칙 개정(2018.4 대개정 등)마다 판이 갈린다. 계약 체결일이 속하는
+버전만 검색해야 하므로 `(version_label, applies_from, applies_to)`로 유효기간을 표현한다
+(`applies_to IS NULL` = 현행판). 검색기(`src/rag/search.py`)는 `level` namespace에 한해
+`contract_date` 인자로 `applies_from <= contract_date AND (applies_to IS NULL OR
+contract_date < applies_to)` 필터를 건다(`contract_date=None`이면 현행판만).
+
 ## 향후 확장
 
-`level`(후유장해 분류표), `medical`(HIRA 수가·KCD)은 테이블 미존재 -> 별도 마이그레이션으로 추가.
+`medical`(HIRA 수가·KCD)은 테이블 미존재 -> 별도 마이그레이션으로 추가.

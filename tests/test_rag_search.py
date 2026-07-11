@@ -3,11 +3,13 @@
 실제 PG·Ollama 없이 라우팅→오타보정(치환 없음)→병렬검색→RRF→인용까지 조립을 검증한다.
 """
 
+import datetime
 import sys
 
 import pytest
 
-import rag.search  # noqa: F401 - 서브모듈 등록(패키지가 search 함수로 이름을 가림)
+import rag.router
+import rag.search  # 서브모듈 등록(패키지가 search 함수로 이름을 가림)
 from core import ai_client
 from core.config import settings
 
@@ -42,10 +44,26 @@ def _case(cid: str, clause: str, article: str) -> dict[str, object]:
     }
 
 
+def _level(cid: str, section: str, version: str) -> dict[str, object]:
+    # schedule_chunks SELECT 별칭: clause_no←section, exhibit←version_label,
+    # article_number←section, product_name←NULL, chunk_type←chunk_type.
+    return {
+        "chunk_id": cid,
+        "content": f"장해분류 {cid}",
+        "clause_no": section,
+        "exhibit": version,
+        "article_number": section,
+        "product_name": None,
+        "chunk_type": "schedule",
+    }
+
+
 _TERMS_KEYWORD = [_terms("t1", "제3조", "별표2"), _terms("t2", "제5조", None)]
 _TERMS_VECTOR = [_terms("t2", "제5조", None), _terms("t3", "제7조", None, "schedule")]
 _CASE_KEYWORD = [_case("c1", "2021다1234", "판시사항")]
 _CASE_VECTOR = [_case("c1", "2021다1234", "판시사항"), _case("c2", "2020다9999", "본문")]
+_LEVEL_KEYWORD = [_level("s1", "눈", "2018.4 개정")]
+_LEVEL_VECTOR = [_level("s1", "눈", "2018.4 개정"), _level("s2", "귀", "2018.4 개정")]
 
 
 class _FakePool:
@@ -64,6 +82,8 @@ class _FakePool:
         is_keyword = "plainto_tsquery" in sql
         if "policy_chunks" in sql:
             return _TERMS_KEYWORD if is_keyword else _TERMS_VECTOR
+        if "schedule_chunks" in sql:
+            return _LEVEL_KEYWORD if is_keyword else _LEVEL_VECTOR
         return _CASE_KEYWORD if is_keyword else _CASE_VECTOR
 
 
@@ -185,3 +205,88 @@ async def test_insurer_product_filter_skips_case_namespace(
     terms_calls = [(sql, args) for sql, args in fake_pool.fetch_calls if "policy_chunks" in sql]
     assert terms_calls, "policy_chunks 검색이 실행돼야 한다"
     assert any("메리츠화재" in args and "다모아상해보험" in args for _, args in terms_calls)
+
+
+def test_router_accepts_level_namespace() -> None:
+    # Arrange / Act: level을 명시하면 유효 namespace로 통과해야 한다
+    decision = rag.router.route("후유장해분류표", namespaces=["level"])
+
+    # Assert
+    assert decision.in_scope is True
+    assert decision.namespaces == ["level"]
+    assert "level" in rag.router.VALID_NAMESPACES
+    # level은 기본 검색 대상은 아니다(명시 요청 시에만)
+    assert "level" not in rag.router.DEFAULT_NAMESPACES
+
+
+async def test_level_search_binds_contract_date_version_filter(
+    fake_pool: _FakePool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Arrange
+    async def fake_embed(text: str) -> list[float]:
+        return [0.0] * settings.embedding_dim
+
+    monkeypatch.setattr(ai_client, "embed", fake_embed)
+    contract_date = datetime.date(2019, 5, 1)
+
+    # Act: contract_date를 주면 level SQL에 적용기간 필터가 붙고 날짜가 파라미터로 실린다
+    await search_mod.search(
+        "후유장해분류표", namespaces=["level"], top_k=8, contract_date=contract_date
+    )
+
+    # Assert: schedule_chunks SQL에 applies_from/applies_to 경계 절 + 날짜 파라미터
+    level_calls = [(sql, args) for sql, args in fake_pool.fetch_calls if "schedule_chunks" in sql]
+    assert level_calls, "schedule_chunks 검색이 실행돼야 한다"
+    for sql, args in level_calls:
+        assert "applies_from <=" in sql
+        assert "applies_to IS NULL OR" in sql
+        assert contract_date in args
+
+
+async def test_level_search_defaults_to_current_version_when_no_contract_date(
+    fake_pool: _FakePool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Arrange
+    async def fake_embed(text: str) -> list[float]:
+        return [0.0] * settings.embedding_dim
+
+    monkeypatch.setattr(ai_client, "embed", fake_embed)
+
+    # Act: contract_date 없이 level 검색 → 현행판(applies_to IS NULL)만
+    await search_mod.search("후유장해분류표", namespaces=["level"], top_k=8)
+
+    # Assert
+    level_calls = [(sql, args) for sql, args in fake_pool.fetch_calls if "schedule_chunks" in sql]
+    assert level_calls, "schedule_chunks 검색이 실행돼야 한다"
+    for sql, args in level_calls:
+        assert "applies_to IS NULL" in sql
+        # 현행판 경로는 날짜 파라미터를 바인딩하지 않는다(date 값이 args에 없어야 함)
+        assert not any(isinstance(a, datetime.date) for a in args)
+
+
+async def test_contract_date_does_not_affect_terms_or_case(
+    fake_pool: _FakePool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Arrange
+    async def fake_embed(text: str) -> list[float]:
+        return [0.0] * settings.embedding_dim
+
+    monkeypatch.setattr(ai_client, "embed", fake_embed)
+    contract_date = datetime.date(2019, 5, 1)
+
+    # Act: terms·case에 contract_date를 넘겨도 버전 필터가 붙지 않아야 한다
+    await search_mod.search(
+        "후유장해", namespaces=["terms", "case"], top_k=8, contract_date=contract_date
+    )
+
+    # Assert: terms/case SQL에는 버전 절도, 날짜 파라미터도 없다
+    other_calls = [
+        (sql, args)
+        for sql, args in fake_pool.fetch_calls
+        if "policy_chunks" in sql or "case_chunks" in sql
+    ]
+    assert other_calls, "terms·case 검색이 실행돼야 한다"
+    for sql, args in other_calls:
+        assert "applies_from" not in sql
+        assert "applies_to" not in sql
+        assert contract_date not in args
