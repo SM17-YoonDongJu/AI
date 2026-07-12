@@ -43,3 +43,6 @@ _workspace/
 _workspace_prev/
 
 # 주의: uv.lock 은 커밋한다(재현성). 무시하지 말 것.
+
+# 장해분류표 원본 다운로드 (별표15 HWP/PDF — 재다운로드 가능, 용량 큼)
+tempVectorDB/schedule_data/raw/
