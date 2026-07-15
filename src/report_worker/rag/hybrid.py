@@ -54,6 +54,9 @@ async def search(
             "namespace": c.namespace,
             "score": c.score,
             "source_ref": _fmt_citation(c),
+            # canonical Chunk.source_ref는 chunk_id다(표시용 source_ref로 덮이므로 별도 보존).
+            # case_search가 이 chunk_id로 case_chunks 메타(사건명·법원·선고일)를 역추적한다.
+            "chunk_id": c.source_ref,
             "article_number": c.article_number,
             "product_name": c.product_name,
             "chunk_type": c.chunk_type,

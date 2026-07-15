@@ -17,7 +17,7 @@ INSERT INTO ocr_results (id, job_id, doc_type, masked_text, entities) VALUES (
   '{"diagnosis":"전방십자인대 파열","icd":"S83.5","surgery":true,"admission_days":14}'::jsonb
 );
 
-INSERT INTO user_insurances (id, user_id, insurer_name, product_name, match_status, policy_no, enrolled_at, coverages, ocr_result_id) VALUES (
+INSERT INTO user_insurances (id, user_id, insurer_name, product_name, match_status, policy_no, enrolled_at, coverages, coverage_details, ocr_result_id) VALUES (
   '00000000-0000-0000-0000-000000000004',
   '00000000-0000-0000-0000-000000000011',
   '메리츠화재',
@@ -26,6 +26,11 @@ INSERT INTO user_insurances (id, user_id, insurer_name, product_name, match_stat
   'POL-2026-0001',
   '2022-05-01',
   ARRAY['상해후유장해','상해입원일당','수술비특약','골절진단비'],
+  -- 특약별 가입금액(증권 OCR로 확보한다고 가정한 값). type: disability|per_diem|surgery|fracture
+  '[{"name":"상해후유장해","type":"disability","amount":30000000},
+    {"name":"상해입원일당","type":"per_diem","amount":30000},
+    {"name":"수술비특약","type":"surgery","amount":500000},
+    {"name":"골절진단비","type":"fracture","amount":300000}]'::jsonb,
   NULL
 );
 

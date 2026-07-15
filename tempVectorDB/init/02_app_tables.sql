@@ -36,7 +36,8 @@ CREATE TABLE IF NOT EXISTS user_insurances (
     match_status  TEXT,                -- MATCHED|UNMATCHED|PENDING
     policy_no     TEXT,
     enrolled_at   DATE,
-    coverages     TEXT[],              -- 가입 특약 → subscribed_coverages
+    coverages     TEXT[],              -- 가입 특약명 → subscribed_coverages
+    coverage_details JSONB,             -- 특약별 가입금액/단가 [{name,type,amount}] → payment_calc
     policy_file_url TEXT,
     ocr_result_id UUID,
     created_at    TIMESTAMPTZ DEFAULT now()

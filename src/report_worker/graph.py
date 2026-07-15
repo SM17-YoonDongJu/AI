@@ -22,6 +22,7 @@ def build_graph():
     g.add_node("coverage_analysis", agents.coverage_analysis)
     g.add_node("case_search", agents.case_search)
     g.add_node("disability_rag", agents.disability_rag)
+    g.add_node("disability_verify", agents.disability_verify)
     g.add_node("disability_calc", agents.disability_calc)
     g.add_node("payment_calc", agents.payment_calc)
     g.add_node("report_compose", agents.report_compose)
@@ -60,7 +61,8 @@ def build_graph():
         agents.route_after_case,
         {"disability": "disability_rag", "payment_calc": "payment_calc"},
     )
-    g.add_edge("disability_rag", "disability_calc")
+    g.add_edge("disability_rag", "disability_verify")
+    g.add_edge("disability_verify", "disability_calc")
     g.add_edge("disability_calc", "payment_calc")
 
     g.add_edge("payment_calc", "report_compose")

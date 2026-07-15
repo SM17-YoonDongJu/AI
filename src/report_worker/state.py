@@ -23,7 +23,8 @@ class ReportState(TypedDict, total=False):
     ]  # accident_type, accident_date, diagnosis, offered_amount, question ...
     masked_text: str  # ocr_results.masked_text
     entities: dict[str, Any]  # ocr_results.entities
-    subscribed_coverages: list[str]  # 가입 특약 (user_insurances.coverages)
+    subscribed_coverages: list[str]  # 가입 특약명 (user_insurances.coverages)
+    coverage_details: list[dict[str, Any]]  # 특약별 가입금액 [{name,type,amount}] (payment_calc용)
 
     # ── 진단/분류 ─────────────────────────────────────────
     diagnosis: dict[str, Any]  # {diagnosis, icd_codes, accident_type, requires_disability_review}
@@ -38,6 +39,8 @@ class ReportState(TypedDict, total=False):
     disability_analysis: dict[str, Any]  # 장해 분기 시만 채움 (P1)
     legal_references: list[dict[str, Any]]  # 판례 → reports.basis_terms_precedents
     estimated_range: dict[str, int]  # {"min": .., "max": ..} (단정 금지)
+    payment_breakdown: list[dict[str, Any]]  # 특약별 지급 산출 [{name, payout, basis}]
+    payment_excluded: list[dict[str, Any]]  # 지급 제외 특약 [{name, reason}]
 
     # ── 최종 산출 ─────────────────────────────────────────
     sections: dict[str, str]  # 8섹션 본문

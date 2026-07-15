@@ -83,7 +83,8 @@ async def load_context(state: ReportState) -> dict[str, Any]:
                 rep["claim_id"],
             )
         ins = await c.fetchrow(
-            "SELECT insurer_name, product_name, coverages, enrolled_at FROM user_insurances "
+            "SELECT insurer_name, product_name, coverages, coverage_details, enrolled_at "
+            "FROM user_insurances "
             "WHERE user_id = (SELECT user_id FROM reports WHERE id = $1) LIMIT 1",
             uuid.UUID(state["report_id"]),
         )
@@ -110,11 +111,16 @@ async def load_context(state: ReportState) -> dict[str, Any]:
         if ins
         else None,  # 가입일(date|None) — 표준표 버전 매칭용
     }
+    coverage_details = []
+    if ins and ins["coverage_details"]:
+        cd = ins["coverage_details"]
+        coverage_details = cd if isinstance(cd, list) else json.loads(cd)
     return {
         "case_info": case_info,
         "masked_text": (ocr["masked_text"] if ocr else ""),
         "entities": entities,
         "subscribed_coverages": list(ins["coverages"]) if ins and ins["coverages"] else [],
+        "coverage_details": coverage_details,
         "errors": errors,
     }
 
@@ -262,17 +268,97 @@ async def coverage_analysis(state: ReportState) -> dict[str, Any]:
     }
 
 
-# ── 판례 검색 (case_chunks 미적재 → 폴백) ──────────────────────
+# ── 판례 검색 (enrich → 사건단위 dedup → LLM 관련성 필터) ──────
+_CASE_TOP_N = 4  # 최종 유지 판례 수
+_CASE_CANDIDATE_K = 12  # dedup·필터 전 후보 풀
+
+
+async def _enrich_cases(chunk_ids: list[str]) -> dict[str, dict[str, Any]]:
+    """chunk_id → case_chunks 메타(사건명·법원·선고일·출처). 표시·dedup용 역추적."""
+    if not chunk_ids:
+        return {}
+    pool = db.get_pool()
+    async with pool.acquire() as c:
+        rows = await c.fetch(
+            "SELECT chunk_id, source_type, institution, case_no, case_title, decision_date "
+            "FROM case_chunks WHERE chunk_id = ANY($1)",
+            chunk_ids,
+        )
+    return {r["chunk_id"]: dict(r) for r in rows}
+
+
+async def _filter_relevant_cases(dx_name: str, cands: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """LLM으로 진단과 무관한 판례를 걸러낸다(구조화 메타로는 필터 불가 — accident_type 미채움).
+
+    실패/빈 응답 시 입력을 그대로 통과시킨다(degrade — 필터는 품질 개선용, 필수 아님).
+    """
+    if not cands:
+        return cands
+    listing = "\n".join(
+        f"{i}) {c.get('case_title') or '(제목없음)'} — {(c.get('text') or '')[:120]}"
+        for i, c in enumerate(cands)
+    )
+    res = await ai_client.chat_json(
+        [
+            {
+                "role": "system",
+                "content": "너는 보험 손해사정 판례 선별가다. 사고와 쟁점이 관련된 판례만 고른다. JSON만 출력한다.",
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"[사고/진단]\n{dx_name}\n\n[판례 후보]\n{listing}\n\n"
+                    "위 사고의 보험금 쟁점(보장·면책·후유장해·수술/입원)과 실제로 관련된 후보의 "
+                    '번호만 고르라. 무관한 사망·타부위·타담보는 제외. JSON: {"relevant":[번호...]}'
+                ),
+            },
+        ]
+    )
+    idxs = res.get("relevant") if isinstance(res, dict) else None
+    if not isinstance(idxs, list):
+        return cands  # 판정 실패 → 통과(degrade)
+    keep = {int(i) for i in idxs if isinstance(i, (int, float)) or str(i).isdigit()}
+    filtered = [c for i, c in enumerate(cands) if i in keep]
+    return filtered or cands  # 전부 탈락하면 보수적으로 원본 유지
+
+
 @safe_node
 async def case_search(state: ReportState) -> dict[str, Any]:
     ci = state.get("case_info", {})
     dx = state.get("diagnosis") or {}
     dx_name = dx.get("diagnosis") or ci.get("diagnosis") or ""
-    res = await hybrid.search(dx_name, namespaces=["case"], top_k=4)
+    res = await hybrid.search(dx_name, namespaces=["case"], top_k=_CASE_CANDIDATE_K)
     refs = res["ranked_chunks"]
     if not refs:
         return {"legal_references": [], "errors": _err(state, "case_data_missing")}
-    return {"legal_references": refs}
+
+    # 1) 메타 역추적(사건명·법원·선고일)으로 각 청크를 보강한다.
+    meta = await _enrich_cases([r.get("chunk_id") for r in refs if r.get("chunk_id")])
+    for r in refs:
+        m = meta.get(r.get("chunk_id"), {})
+        r["case_title"] = m.get("case_title")
+        r["case_no"] = m.get("case_no")
+        r["institution"] = m.get("institution")
+        r["decision_date"] = str(m["decision_date"]) if m.get("decision_date") else None
+        r["source_type"] = m.get("source_type")
+
+    # 2) 사건 단위 dedup — 같은 사건의 여러 청크 중 최상위 순위만(입력이 이미 점수순).
+    seen: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for r in refs:
+        key = r.get("case_no") or r.get("case_title") or r.get("chunk_id")
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(r)
+
+    # 3) LLM 관련성 필터(무관 판례 제거) 후 상위 N만.
+    relevant = await _filter_relevant_cases(dx_name, deduped)
+    kept = relevant[:_CASE_TOP_N]
+    errors = state.get("errors", [])
+    if len(deduped) > len(relevant):
+        errors = _err(state, f"case_filtered:{len(deduped)}→{len(relevant)}")
+    return {"legal_references": kept, "errors": errors}
 
 
 # ── 분기: 후유장해 검토 필요 시 장해 서브그래프로 ──────────────
@@ -452,6 +538,92 @@ async def disability_rag(state: ReportState) -> dict[str, Any]:
     return out
 
 
+# ── 장해 분류 적정성 검증 (LLM 비판 — 과대분류 방지) ───────────
+@safe_node
+async def disability_verify(state: ReportState) -> dict[str, Any]:
+    """추출된 장해 항목이 진단에 비해 과대분류인지 LLM으로 비판·교정한다.
+
+    숫자 검증(disability_rag)은 "지급률이 원문에 있나"만 보고 "이 진단이 그 등급에 맞나"는
+    못 본다(사용자 지적). 이 노드가 그 공백을 메운다: 과대면 같은 표의 낮은 등급 지급률로
+    하향하고(rate_original 보존), 신뢰도를 low로 강등, 사유를 남긴다. 실패 시 무변경(degrade).
+    """
+    da = state.get("disability_analysis", {})
+    items = da.get("items", [])
+    targets = [i for i in items if i.get("verified")]
+    if not targets:
+        return {}
+
+    ci = state.get("case_info", {})
+    dx = state.get("diagnosis") or {}
+    dx_name = dx.get("diagnosis") or ci.get("diagnosis") or ""
+    surgery = bool(dx.get("surgery"))
+    listing = "\n".join(
+        f"{idx}) 손상={i.get('injury')} / 선택등급='{i.get('category_label')}' / 지급률={i.get('rate')}%"
+        for idx, i in enumerate(targets)
+    )
+    res = await ai_client.chat_json(
+        [
+            {
+                "role": "system",
+                "content": (
+                    "너는 보험 손해사정 장해평가 감수자다. 장해분류표에서 '완전히 잃음/완전강직'은 "
+                    "절단·인공관절·고정 수준의 중증에만 쓴다. 단순 파열·염좌·재건술 후 회복 가능한 "
+                    "손상을 최상위 등급에 넣는 건 과대분류다. JSON만 출력한다."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"[진단]\n{dx_name} (수술={surgery})\n\n[추출된 장해 항목]\n{listing}\n\n"
+                    "각 항목에 대해 선택등급이 손상 정도에 적정한지 판정하라. 과대면 같은 부위의 "
+                    "더 낮은 등급 지급률(예: 완전상실 30%→기능장해 10~20%)을 제시하라.\n"
+                    'JSON: {"reviews":[{"idx":번호,"appropriate":bool,"suggested_rate":숫자 또는 null,'
+                    '"reason":str}]}'
+                ),
+            },
+        ]
+    )
+    reviews = res.get("reviews") if isinstance(res, dict) else None
+    if not isinstance(reviews, list):
+        return {}  # 판정 실패 → 무변경(degrade)
+
+    by_idx = {int(r["idx"]): r for r in reviews if isinstance(r, dict) and "idx" in r}
+    disputed = False
+    for idx, item in enumerate(targets):
+        rv = by_idx.get(idx)
+        if not rv:
+            continue
+        appropriate = bool(rv.get("appropriate", True))
+        item["review"] = {"appropriate": appropriate, "reason": str(rv.get("reason") or "")}
+        if appropriate:
+            continue
+        disputed = True
+        sug = rv.get("suggested_rate")
+        try:
+            sug_f = float(sug)
+        except (TypeError, ValueError):
+            sug_f = None
+        if sug_f is not None and 0 <= sug_f < float(item.get("rate") or 0):
+            item["rate_original"] = item.get("rate")
+            item["rate"] = sug_f  # 하향 교정 — disability_calc가 이 값으로 합산
+            item["disputed"] = True
+
+    if not disputed:
+        return {"disability_analysis": {**da, "items": items}}
+
+    caveat = da.get("caveat", "")
+    new_da = {
+        **da,
+        "items": items,
+        "confidence": "low",  # 분류 분쟁 → 신뢰도 강등
+        "caveat": f"{caveat} · 분류 과대평가 소지로 하향 교정됨(자동검증, 손해사정사 확인 필요)",
+    }
+    return {
+        "disability_analysis": new_da,
+        "errors": _err(state, "disability_classification_disputed"),
+    }
+
+
 # ── 장해지급률 결정론 합산 (LLM 없음) ──────────────────────────
 @safe_node
 async def disability_calc(state: ReportState) -> dict[str, Any]:
@@ -468,18 +640,112 @@ async def disability_calc(state: ReportState) -> dict[str, Any]:
     }
 
 
-# ── 보험금 계산 (추정 범위, 단정 금지) ─────────────────────────
+# ── 보험금 계산 (특약별 항목 합산, 단정 금지) ──────────────────
+# 정액/변동 특약 유형을 이름 키워드로 추론(가입금액은 coverage_details.amount).
+_PER_DIEM_KW = ("입원일당", "입원비")
+_DISABILITY_KW = ("후유장해",)
+_SURGERY_KW = ("수술비", "수술특약")
+_FRACTURE_KW = ("골절",)
+# KCD 골절 코드 접두(신체부위별 S_2). 인대·염좌(S83 등)는 여기 안 들어와 골절진단비 제외됨.
+_FRACTURE_ICD = ("S02", "S12", "S22", "S32", "S42", "S52", "S62", "S72", "S82", "S92")
+
+
+def _is_fracture(dx_name: str, icd: str) -> bool:
+    if "골절" in dx_name:
+        return True
+    codes = icd.replace(" ", "").upper()
+    return any(c in codes for c in _FRACTURE_ICD)
+
+
 @safe_node
 async def payment_calc(state: ReportState) -> dict[str, Any]:
-    offered = state.get("case_info", {}).get("offered_amount") or 0
-    base = max(offered, 0)
-    # 가입금액 미보유 → 절대 보험금은 못 냄. 장해지급률이 있으면 상단 배수를 지급률에 비례해
-    # 확장(0%→×1.0, 100%→×1.8)하고, 없으면 기존 ±범위(×1.8)로 폴백. 모두 '추정'.
-    rate = float((state.get("disability_analysis") or {}).get("combined_rate") or 0.0)
-    factor_hi = 1.0 + min(rate, 100.0) / 100.0 * 0.8 if rate > 0 else 1.8
-    lo = int(base * 1.0)
-    hi = int(base * factor_hi) if base else 0
-    return {"estimated_range": {"min": lo, "max": hi}}
+    """특약별 지급액을 항목화해 합산한다(정액 특약 + 후유장해).
+
+    가입금액(coverage_details.amount)이 있으면 실제 곱셈으로 산출한다:
+      - 입원일당 = 일당 x 입원일수   - 수술비 = 정액(수술 시)
+      - 골절진단비 = 정액(골절 진단 시)  - 후유장해 = 담보금액 x 장해율
+    범위는 min=정액 특약(조건 명확)만, max=후유장해까지 포함(지급률 불확실)로 잡는다.
+    coverage_details 가 없으면(구 시드) 기존 배수 어림으로 폴백한다.
+    """
+    ci = state.get("case_info", {})
+    dx = state.get("diagnosis") or {}
+    entities = state.get("entities", {})
+    dx_name = dx.get("diagnosis") or ci.get("diagnosis") or ""
+    icd = " ".join(dx.get("icd_codes") or []) or str(entities.get("icd") or "")
+    days = int(entities.get("admission_days") or 0)
+    surgery = bool(dx.get("surgery") or entities.get("surgery"))
+    fracture = _is_fracture(dx_name, icd)
+    da = state.get("disability_analysis") or {}
+    rate = float(da.get("combined_rate") or 0.0)
+    # disability_verify가 과대분류를 하향 교정했으면 지급액 근거에 그 사실을 명시한다.
+    disputed = any(i.get("disputed") for i in da.get("items", []))
+
+    details = [
+        d for d in state.get("coverage_details", []) if isinstance(d, dict) and d.get("name")
+    ]
+    if not details:  # 가입금액 미보유 → 기존 배수 어림(하위호환)
+        offered = max(ci.get("offered_amount") or 0, 0)
+        factor_hi = 1.0 + min(rate, 100.0) / 100.0 * 0.8 if rate > 0 else 1.8
+        return {
+            "estimated_range": {"min": offered, "max": int(offered * factor_hi)},
+            "payment_breakdown": [],
+            "payment_excluded": [],
+        }
+
+    fixed_items: list[dict[str, Any]] = []  # 조건 명확한 정액(입원일당·수술비·골절)
+    variable_items: list[dict[str, Any]] = []  # 후유장해(지급률 불확실)
+    excluded: list[dict[str, Any]] = []
+
+    for d in details:
+        name = str(d["name"])
+        amt = float(d.get("amount") or 0)
+        if any(k in name for k in _DISABILITY_KW):
+            if rate > 0:
+                variable_items.append(
+                    {
+                        "name": name,
+                        "payout": int(amt * rate / 100.0),
+                        "basis": f"담보 {amt:,.0f}원 × 장해율 {rate}%"
+                        + ("(과대분류 하향 교정됨)" if disputed else ""),
+                    }
+                )
+            else:
+                excluded.append({"name": name, "reason": "후유장해 미검토/지급률 0"})
+        elif any(k in name for k in _PER_DIEM_KW):
+            if days > 0:
+                fixed_items.append(
+                    {
+                        "name": name,
+                        "payout": int(amt * days),
+                        "basis": f"{amt:,.0f}원/일 × 입원 {days}일",
+                    }
+                )
+            else:
+                excluded.append({"name": name, "reason": "입원일수 0"})
+        elif any(k in name for k in _SURGERY_KW):
+            if surgery:
+                fixed_items.append(
+                    {"name": name, "payout": int(amt), "basis": f"수술 정액 {amt:,.0f}원"}
+                )
+            else:
+                excluded.append({"name": name, "reason": "수술 없음"})
+        elif any(k in name for k in _FRACTURE_KW):
+            if fracture:
+                fixed_items.append(
+                    {"name": name, "payout": int(amt), "basis": f"골절진단 정액 {amt:,.0f}원"}
+                )
+            else:
+                excluded.append({"name": name, "reason": "골절 진단 아님(인대 손상)"})
+        else:
+            excluded.append({"name": name, "reason": "지급 조건 매칭 안 됨"})
+
+    fixed_sum = sum(i["payout"] for i in fixed_items)
+    var_sum = sum(i["payout"] for i in variable_items)
+    return {
+        "estimated_range": {"min": fixed_sum, "max": fixed_sum + var_sum},
+        "payment_breakdown": fixed_items + variable_items,
+        "payment_excluded": excluded,
+    }
 
 
 # ── 리포트 통합 (8섹션 + issues, 생성 가드레일) ────────────────
@@ -511,6 +777,8 @@ async def report_compose(state: ReportState) -> dict[str, Any]:
                     f"누락 가능: {state.get('missing_coverages')}\n"
                     f"분석: {ca.get('analysis')}\n"
                     f"추정범위: {state.get('estimated_range')}\n"
+                    f"특약별 산출: {state.get('payment_breakdown')}\n"
+                    f"지급제외: {state.get('payment_excluded')}\n"
                     f"장해지급률: {disability_line}\n"
                     f"인용: {ca.get('citations')}\n\n"
                     "위 내용으로 손해사정 리포트 본문을 작성하라(사건요약/적용특약/분쟁포인트/추가확인 필요)."
@@ -544,11 +812,22 @@ async def report_compose(state: ReportState) -> dict[str, Any]:
         "3_누락가능특약": ", ".join(state.get("missing_coverages", [])),
         "4_약관근거": ", ".join(ca.get("citations", [])),
         "4b_판례근거": "; ".join(
-            f"{c.get('article_number') or ''} {c.get('product_name') or ''}".strip()
+            f"{c.get('case_title') or c.get('case_no') or '판례'}"
+            f"{' (' + c['institution'] + ')' if c.get('institution') else ''}"
+            f"{' ' + c['decision_date'] if c.get('decision_date') else ''}".strip()
             for c in state.get("legal_references", [])[:5]
         )
         or "관련 판례 없음",
         "5_추정보상범위": str(state.get("estimated_range", {})),
+        "5c_보상항목내역": "; ".join(
+            f"{i['name']} {i['payout']:,}원 ({i['basis']})"
+            for i in state.get("payment_breakdown", [])
+        )
+        or "산출 항목 없음(가입금액 미보유)",
+        "5d_지급제외": "; ".join(
+            f"{e['name']}({e['reason']})" for e in state.get("payment_excluded", [])
+        )
+        or "없음",
         "5b_장해지급률": disability_line,
         "6_본문": body,
         "7_추가확인필요": "; ".join(state.get("errors", [])) or "없음",
