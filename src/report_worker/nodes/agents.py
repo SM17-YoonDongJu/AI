@@ -371,6 +371,8 @@ def route_after_case(state: ReportState) -> str:
 
 # 폴백 시 캐비앗·신뢰도 캡 상수(약관 미확보 → 표준표 추정임을 명시).
 _TERMS_CAVEAT = "가입금액 미보유로 절대 보험금 불가·약관표 위치정렬 한계 — 지급률은 추정"
+# 장해검토 대상인데 확정 장해 항목이 없을 때(급성 골절 등) — 0으로 침묵하지 않고 재평가를 안내.
+_PENDING_CAVEAT = "후유장해 미확정 — 치료·골유합 경과 후 재평가 시 추가 보상 가능"
 _STANDARD_CAVEAT = "표준 장해분류표 기준(가입 약관 미확보) — 개별 약관 확인 필요"
 _STANDARD_NO_DATE_CAVEAT = "가입일 미상 — 현행판 기준"
 
@@ -522,6 +524,14 @@ async def disability_rag(state: ReportState) -> dict[str, Any]:
 
     seen = {c.get("source_ref") for c in existing}
     merged = existing + [c for c in sched if c.get("source_ref") not in seen]
+
+    # 장해표는 찾았는데 확정 항목이 0개 = '아직 미확정'(급성 골절 등). 이 노드는 장해검토가
+    # 필요하다고 판정돼야 진입하므로(route_after_case), 조용히 0으로 두면 "경과 후 재평가하면
+    # 추가 보상 가능"이라는 정보가 사라진다 — 명시적 캐비앗·마커로 승격한다.
+    pending = not extracted["items"]
+    if pending:
+        caveat = f"{caveat} · {_PENDING_CAVEAT}"
+
     out: dict[str, Any] = {
         "disability_analysis": {
             "items": extracted["items"],
@@ -529,12 +539,18 @@ async def disability_rag(state: ReportState) -> dict[str, Any]:
             "citations": extracted["citations"],
             "confidence": confidence,
             "caveat": caveat,
+            "pending_reeval": pending,
         },
         "retrieved_clauses": merged,
     }
+    markers = []
     if is_fallback:
         # 운영 추적용 마커(표준표 폴백이 실제로 탔음을 남긴다).
-        out["errors"] = _err(state, "disability_fallback_standard_schedule")
+        markers.append("disability_fallback_standard_schedule")
+    if pending:
+        markers.append("disability_pending_reeval")
+    if markers:
+        out["errors"] = [*state.get("errors", []), *markers]
     return out
 
 
@@ -710,7 +726,14 @@ async def payment_calc(state: ReportState) -> dict[str, Any]:
                     }
                 )
             else:
-                excluded.append({"name": name, "reason": "후유장해 미검토/지급률 0"})
+                excluded.append(
+                    {
+                        "name": name,
+                        "reason": "후유장해 재평가 필요(미확정 — 경과 후 추가 보상 가능)"
+                        if da.get("pending_reeval")
+                        else "후유장해 미검토/지급률 0",
+                    }
+                )
         elif any(k in name for k in _PER_DIEM_KW):
             if days > 0:
                 fixed_items.append(
@@ -756,13 +779,17 @@ async def report_compose(state: ReportState) -> dict[str, Any]:
     dx = state.get("diagnosis") or {}
     dx_name = dx.get("diagnosis") or ci.get("diagnosis") or ""
     da = state.get("disability_analysis") or {}
-    disability_line = (
-        f"추정 합산 장해지급률 {da.get('combined_rate', 0)}% "
-        f"(신뢰도 {da.get('confidence', '-')}, 근거 {', '.join(da.get('citations', []))}) — "
-        f"규칙 {'; '.join(da.get('rule_notes', [])) or '-'}. ※ {da.get('caveat', '')}"
-        if da.get("items")
-        else "해당 없음(후유장해 미검토)"
-    )
+    if da.get("items"):
+        disability_line = (
+            f"추정 합산 장해지급률 {da.get('combined_rate', 0)}% "
+            f"(신뢰도 {da.get('confidence', '-')}, 근거 {', '.join(da.get('citations', []))}) — "
+            f"규칙 {'; '.join(da.get('rule_notes', [])) or '-'}. ※ {da.get('caveat', '')}"
+        )
+    elif da.get("pending_reeval"):
+        # 장해검토 대상이나 아직 확정 항목 없음 — '0원'이 아니라 재평가 안내로 전달한다.
+        disability_line = f"현재 확정 장해 없음 — 재평가 대상. ※ {da.get('caveat', '')}"
+    else:
+        disability_line = "해당 없음(후유장해 미검토)"
     body = await ai_client.chat(
         [
             {
