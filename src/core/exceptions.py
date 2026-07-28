@@ -12,3 +12,7 @@ class AppError(Exception):
 
 class OcrError(AppError):
     """OCR 처리 실패(S3 다운로드·문서 렌더·OCR 엔진 추론 등)."""
+
+
+class CorpusSyncError(AppError):
+    """약관 코퍼스 카탈로그 동기화 실패(Notion REST API 호출·응답 파싱·PG 미러 upsert)."""
