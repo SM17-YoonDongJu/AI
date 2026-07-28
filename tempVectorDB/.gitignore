@@ -1,0 +1,3 @@
+# 실행 로그·머신 종속 생성물 (커밋 제외)
+*.log
+meritz_latest_manifest.yaml

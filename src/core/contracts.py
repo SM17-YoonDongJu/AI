@@ -103,6 +103,10 @@ class Chunk(BaseModel):
     namespace: str
     score: float  # RRF 통합 점수
     source_ref: str  # 원문 위치 참조 (chunk_id)
+    # 소비자(리포트 노드)가 인용 포맷·schedule 선별에 쓰는 파생 메타(없으면 None).
+    article_number: str | None = None  # 조항/사례 번호 (terms=article_number, case=section)
+    product_name: str | None = None
+    chunk_type: str | None = None  # 예: schedule(장해분류표)·clause·termination
 
 
 class Citation(BaseModel):

@@ -15,5 +15,9 @@ ENV PYTHONUNBUFFERED=1 \
 COPY --from=builder /app/.venv /app/.venv
 COPY src ./src
 
-# 엔트리포인트(report_worker/__main__.py)는 구현 단계에서 추가.
+# report-worker 전용 컨슈머 그룹·서비스명 (settings 기본값 ocr-worker 오버라이드)
+ENV KAFKA_CONSUMER_GROUP=report-worker \
+    SERVICE_NAME=report-worker
+
+# 진입점: src/report_worker/__main__.py (report-job 컨슈머)
 CMD ["python", "-m", "report_worker"]

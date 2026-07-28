@@ -13,6 +13,7 @@ dependencies = [
     "ollama>=0.3",
     "structlog>=24.1",
     "httpx>=0.27",
+    "kiwipiepy>=0.23.2",
 ]
 
 [project.optional-dependencies]
@@ -70,6 +71,12 @@ select = ["E", "F", "I", "UP", "B", "ASYNC", "S", "SIM", "RUF"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101"]  # 테스트에서 assert 허용
+# 이관된 실험 리포트 그래프(P2). 프롬프트·주석 위주 장문(E501/RUF003), 자립 RAG의
+# 즉시-await 클로저(B023)·내부상수 SQL(S608)은 안전 — 정밀 정리는 후속 리라이트에서.
+"src/report_worker/nodes/agents.py" = ["E501", "RUF003", "SIM117"]
+"src/report_worker/state.py" = ["E501"]
+# 동적 검색 SQL: 테이블·컬럼은 내부 상수(_NS_TABLE/_NS_COLS), 사용자 값은 $N 파라미터 바인딩만.
+"src/rag/search.py" = ["S608"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
