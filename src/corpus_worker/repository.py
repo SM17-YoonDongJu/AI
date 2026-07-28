@@ -72,6 +72,25 @@ class PartRecord:
     notion_file_name: str | None = None
 
 
+@dataclass(slots=True)
+class ClaimedDoc:
+    """우선순위 큐에서 claim한(=in_progress로 전이된) 문서 1건(P2 드레인 단위)."""
+
+    notion_page_id: str
+    category: str
+    part_total: int
+
+
+@dataclass(slots=True)
+class PartRow:
+    """한 문서 파트의 업로드 진행 상태(멱등 재개 판정 입력)."""
+
+    id: str
+    part_order: int
+    sha256: str | None
+    status: str
+
+
 _UPSERT_SOURCE_SQL = """
 INSERT INTO corpus_source (
     notion_page_id, name, category, priority_tier, phase, access_method,
@@ -215,9 +234,7 @@ async def update_priority(pool: asyncpg.Pool, file_page_id: str, priority: float
     await pool.execute(_UPDATE_PRIORITY_SQL, _uuid(file_page_id), priority)
 
 
-async def sync_parts(
-    pool: asyncpg.Pool, file_page_id: str, parts: list[PartRecord]
-) -> None:
+async def sync_parts(pool: asyncpg.Pool, file_page_id: str, parts: list[PartRecord]) -> None:
     """한 약관 문서의 파트를 (file_page_id, part_order) 기준 멱등 동기화한다.
 
     이름·순서만 반영하고 sha256/s3_key/status(업로드 상태)는 건드리지 않는다. Notion에서
@@ -234,9 +251,7 @@ async def sync_parts(
     await pool.execute(_DELETE_EXTRA_PARTS_SQL, file_id, len(parts))
 
 
-async def archive_missing(
-    pool: asyncpg.Pool, data_source: str, seen_ids: set[str]
-) -> int:
+async def archive_missing(pool: asyncpg.Pool, data_source: str, seen_ids: set[str]) -> int:
     """이번 사이클에 안 보인 기존 행을 ``status='archived'``로 전이한다(하드 삭제 금지).
 
     부분(증분) 조회로는 삭제를 판별할 수 없으므로, 호출자는 전체 조회(full sync)에서만
@@ -275,6 +290,171 @@ async def get_file_cursor(pool: asyncpg.Pool) -> datetime | None:
     """
     row = await pool.fetchrow(_MAX_FILE_EDITED_SQL)
     return row["cursor"] if row else None
+
+
+# --------------------------------------------------------------------------- #
+# P2 우선순위 큐 — claim(SKIP LOCKED)·파트 진행·완료/실패 전이·좀비 회수
+# --------------------------------------------------------------------------- #
+
+# 002의 (status, priority DESC) 인덱스와 정합. FOR UPDATE SKIP LOCKED로 여러 워커가
+# 같은 문서를 중복 claim하지 않게 하고(경합 없이 다음 행으로 건너뜀), 같은 tx에서
+# in_progress로 전이해 claim을 확정한다.
+_CLAIM_SELECT_SQL = """
+SELECT notion_page_id, category, part_total
+FROM corpus_file
+WHERE status = 'pending'
+ORDER BY priority DESC, effective_date DESC NULLS LAST
+FOR UPDATE SKIP LOCKED
+LIMIT 1
+"""
+
+_CLAIM_UPDATE_SQL = """
+UPDATE corpus_file SET status = 'in_progress', updated_at = now()
+WHERE notion_page_id = $1
+"""
+
+_LIST_PARTS_SQL = """
+SELECT id, part_order, sha256, status
+FROM corpus_file_part
+WHERE file_page_id = $1
+ORDER BY part_order
+"""
+
+_MARK_PART_UPLOADED_SQL = """
+UPDATE corpus_file_part
+SET status = 'uploaded', sha256 = $2, s3_key = $3, byte_size = $4
+WHERE id = $1
+"""
+
+_MARK_DOC_DONE_SQL = """
+UPDATE corpus_file
+SET status = 'done', part_done = part_total, updated_at = now()
+WHERE notion_page_id = $1
+"""
+
+# attempts 증가 후 상한 도달이면 'failed'(영구 격리), 아니면 'pending'으로 되돌려 재시도.
+_MARK_DOC_FAILED_SQL = """
+UPDATE corpus_file
+SET attempts = attempts + 1,
+    fail_reason = $2,
+    status = CASE WHEN attempts + 1 >= $3 THEN 'failed' ELSE 'pending' END,
+    updated_at = now()
+WHERE notion_page_id = $1
+"""
+
+# updated_at 기준 좀비(진행 중 멈춘) 문서 회수 — 스키마 변경 없이 TTL로 pending 복귀.
+_RECLAIM_STALE_SQL = """
+UPDATE corpus_file
+SET status = 'pending', updated_at = now()
+WHERE status = 'in_progress'
+  AND updated_at < now() - make_interval(secs => $1)
+"""
+
+
+async def claim_next_document(pool: asyncpg.Pool) -> ClaimedDoc | None:
+    """우선순위 최상위 pending 문서 1건을 원자적으로 claim한다(없으면 None).
+
+    한 트랜잭션에서 ``FOR UPDATE SKIP LOCKED``로 행을 잠그고 ``in_progress``로 전이해,
+    다수 워커·다수 드레인 태스크가 같은 문서를 중복 처리하지 않게 한다.
+
+    Args:
+        pool: asyncpg 연결 풀(core.db).
+
+    Returns:
+        claim한 문서(``ClaimedDoc``) 또는 대기열이 비었으면 ``None``.
+    """
+    async with pool.acquire() as conn, conn.transaction():
+        row = await conn.fetchrow(_CLAIM_SELECT_SQL)
+        if row is None:
+            return None
+        await conn.execute(_CLAIM_UPDATE_SQL, row["notion_page_id"])
+        return ClaimedDoc(
+            notion_page_id=str(row["notion_page_id"]),
+            category=row["category"],
+            part_total=row["part_total"],
+        )
+
+
+async def list_parts(pool: asyncpg.Pool, file_page_id: str) -> list[PartRow]:
+    """한 문서의 파트를 part_order 순서로 조회한다(멱등 재개 판정용).
+
+    Args:
+        pool: asyncpg 연결 풀(core.db).
+        file_page_id: 대상 약관 문서 Notion page id.
+
+    Returns:
+        part_order 오름차순 파트 목록.
+    """
+    rows = await pool.fetch(_LIST_PARTS_SQL, _uuid(file_page_id))
+    return [
+        PartRow(
+            id=str(row["id"]),
+            part_order=row["part_order"],
+            sha256=row["sha256"],
+            status=row["status"],
+        )
+        for row in rows
+    ]
+
+
+async def mark_part_uploaded(
+    pool: asyncpg.Pool, part_id: str, sha256: str, s3_key: str, byte_size: int
+) -> None:
+    """파트를 ``uploaded``로 전이하고 내용해시·S3 키·크기를 기록한다.
+
+    Args:
+        pool: asyncpg 연결 풀(core.db).
+        part_id: 대상 ``corpus_file_part.id``.
+        sha256: 업로드한 내용 해시(hex).
+        s3_key: 저장된 S3 키.
+        byte_size: 바이트 크기.
+    """
+    await pool.execute(_MARK_PART_UPLOADED_SQL, _uuid(part_id), sha256, s3_key, byte_size)
+
+
+async def mark_document_done(pool: asyncpg.Pool, page_id: str) -> None:
+    """모든 파트 업로드 완료 문서를 ``done``으로 전이한다(part_done=part_total).
+
+    Args:
+        pool: asyncpg 연결 풀(core.db).
+        page_id: 대상 약관 문서 Notion page id.
+    """
+    await pool.execute(_MARK_DOC_DONE_SQL, _uuid(page_id))
+
+
+async def mark_document_failed(
+    pool: asyncpg.Pool, page_id: str, reason: str, max_attempts: int
+) -> None:
+    """문서 처리 실패를 반영한다(attempts++; 상한 도달 시 failed, 아니면 pending 재시도).
+
+    ``reason``에는 PII를 담지 않는다 — 예외 종류·비식별 컨텍스트만 기록한다(§9·§13).
+
+    Args:
+        pool: asyncpg 연결 풀(core.db).
+        page_id: 대상 약관 문서 Notion page id.
+        reason: 실패 사유(비-PII 요약).
+        max_attempts: 재시도 상한(도달 시 영구 failed).
+    """
+    await pool.execute(_MARK_DOC_FAILED_SQL, _uuid(page_id), reason, max_attempts)
+
+
+async def reclaim_stale(pool: asyncpg.Pool, ttl_seconds: int) -> int:
+    """TTL을 넘겨 ``in_progress``에 멈춘 좀비 문서를 ``pending``으로 되돌린다.
+
+    워커 crash로 claim만 되고 진행이 멈춘 문서를 다시 큐에 넣는다(멱등 재개는 파트
+    상태가 보장). ``updated_at`` 기준이라 스키마 변경이 필요 없다.
+
+    Args:
+        pool: asyncpg 연결 풀(core.db).
+        ttl_seconds: 이 시간(초)보다 오래 갱신되지 않은 in_progress를 회수.
+
+    Returns:
+        회수한(=pending으로 되돌린) 문서 수.
+    """
+    result = await pool.execute(_RECLAIM_STALE_SQL, float(ttl_seconds))
+    reclaimed = _row_count(result)
+    logger.info("corpus_reclaim_stale", reclaimed=reclaimed)
+    return reclaimed
 
 
 def _uuid(value: str) -> uuid.UUID:

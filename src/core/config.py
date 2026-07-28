@@ -70,7 +70,11 @@ class Settings(BaseSettings):
     s3_corpus_sse: str = "AES256"  # SSE-S3(공개 약관·비-PII)
     corpus_poll_interval_seconds: float = 5.0  # 우선순위 큐 폴링 간격
     corpus_max_concurrent_uploads: int = 4  # 동시 업로드 수
-    corpus_download_tmp_dir: str = "/tmp"  # 대용량 스트리밍 임시(처리 후 즉시 삭제)
+    # 대용량 스트리밍 임시(처리 후 즉시 삭제). env로 재정의 가능한 기본값이라 S108 무시.
+    corpus_download_tmp_dir: str = "/tmp"  # noqa: S108
+    corpus_max_attempts: int = 5  # 문서 처리 재시도 상한(초과 시 status='failed')
+    corpus_stale_reclaim_seconds: int = 900  # in_progress 좀비 회수 TTL(초)
+    corpus_full_reconcile_every_cycles: int = 24  # N 사이클마다 full 동기화(삭제 반영)
 
     # --- 수요도 우선순위 (가중치·상수만 env; 상품종류 룩업표는 priority 모듈) ---
     corpus_w_demand: float = 0.6  # 수요도(상품종류) 가중

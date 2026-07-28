@@ -290,12 +290,12 @@ async def _sync_files(
             await upsert_file(pool, record)
             await sync_parts(pool, record.notion_page_id, parts)
             await update_priority(
-                pool, record.notion_page_id, priority.compute(linked_source, record)
+                pool,
+                record.notion_page_id,
+                priority.compute(linked_source, record, settings=settings),
             )
         except (asyncpg.PostgresError, CorpusSyncError) as exc:
-            logger.warning(
-                "corpus_file_sync_failed", page_id=record.notion_page_id, error=str(exc)
-            )
+            logger.warning("corpus_file_sync_failed", page_id=record.notion_page_id, error=str(exc))
             continue
         seen.add(record.notion_page_id)
     return seen, skipped

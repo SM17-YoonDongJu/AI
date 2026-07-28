@@ -12,7 +12,7 @@ import pytest
 
 from core.config import Settings
 from core.exceptions import CorpusSyncError
-from corpus_worker import sync
+from corpus_worker import priority, sync
 from corpus_worker.repository import (
     FileRecord,
     PartRecord,
@@ -288,12 +288,17 @@ async def test_run_sync_cycle_writes_tier_priority() -> None:
     # Act
     await sync.run_sync_cycle(pool, source, _settings())  # type: ignore[arg-type]
 
-    # Assert: P1 출처의 파일 priority = 2000
-    priority_updates = [
-        args for sql, args in pool.executed if "SET priority" in sql
-    ]
+    # Assert: terms 카테고리 base + P1 tier + 기본 수요/긴급도 합성 점수
+    settings = _settings()
+    expected = (
+        priority.CATEGORY_BASE["terms"]
+        + priority.TIER_BASE_SCORES["P1"]
+        + settings.corpus_w_demand * priority.DEFAULT_DEMAND
+        + settings.corpus_w_urgency * priority.DEFAULT_URGENCY
+    )
+    priority_updates = [args for sql, args in pool.executed if "SET priority" in sql]
     assert priority_updates
-    assert priority_updates[0][1] == 2000.0
+    assert priority_updates[0][1] == expected
 
 
 async def test_run_sync_cycle_incremental_skips_archive() -> None:

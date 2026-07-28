@@ -69,7 +69,8 @@ src = ["src", "tests"]
 select = ["E", "F", "I", "UP", "B", "ASYNC", "S", "SIM", "RUF"]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["S101"]  # 테스트에서 assert 허용
+# 테스트: assert(S101)·가짜 시크릿(S106)·임시파일 접근(ASYNC230/240) 허용
+"tests/**" = ["S101", "S106", "ASYNC230", "ASYNC240"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

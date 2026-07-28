@@ -43,6 +43,8 @@ _MIN_RATE_PER_SECOND = 0.1
 # 재시도 대상 서버 오류 하한.
 _SERVER_ERROR_MIN = 500
 _TOO_MANY_REQUESTS = 429
+# 약관 파일 첨부 property 이름(files 타입). 파트별 신선 URL 재조회 대상.
+_FILE_PROPERTY_NAME = "파일"
 
 
 class _AsyncHttpClient(Protocol):
@@ -51,6 +53,8 @@ class _AsyncHttpClient(Protocol):
     async def post(
         self, url: str, *, json: dict[str, Any], headers: dict[str, str]
     ) -> httpx.Response: ...
+
+    async def get(self, url: str, *, headers: dict[str, str]) -> httpx.Response: ...
 
     async def aclose(self) -> None: ...
 
@@ -159,6 +163,20 @@ def parse_props(page: dict[str, Any]) -> dict[str, Any]:
     return parsed
 
 
+def _attachment_url(attachment: dict[str, Any]) -> str | None:
+    """files property 한 첨부에서 다운로드 URL을 뽑는다(Notion-hosted/external 모두).
+
+    Notion-hosted(``type=file``)의 ``file.url``은 만료되므로 업로드 직전에만 조회한다.
+    external은 만료되지 않는 원본 URL(``external.url``)이다.
+    """
+    file_type = attachment.get("type")
+    if file_type == "file":
+        return (attachment.get("file") or {}).get("url")
+    if file_type == "external":
+        return (attachment.get("external") or {}).get("url")
+    return None
+
+
 class NotionSource:
     """공식 Notion REST 클라이언트(async·레이트리밋·재시도).
 
@@ -223,12 +241,61 @@ class NotionSource:
             if cursor is None:
                 return
 
+    async def file_urls(self, page_id: str) -> list[str]:
+        """한 페이지의 ``파일`` 첨부 URL을 part_order(배열 순서)대로 조회한다.
+
+        Notion-hosted 첨부 URL은 만료되므로 **업로드 직전에** 페이지를 재조회해 신선한
+        URL을 받는다. 반환 순서는 files 배열 순서(= ``corpus_file_part.part_order``)와
+        일치하므로 호출자는 ``file_urls(...)[part_order]``로 매핑할 수 있다.
+
+        Args:
+            page_id: 약관 문서 Notion page id.
+
+        Returns:
+            첨부 파트별 다운로드 URL 목록(순서 보존).
+
+        Raises:
+            CorpusSyncError: 재시도 소진, 재시도 불가 4xx, 또는 URL 없는 첨부 존재.
+        """
+        payload = await self._get(f"/v1/pages/{page_id}")
+        prop = (payload.get("properties") or {}).get(_FILE_PROPERTY_NAME) or {}
+        attachments = prop.get("files") or []
+        urls: list[str] = []
+        for index, attachment in enumerate(attachments):
+            url = _attachment_url(attachment)
+            if not url:
+                raise CorpusSyncError(f"첨부 URL 없음: page={page_id} order={index}")
+            urls.append(url)
+        return urls
+
     async def _query(self, data_source_id: str, body: dict[str, Any]) -> dict[str, Any]:
-        """단일 query 요청(레이트리밋 + 429/5xx 지수 백오프 재시도)."""
+        """단일 database query 요청(레이트리밋 + 429/5xx 지수 백오프 재시도)."""
         path = f"/v1/databases/{data_source_id}/query"
+        return await self._send_with_retry(
+            lambda: self._client.post(path, json=body, headers=self._headers), path=path
+        )
+
+    async def _get(self, path: str) -> dict[str, Any]:
+        """단일 GET 요청(레이트리밋 + 429/5xx 지수 백오프 재시도)."""
+        return await self._send_with_retry(
+            lambda: self._client.get(path, headers=self._headers), path=path
+        )
+
+    async def _send_with_retry(
+        self, send: Callable[[], Awaitable[httpx.Response]], *, path: str
+    ) -> dict[str, Any]:
+        """요청 콜러블을 레이트리밋·재시도로 감싸 JSON 본문을 돌려준다.
+
+        Args:
+            send: 매 시도마다 호출할 HTTP 요청 콜러블(POST/GET).
+            path: 로깅·에러 컨텍스트용 요청 경로.
+
+        Raises:
+            CorpusSyncError: 재시도 소진 또는 재시도 불가한 4xx 응답.
+        """
         for attempt in range(self._max_retries + 1):
             await self._bucket.acquire()
-            response = await self._client.post(path, json=body, headers=self._headers)
+            response = await send()
             status = response.status_code
             if status < 400:
                 return response.json()
@@ -237,7 +304,11 @@ class NotionSource:
                     raise CorpusSyncError(f"Notion API 재시도 소진: status={status}")
                 delay = self._retry_delay(response, attempt)
                 logger.warning(
-                    "notion_query_retry", status=status, attempt=attempt, delay_seconds=delay
+                    "notion_request_retry",
+                    status=status,
+                    attempt=attempt,
+                    delay_seconds=delay,
+                    path=path,
                 )
                 await self._sleep(delay)
                 continue

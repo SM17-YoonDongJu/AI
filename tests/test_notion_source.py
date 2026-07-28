@@ -10,8 +10,8 @@ from typing import Any
 import httpx
 import pytest
 
-from corpus_worker.notion_source import NotionSource, parse_props
 from core.exceptions import CorpusSyncError
+from corpus_worker.notion_source import NotionSource, parse_props
 
 
 def _page() -> dict[str, Any]:
@@ -54,11 +54,16 @@ class FakeClient:
     def __init__(self, responses: list[httpx.Response]) -> None:
         self._responses = list(responses)
         self.calls: list[tuple[str, dict[str, Any], dict[str, str]]] = []
+        self.get_calls: list[tuple[str, dict[str, str]]] = []
 
     async def post(
         self, url: str, *, json: dict[str, Any], headers: dict[str, str]
     ) -> httpx.Response:
         self.calls.append((url, json, headers))
+        return self._responses.pop(0)
+
+    async def get(self, url: str, *, headers: dict[str, str]) -> httpx.Response:
+        self.get_calls.append((url, headers))
         return self._responses.pop(0)
 
     async def aclose(self) -> None:
@@ -134,9 +139,7 @@ async def test_iter_rows_paginates_until_has_more_false() -> None:
         200, json={"results": [{"id": "b"}], "has_more": False, "next_cursor": None}
     )
     client = FakeClient([resp1, resp2])
-    source = NotionSource(
-        client, token="tok", api_version="2022-06-28", rate_limit_rps=1000.0
-    )
+    source = NotionSource(client, token="tok", api_version="2022-06-28", rate_limit_rps=1000.0)
 
     # Act
     rows = [row async for row in source.iter_rows("ds-1")]
@@ -207,3 +210,70 @@ async def test_query_raises_after_retry_exhaustion() -> None:
     # Act / Assert
     with pytest.raises(CorpusSyncError):
         _ = [row async for row in source.iter_rows("ds-1")]
+
+
+# --------------------------------------------------------------------------- #
+# file_urls (업로드 직전 신선 URL 재조회)
+# --------------------------------------------------------------------------- #
+
+
+def _page_with_files(files: list[dict[str, Any]]) -> dict[str, Any]:
+    return {"id": "page-1", "properties": {"파일": {"type": "files", "files": files}}}
+
+
+async def test_file_urls_returns_urls_in_part_order() -> None:
+    # Arrange: file(Notion-hosted 만료 URL)·external 혼재, 배열 순서 = part_order
+    files = [
+        {"name": "part0.pdf", "type": "file", "file": {"url": "https://s3/0?token=a"}},
+        {"name": "part1.pdf", "type": "external", "external": {"url": "https://ext/1"}},
+    ]
+    client = FakeClient([httpx.Response(200, json=_page_with_files(files))])
+    source = NotionSource(client, token="t", api_version="v", rate_limit_rps=1000.0)
+
+    # Act
+    urls = await source.file_urls("page-1")
+
+    # Assert: order 순서대로 신선 URL 반환 + GET 페이지 경로
+    assert urls == ["https://s3/0?token=a", "https://ext/1"]
+    assert client.get_calls[0][0] == "/v1/pages/page-1"
+    assert client.get_calls[0][1]["Authorization"] == "Bearer t"
+
+
+async def test_file_urls_empty_when_no_attachments() -> None:
+    # Arrange
+    client = FakeClient([httpx.Response(200, json=_page_with_files([]))])
+    source = NotionSource(client, token="t", api_version="v", rate_limit_rps=1000.0)
+
+    # Act / Assert
+    assert await source.file_urls("page-1") == []
+
+
+async def test_file_urls_raises_when_attachment_url_missing() -> None:
+    # Arrange: url 없는 첨부 → part_order 정합을 깨지 않게 실패로 처리
+    files = [{"name": "x.pdf", "type": "file", "file": {}}]
+    client = FakeClient([httpx.Response(200, json=_page_with_files(files))])
+    source = NotionSource(client, token="t", api_version="v", rate_limit_rps=1000.0)
+
+    # Act / Assert
+    with pytest.raises(CorpusSyncError):
+        await source.file_urls("page-1")
+
+
+async def test_file_urls_retries_on_429_then_succeeds() -> None:
+    # Arrange: GET도 429 재시도 경로(_send_with_retry)를 공유한다
+    files = [{"name": "p.pdf", "type": "external", "external": {"url": "https://ext/p"}}]
+    responses = [
+        httpx.Response(429, json={}, headers={"Retry-After": "0"}),
+        httpx.Response(200, json=_page_with_files(files)),
+    ]
+    client = FakeClient(responses)
+    source = NotionSource(
+        client, token="t", api_version="v", rate_limit_rps=1000.0, sleep=_noop_sleep
+    )
+
+    # Act
+    urls = await source.file_urls("page-1")
+
+    # Assert
+    assert urls == ["https://ext/p"]
+    assert len(client.get_calls) == 2
