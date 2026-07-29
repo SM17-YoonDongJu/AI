@@ -253,7 +253,7 @@ async def _sync_catalog(
 ) -> dict[str, SourceRecord]:
     """카탈로그를 전체 조회해 허용 카테고리 출처만 업서트하고 맵으로 돌려준다."""
     source_map: dict[str, SourceRecord] = {}
-    async for page in source.iter_rows(settings.notion_catalog_data_source_id):
+    async for page in source.iter_rows(settings.notion_catalog_database_id):
         record = map_source(parse_props(page))
         if not category_allowed(record.category, allowed):
             continue
@@ -278,7 +278,7 @@ async def _sync_files(
     """약관 파일을 증분 조회해 첨부 있는 행만 업서트·파트·priority 반영한다."""
     seen: set[str] = set()
     skipped = 0
-    async for page in source.iter_rows(settings.notion_corpus_data_source_id, since=since):
+    async for page in source.iter_rows(settings.notion_corpus_database_id, since=since):
         parsed = parse_props(page)
         if not has_attachment(parsed):
             skipped += 1

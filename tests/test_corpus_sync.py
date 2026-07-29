@@ -62,8 +62,8 @@ class FakeSource:
 def _settings() -> Settings:
     return Settings(
         corpus_categories="terms",
-        notion_catalog_data_source_id="catalog-ds",
-        notion_corpus_data_source_id="corpus-ds",
+        notion_catalog_database_id="catalog-ds",
+        notion_corpus_database_id="corpus-ds",
         notion_token="test-token",
     )
 

@@ -56,10 +56,11 @@ class Settings(BaseSettings):
 
     # --- Notion (약관 코퍼스 소스 — jjg 인테그레이션, 공식 REST API) ---
     notion_token: str = ""  # 시크릿(ntn_...). SSM/.env 주입, 코드·커밋 금지
-    # 데이터 출처 카탈로그(컨트롤 테이블: 카테고리·우선순위 P0~P3·수집단계)
-    notion_catalog_data_source_id: str = "6b817446-047a-4924-abd6-4f334bbbeaa2"
-    # terms(약관) 파일 DB — 카탈로그 `출처` relation의 대상
-    notion_corpus_data_source_id: str = "45785f96-fd07-460c-8f90-e8dd17cb2f00"
+    # 데이터 출처 카탈로그(컨트롤 테이블). /v1/databases/{id}/query용 **database id**
+    # (collection/data source id 아님 — 그건 relation·view 참조용).
+    notion_catalog_database_id: str = "e6fa0ba5efb946c6934c195774e9b6e7"
+    # terms(약관) 파일 DB(카탈로그 `출처` relation 대상)의 database id.
+    notion_corpus_database_id: str = "e2bde980f10741d8bcf35f2d60709171"
     notion_api_version: str = "2022-06-28"  # Notion-Version 헤더 고정
     notion_sync_interval_seconds: int = 3600  # 카탈로그→PG 주기 동기화 간격
     notion_rate_limit_rps: float = 3.0  # Notion API 평균 레이트리밋 상한
