@@ -303,6 +303,7 @@ _CLAIM_SELECT_SQL = """
 SELECT notion_page_id, category, part_total
 FROM corpus_file
 WHERE status = 'pending'
+  AND (next_retry_at IS NULL OR next_retry_at <= now())
 ORDER BY priority DESC, effective_date DESC NULLS LAST
 FOR UPDATE SKIP LOCKED
 LIMIT 1
@@ -333,11 +334,17 @@ WHERE notion_page_id = $1
 """
 
 # attempts 증가 후 상한 도달이면 'failed'(영구 격리), 아니면 'pending'으로 되돌려 재시도.
+# 재시도는 지수 백오프(30s·2^attempts, 최대 1h)를 next_retry_at에 실어 즉시 재큐(retry
+# storm)를 막는다 — claim SELECT가 next_retry_at 이후에만 다시 집는다.
 _MARK_DOC_FAILED_SQL = """
 UPDATE corpus_file
 SET attempts = attempts + 1,
     fail_reason = $2,
     status = CASE WHEN attempts + 1 >= $3 THEN 'failed' ELSE 'pending' END,
+    next_retry_at = CASE
+        WHEN attempts + 1 >= $3 THEN NULL
+        ELSE now() + make_interval(secs => LEAST(3600, 30 * power(2, attempts)))
+    END,
     updated_at = now()
 WHERE notion_page_id = $1
 """
@@ -345,7 +352,7 @@ WHERE notion_page_id = $1
 # updated_at 기준 좀비(진행 중 멈춘) 문서 회수 — 스키마 변경 없이 TTL로 pending 복귀.
 _RECLAIM_STALE_SQL = """
 UPDATE corpus_file
-SET status = 'pending', updated_at = now()
+SET status = 'pending', next_retry_at = NULL, updated_at = now()
 WHERE status = 'in_progress'
   AND updated_at < now() - make_interval(secs => $1)
 """

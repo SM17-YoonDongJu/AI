@@ -111,6 +111,8 @@ async def test_claim_next_document_selects_priority_and_transitions() -> None:
     assert "status = 'pending'" in pool.conn.fetchrow_sql
     assert "ORDER BY priority DESC" in pool.conn.fetchrow_sql
     assert "FOR UPDATE SKIP LOCKED" in pool.conn.fetchrow_sql
+    # 백오프 대기 중(next_retry_at 미래)인 문서는 claim 대상에서 제외(retry storm 방지)
+    assert "next_retry_at IS NULL OR next_retry_at <= now()" in pool.conn.fetchrow_sql
     # 같은 tx에서 in_progress로 claim 확정
     assert any("status = 'in_progress'" in sql for sql, _ in pool.conn.executed)
 
@@ -193,6 +195,9 @@ async def test_mark_document_failed_encodes_retry_branch() -> None:
     sql, args = pool.executed[0]
     assert "attempts = attempts + 1" in sql
     assert "CASE WHEN attempts + 1 >= $3 THEN 'failed' ELSE 'pending' END" in sql
+    # 재시도는 지수 백오프(30s·2^attempts, 최대 1h)를 next_retry_at에 실어 즉시 재큐 방지
+    assert "next_retry_at = CASE" in sql
+    assert "make_interval(secs => LEAST(3600, 30 * power(2, attempts)))" in sql
     assert args == (uuid.UUID(PAGE), "HTTPError", 5)
 
 
@@ -208,4 +213,5 @@ async def test_reclaim_stale_returns_affected_count() -> None:
     sql, args = pool.executed[0]
     assert "status = 'in_progress'" in sql
     assert "make_interval(secs => $1)" in sql
+    assert "next_retry_at = NULL" in sql  # reclaim 시 백오프 해제 → 즉시 재claim 가능
     assert args == (900.0,)  # 초는 double로 넘긴다

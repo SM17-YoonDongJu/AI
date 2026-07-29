@@ -330,3 +330,6 @@ async def test_run_sync_cycle_full_reconcile_archives() -> None:
     # 미노출 행 아카이브가 실행된다(UPDATE 2 → 2건)
     assert stats.archived == 2
     assert any("status = 'archived'" in sql for sql, _ in pool.executed)
+    # 첨부 없는 행도 observed에 포함 → archive 기준에 들어가 삭제 오판 안 됨(#4 회귀)
+    archive_args = next(a for s, a in pool.executed if "status = 'archived'" in s)
+    assert uuid.UUID(FILE_NO_ATTACHMENT) in archive_args[0]

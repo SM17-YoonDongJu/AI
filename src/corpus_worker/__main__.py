@@ -31,6 +31,7 @@ from corpus_worker.repository import (
     ClaimedDoc,
     claim_next_document,
     list_parts,
+    mark_document_failed,
     reclaim_stale,
 )
 from corpus_worker.s3 import CorpusS3
@@ -144,6 +145,18 @@ async def _process_and_release(
         await process_document(deps, doc, parts)
     except Exception:  # 최상위 격리: 개별 문서 실패로 드레인이 멈추지 않게(§8)
         logger.exception("corpus_process_doc_error")
+        # claim 뒤 list_parts 등에서 실패하면 문서가 in_progress에 갇힌다 — 재시도 상태로
+        # 되돌려 startup reclaim(TTL)까지 기다리지 않게 한다(process_document 자체 실패는
+        # 이미 mark 처리되므로, 여기 도달하는 건 그 밖의 경로다).
+        try:
+            await mark_document_failed(
+                deps.pool,
+                doc.notion_page_id,
+                "process_error",
+                deps.settings.corpus_max_attempts,
+            )
+        except Exception:
+            logger.exception("corpus_mark_failed_error")
     finally:
         semaphore.release()
 

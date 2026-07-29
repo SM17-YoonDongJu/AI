@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS corpus_file (
     part_done           smallint    NOT NULL DEFAULT 0,         -- 완료 파트 수(업로드 진행, P2)
     fail_reason         text,                                   -- 실패 사유(P2)
     attempts            smallint    NOT NULL DEFAULT 0,         -- 처리 시도 횟수(P2)
+    next_retry_at       timestamptz,                            -- 재시도 예정 시각(지수 백오프). claim은 이후만 집음
     notion_last_edited  timestamptz,                            -- Notion last_edited_time(증분 커서)
     synced_at           timestamptz NOT NULL DEFAULT now(),     -- 마지막 미러 시각
     updated_at          timestamptz NOT NULL DEFAULT now(),     -- 마지막 변경 시각
@@ -88,6 +89,8 @@ CREATE INDEX IF NOT EXISTS corpus_file_status_priority_idx
 CREATE INDEX IF NOT EXISTS corpus_file_product_name_trgm_idx
     ON corpus_file USING gin (product_name gin_trgm_ops);
 
--- 동일 내용 파트 중복 업로드 방지. sha256이 채워진 파트에 한해 전역 유일(부분 유니크).
-CREATE UNIQUE INDEX IF NOT EXISTS corpus_file_part_sha256_key
+-- 내용주소 조회·수요 매칭용(전역 유니크 아님). 여러 문서가 동일 첨부(공통 특약·별표)를
+-- 공유할 수 있으므로 sha256을 유일하게 강제하지 않는다 — 실제 중복 업로드 방지는 S3
+-- HeadObject(내용주소 키 corpus/{category}/{sha256}.pdf)가 담당한다.
+CREATE INDEX IF NOT EXISTS corpus_file_part_sha256_idx
     ON corpus_file_part (sha256) WHERE sha256 IS NOT NULL;

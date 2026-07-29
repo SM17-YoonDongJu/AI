@@ -228,12 +228,15 @@ async def run_sync_cycle(
     source_map = await _sync_catalog(pool, source, settings, allowed)
     # 전수 재조정은 커서를 무시해야 전 행을 관측해 삭제를 판별할 수 있다.
     cursor = None if full else await get_file_cursor(pool)
-    seen_files, skipped = await _sync_files(pool, source, settings, source_map, cursor)
+    seen_files, observed_files, skipped = await _sync_files(
+        pool, source, settings, source_map, cursor
+    )
 
     # 삭제 반영은 전수(full) 관측에서만 안전하다 — 증분은 미관측이 삭제인지 알 수 없어 생략.
+    # 첨부가 순간 빈 행도 observed에 있어, 그 순간만으로 삭제 오판돼 archived 되지 않는다.
     archived = 0
-    if full and seen_files:
-        archived = await archive_missing(pool, _ARCHIVE_TABLE, seen_files)
+    if full and observed_files:
+        archived = await archive_missing(pool, _ARCHIVE_TABLE, observed_files)
 
     stats = SyncStats(
         sources_synced=len(source_map),
@@ -274,12 +277,21 @@ async def _sync_files(
     settings: Settings,
     source_map: dict[str, SourceRecord],
     since: datetime | None,
-) -> tuple[set[str], int]:
-    """약관 파일을 증분 조회해 첨부 있는 행만 업서트·파트·priority 반영한다."""
+) -> tuple[set[str], set[str], int]:
+    """약관 파일을 조회해 첨부 있는 행만 업서트·파트·priority 반영한다.
+
+    반환의 ``observed``는 이번 조회에서 관측한 **모든** 문서(첨부 없어 skip한 것 포함)다.
+    archive는 이 observed 기준이라, 순간적으로 ``파일`` 첨부가 빈 행(편집 중 일시 제거)이
+    삭제로 오판돼 ``archived`` 되지 않는다.
+    """
     seen: set[str] = set()
+    observed: set[str] = set()
     skipped = 0
     async for page in source.iter_rows(settings.notion_corpus_database_id, since=since):
         parsed = parse_props(page)
+        page_id = parsed.get("id")
+        if page_id:
+            observed.add(page_id)  # Notion에 존재 = 관측됨(첨부 유무 무관, archive 기준)
         if not has_attachment(parsed):
             skipped += 1
             continue
@@ -298,4 +310,4 @@ async def _sync_files(
             logger.warning("corpus_file_sync_failed", page_id=record.notion_page_id, error=str(exc))
             continue
         seen.add(record.notion_page_id)
-    return seen, skipped
+    return seen, observed, skipped
