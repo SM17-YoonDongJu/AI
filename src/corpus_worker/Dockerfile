@@ -22,6 +22,9 @@ COPY pyproject.toml uv.lock* ./
 RUN uv sync --no-dev --extra corpus
 
 COPY src ./src
+# __main__이 기동 시 run_migrations("migrations")로 자가 마이그레이션한다 → 이미지에 필수.
+# (누락 시 files=[]로 아무 것도 적용 안 돼 corpus_file 부재 → UndefinedTableError 크래시 루프)
+COPY migrations ./migrations
 
 # 상시 데몬(sync + drain). SIGTERM에 우아하게 종료(진행 중 완료 후 정리).
 CMD ["python", "-m", "corpus_worker"]
