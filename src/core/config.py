@@ -54,6 +54,35 @@ class Settings(BaseSettings):
     aws_region: str = "ap-northeast-2"
     s3_bucket: str = ""
 
+    # --- Notion (약관 코퍼스 소스 — jjg 인테그레이션, 공식 REST API) ---
+    notion_token: str = ""  # 시크릿(ntn_...). SSM/.env 주입, 코드·커밋 금지
+    # 데이터 출처 카탈로그(컨트롤 테이블). /v1/databases/{id}/query용 **database id**
+    # (collection/data source id 아님 — 그건 relation·view 참조용).
+    notion_catalog_database_id: str = "e6fa0ba5efb946c6934c195774e9b6e7"
+    # terms(약관) 파일 DB(카탈로그 `출처` relation 대상)의 database id.
+    notion_corpus_database_id: str = "e2bde980f10741d8bcf35f2d60709171"
+    notion_api_version: str = "2022-06-28"  # Notion-Version 헤더 고정
+    notion_sync_interval_seconds: int = 3600  # 카탈로그→PG 주기 동기화 간격
+    notion_rate_limit_rps: float = 3.0  # Notion API 평균 레이트리밋 상한
+
+    # --- Corpus S3 스테이징 (Notion 첨부 → S3, 청킹/임베딩은 범위 밖) ---
+    corpus_categories: str = "terms"  # MVP 필터. 확장 시 "terms,precedent,medical,legal"
+    s3_corpus_prefix: str = "corpus/"  # 키 = corpus/{category}/{sha256}.pdf (OCR 키공간과 분리)
+    s3_corpus_sse: str = "AES256"  # SSE-S3(공개 약관·비-PII)
+    corpus_poll_interval_seconds: float = 5.0  # 우선순위 큐 폴링 간격
+    corpus_max_concurrent_uploads: int = 4  # 동시 업로드 수
+    # 대용량 스트리밍 임시(처리 후 즉시 삭제). env로 재정의 가능한 기본값이라 S108 무시.
+    corpus_download_tmp_dir: str = "/tmp"  # noqa: S108
+    corpus_max_attempts: int = 5  # 문서 처리 재시도 상한(초과 시 status='failed')
+    corpus_stale_reclaim_seconds: int = 900  # in_progress 좀비 회수 TTL(초)
+    corpus_full_reconcile_every_cycles: int = 24  # N 사이클마다 full 동기화(삭제 반영)
+
+    # --- 수요도 우선순위 (가중치·상수만 env; 상품종류 룩업표는 priority 모듈) ---
+    corpus_w_demand: float = 0.6  # 수요도(상품종류) 가중
+    corpus_w_urgency: float = 0.4  # 긴급도(시행일 신선도) 가중
+    corpus_demand_halflife_days: float = 7.0  # 수요 부스트 반감기(일)
+    corpus_demand_boost_cap: float = 40.0  # 수요 부스트 상한
+
     # --- PII 마스킹 ---
     use_ner: bool = False  # NER 디텍터 활성 여부(false면 정규식만)
     # NER 모델(로컬 실행 — 외부 API로 PII 전송 금지). 이름(PS)만 사용.
