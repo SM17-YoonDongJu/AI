@@ -35,6 +35,7 @@ jobs:
           filters: |
             shared: ['pyproject.toml','uv.lock','src/core/**']
             ocr: ['src/ocr_worker/**']
+            corpus: ['src/corpus_worker/**','migrations/**']
             report: ['src/report_worker/**','src/rag/**','src/guardrail/**']
             chatbot: ['src/chatbot/**','src/rag/**','src/guardrail/**']
       - id: set
@@ -49,6 +50,7 @@ jobs:
           # compose_src: 배포 시 호스트에 기록할 "레포 내" compose. OCR compose는 우리 소유라 코드 기반.
           #   backend EC2 compose는 backend 레포와 공유 → 덮지 않음(compose_src 비움).
           [ "$shared" = "true" ] || [ "${{ steps.filter.outputs.ocr }}" = "true" ]     && add '{"service":"ocr","dockerfile":"src/ocr_worker/Dockerfile","repo":"soma/ocr","tag":"dev","target":"ocr","svc":"ocr-worker","compose_src":"deploy/docker-compose.ocr.yml"}'
+          [ "$shared" = "true" ] || [ "${{ steps.filter.outputs.corpus }}" = "true" ]  && add '{"service":"corpus","dockerfile":"src/corpus_worker/Dockerfile","repo":"soma/corpus","tag":"dev","target":"corpus","svc":"corpus-worker","compose_src":"deploy/docker-compose.corpus.yml"}'
           [ "$shared" = "true" ] || [ "${{ steps.filter.outputs.report }}" = "true" ]  && add '{"service":"report","dockerfile":"src/report_worker/Dockerfile","repo":"soma/report","tag":"dev","target":"backend","svc":"report","compose_src":""}'
           [ "$shared" = "true" ] || [ "${{ steps.filter.outputs.chatbot }}" = "true" ] && add '{"service":"chatbot","dockerfile":"src/chatbot/Dockerfile","repo":"soma/chatbot","tag":"dev","target":"backend","svc":"chatbot","compose_src":""}'
           json=$(IFS=,; echo "[${items[*]}]")
@@ -109,6 +111,10 @@ jobs:
             echo "instance=${{ vars.OCR_EC2_INSTANCE_ID }}" >> "$GITHUB_OUTPUT"
             echo "compose=/opt/ocr/docker-compose.ocr.yml" >> "$GITHUB_OUTPUT"
             echo "envfile=/opt/ocr/.env.ocr" >> "$GITHUB_OUTPUT"
+          elif [ "${{ matrix.target }}" = "corpus" ]; then
+            echo "instance=${{ vars.OCR_EC2_INSTANCE_ID }}" >> "$GITHUB_OUTPUT"  # OCR과 같은 GPU EC2 co-locate
+            echo "compose=/opt/corpus/docker-compose.corpus.yml" >> "$GITHUB_OUTPUT"
+            echo "envfile=/opt/corpus/.env.corpus" >> "$GITHUB_OUTPUT"
           else
             echo "instance=${{ vars.BACKEND_EC2_INSTANCE_ID }}" >> "$GITHUB_OUTPUT"
             echo "compose=/home/ubuntu/backend/docker-compose.yml" >> "$GITHUB_OUTPUT"
