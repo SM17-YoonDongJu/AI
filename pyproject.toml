@@ -23,6 +23,7 @@ dependencies = [
 ocr = [
     "surya-ocr>=0.17,<0.18",
     "requests>=2.31",  # surya.common.s3가 import하지만 surya-ocr 자체 의존성 선언 누락
+    "transformers>=4.56.1,<5.0",  # transformers 5.x는 SuryaDecoderConfig.pad_token_id 깨짐(datalab-to/surya#484)
     "pymupdf>=1.24",   # PDF → 페이지 이미지 렌더
     "pillow>=10.0",    # surya 입력(PIL.Image)
     "boto3>=1.34",     # S3 GetObject(원본 다운로드)
