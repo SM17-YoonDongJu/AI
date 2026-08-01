@@ -18,6 +18,7 @@
 
 import asyncio
 import io
+import math
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
@@ -171,16 +172,23 @@ def render_to_images(data: bytes, content_type: str) -> list[PageImage]:
 
 
 def _render_pdf(data: bytes) -> list[PageImage]:
-    """PDF 바이트를 페이지별 PIL 이미지로 렌더한다(pymupdf)."""
+    """PDF 바이트를 페이지별 PIL 이미지로 렌더한다(pymupdf).
+
+    페이지 물리 크기가 큰 스캔본(예: A3 이상)은 ``PDF_RENDER_DPI``로 그대로
+    렌더하면 PIL의 압축폭탄 방지 한도(``Image.MAX_IMAGE_PIXELS``)를 넘어
+    디코드가 거부된다. 한도를 해제하는 대신 페이지별로 한도 안에 들어오도록
+    DPI를 낮춰 렌더한다.
+    """
     import fitz  # lazy: pymupdf
     from PIL import Image
 
-    zoom = PDF_RENDER_DPI / 72
+    default_zoom = PDF_RENDER_DPI / 72
     images: list[PageImage] = []
     try:
         with fitz.open(stream=data, filetype="pdf") as document:
-            matrix = fitz.Matrix(zoom, zoom)
             for page in document:
+                zoom = _safe_zoom(page.rect.width, page.rect.height, default_zoom)
+                matrix = fitz.Matrix(zoom, zoom)
                 pixmap = page.get_pixmap(matrix=matrix)
                 images.append(Image.open(io.BytesIO(pixmap.tobytes("png"))).convert("RGB"))
     except Exception as exc:  # 렌더 실패를 도메인 예외로 변환(컨텍스트 체이닝)
@@ -188,6 +196,27 @@ def _render_pdf(data: bytes) -> list[PageImage]:
     if not images:
         raise OcrError("PDF에 페이지가 없습니다.")
     return images
+
+
+def _safe_zoom(width_pt: float, height_pt: float, zoom: float) -> float:
+    """``zoom``으로 렌더 시 픽셀 수가 PIL 압축폭탄 한도를 넘으면 한도 안으로 줄인다."""
+    from PIL import Image
+
+    max_pixels = Image.MAX_IMAGE_PIXELS
+    if not max_pixels:
+        return zoom
+    pixels = (width_pt * zoom) * (height_pt * zoom)
+    if pixels <= max_pixels:
+        return zoom
+    safe_zoom = zoom * math.sqrt(max_pixels / pixels)
+    logger.warning(
+        "pdf_page_downscaled",
+        requested_dpi=round(zoom * 72),
+        safe_dpi=round(safe_zoom * 72),
+        width_pt=round(width_pt),
+        height_pt=round(height_pt),
+    )
+    return safe_zoom
 
 
 def _render_image(data: bytes) -> list[PageImage]:
