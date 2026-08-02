@@ -26,6 +26,7 @@ COPY pyproject.toml uv.lock* ./
 RUN uv sync --no-dev --extra ocr
 
 COPY src ./src
+COPY migrations ./migrations
 
 # 엔트리포인트(ocr_worker/__main__.py)는 구현 단계에서 추가.
 CMD ["python", "-m", "ocr_worker"]
