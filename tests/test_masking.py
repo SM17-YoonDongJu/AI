@@ -17,6 +17,7 @@ from ocr_worker.masking import (
     mask,
     merge_overlaps,
 )
+from ocr_worker.masking.patterns import CARD_RE
 
 # ── 정규식 디텍터: 정형 PII를 가린다 ─────────────────────────────
 
@@ -85,6 +86,13 @@ def test_masks_amex_card_number() -> None:
     masked = mask("카드 3412-345678-12345 결제")
     assert "[카드번호]" in masked
     assert "345678" not in masked
+
+
+def test_card_regex_does_not_span_newlines() -> None:
+    # 실제 카드번호는 한 줄에 인쇄된다 — 서로 다른 줄에 흩어진 숫자 조각을
+    # 카드번호로 오인하지 않아야 한다(과마스킹 방지).
+    assert CARD_RE.search("1234\n5678\n9012\n3456") is None
+    assert CARD_RE.search("1234-5678-9012-3456") is not None  # 한 줄이면 정상 매칭
 
 
 def test_masks_ward_room_number() -> None:
@@ -197,6 +205,16 @@ def test_assert_no_residual_does_not_gate_account_only() -> None:
     # 계좌는 추적 전용(_TRACK_ONLY) — 잔류해도 하드 실패시키지 않는다.
     # (이 숫자열은 RRN/카드 패턴엔 안 걸려 ACCOUNT로만 잡힘)
     assert_no_residual("계좌번호 110-1234-567890")  # 예외 없음
+
+
+def test_card_residual_does_not_span_newlines() -> None:
+    # 실측(노이즈 많은 실사진 OCR): 서로 무관한 짧은 숫자 조각이 여러 줄에 걸쳐
+    # 우연히 14~15자리를 채우면, 개행까지 구분자로 허용하던 옛 패턴은 이를
+    # 카드번호로 오탐해 정상 문서를 MaskingError로 fail-closed 격리시켰다.
+    text = "71\n31\n2 16\n21029144"
+    leaks = find_residual_pii(text)
+    assert not any(s.label is PiiLabel.CARD for s in leaks)
+    assert_no_residual(text)  # 예외 없음 — 카드번호 오탐으로 막히지 않는다
 
 
 # ── 디텍터 직접 호출(이미지 마스킹 B안 스팬 공유) ───────────────

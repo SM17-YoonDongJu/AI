@@ -23,8 +23,11 @@ class MaskingError(Exception):
 _RESIDUAL_PATTERNS: tuple[tuple[re.Pattern[str], PiiLabel], ...] = (
     # 주민/외국인등록번호: 구분자에 공백·점 허용
     (re.compile(r"(?<!\d)\d{6}[-.\s]?\d{7}(?!\d)"), PiiLabel.RRN),
-    # 16자리·15자리(Amex) 카드(구분자 관대)
-    (re.compile(r"(?<!\d)(?:\d[-.\s]?){14,15}\d(?!\d)"), PiiLabel.CARD),
+    # 16자리·15자리(Amex) 카드(구분자 관대하되 개행은 제외 — 실측: 노이즈 많은
+    # 실사진 OCR에서 서로 무관한 짧은 숫자 조각들이 여러 줄에 걸쳐 우연히 14~15자리를
+    # 채워 카드번호로 오탐, 잔류 없는 문서가 MaskingError로 fail-closed 격리되는
+    # 사례를 실제로 확인했다. 카드번호는 한 줄에 인쇄되므로 개행 구분자는 배제한다)
+    (re.compile(r"(?<!\d)(?:\d[-. \t]?){14,15}\d(?!\d)"), PiiLabel.CARD),
     # 이메일
     (re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"), PiiLabel.EMAIL),
     # 휴대폰(고민감은 아니나 누락 추적용)
