@@ -91,6 +91,27 @@ def test_claim_extracts_amount_reference() -> None:
     assert entities == {"payout_amount": 950000}
 
 
+# ── 입퇴원확인서·진료비영수증: 표 구조화는 하이브리드 VLM 경로 담당 ──
+
+
+def test_hospitalization_cert_returns_empty_entities() -> None:
+    # Arrange
+    text = "입원확인서\n입원기간 2026-01-01부터 2026-01-05까지"
+    # Act
+    entities = extract(DocType.HOSPITALIZATION_CERT, text)
+    # Assert — 항목별 구조화는 pipeline의 하이브리드 VLM 경로가 담당
+    assert entities == {}
+
+
+def test_medical_receipt_returns_empty_entities() -> None:
+    # Arrange
+    text = "진료비계산서·영수증\n영수금액 47,500원"
+    # Act
+    entities = extract(DocType.MEDICAL_RECEIPT, text)
+    # Assert
+    assert entities == {}
+
+
 # ── OTHER ───────────────────────────────────────────────────────
 
 

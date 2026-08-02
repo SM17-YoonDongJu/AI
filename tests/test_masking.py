@@ -80,6 +80,38 @@ def test_masks_policy_number() -> None:
     assert "한화생명" in masked  # 보험사명은 유지(화이트리스트)
 
 
+def test_masks_amex_card_number() -> None:
+    # 15자리(4-6-5) Amex 형식도 카드번호로 가린다
+    masked = mask("카드 3412-345678-12345 결제")
+    assert "[카드번호]" in masked
+    assert "345678" not in masked
+
+
+def test_masks_ward_room_number() -> None:
+    masked = mask("병실번호 302호로 배정되었습니다")
+    assert "[병실번호]" in masked
+    assert "302" not in masked
+
+
+def test_masks_approval_number() -> None:
+    masked = mask("현금영수증 승인번호 123456789 발급")
+    assert "[승인번호]" in masked
+    assert "123456789" not in masked
+
+
+def test_masks_patient_id() -> None:
+    masked = mask("환자등록번호 P-260715-031 확인")
+    assert "[환자등록번호]" in masked
+    assert "P-260715-031" not in masked
+
+
+def test_business_registration_number_not_masked_as_patient_id() -> None:
+    # "사업자등록번호"는 단독 "등록번호" 앵커를 제외했으므로 환자등록번호로 오탐되지 않음
+    masked = mask("사업자등록번호 123-45-67890")
+    assert "[환자등록번호]" not in masked
+    assert "[사업자등록번호]" in masked
+
+
 def test_masks_doctor_name_after_keyword() -> None:
     assert mask("작성 의사: 김철수") == "작성 의사: [이름]"
 

@@ -37,7 +37,7 @@ from ocr_worker.classify import classify
 from ocr_worker.extract import extract
 from ocr_worker.masking.image_masker import ImageMasker, image_to_png_bytes
 from ocr_worker.masking.masker import Masker, get_masker
-from ocr_worker.masking.verify import assert_no_residual
+from ocr_worker.masking.verify import MaskingError, assert_no_residual
 from ocr_worker.ocr import OcrProcessor, OcrResult, PageImage, get_processor
 from ocr_worker.repository import (
     OcrResultRecord,
@@ -46,6 +46,7 @@ from ocr_worker.repository import (
     save_ocr_result,
 )
 from ocr_worker.storage import put_object
+from ocr_worker.vlm_client import VlmClientError, transcribe_table
 
 logger = get_logger(__name__)
 
@@ -53,6 +54,12 @@ logger = get_logger(__name__)
 _REPORT_ID_NAMESPACE = uuid.NAMESPACE_URL
 # 비식별 이미지 사본 키 공간 — 원본 키와 분리(원본은 별도 보존정책).
 _MASKED_IMAGE_CONTENT_TYPE = "image/png"
+
+# 하이브리드 VLM 보조 대상 — surya 라인 순서가 표 행/열 구조를 보존 못하는 다중
+# 항목 표 문서 유형만. 단순 라벨-값 문서(진단서·증권)는 surya만으로 충분해 제외한다.
+_TABLE_DOC_TYPES: frozenset[DocType] = frozenset(
+    {DocType.PAYOUT_NOTICE, DocType.CLAIM, DocType.HOSPITALIZATION_CERT, DocType.MEDICAL_RECEIPT}
+)
 
 
 def _masked_image_key(job_id: str, page_index: int) -> str:
@@ -69,6 +76,8 @@ def _derive_report_id(ocr_result_id: str) -> str:
 type ImagePipeline = Callable[[OcrJob, OcrResult, list[PageImage]], Awaitable[list[str]]]
 # S3 업로드 주입점(테스트에서 페이크).
 type UploadFn = Callable[[str, bytes, str], Awaitable[None]]
+# 하이브리드 VLM 표 전사 주입점(테스트에서 페이크로 대체).
+type VlmTranscribe = Callable[[PageImage], Awaitable[str]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +107,7 @@ class OcrPipeline:
         processor: OcrProcessor | None = None,
         masker: Masker | None = None,
         image_pipeline: ImagePipeline | None = None,
+        vlm_transcribe: VlmTranscribe | None = None,
     ) -> None:
         """파이프라인을 구성한다.
 
@@ -108,6 +118,7 @@ class OcrPipeline:
             processor: OCR 오케스트레이터. ``None``이면 프로세스 공용 ``get_processor()``.
             masker: 텍스트 마스커. ``None``이면 프로세스 공용 ``get_masker()``.
             image_pipeline: 이미지 마스킹 트랙. ``None``이면 기본(PIL 렌더+S3 업로드).
+            vlm_transcribe: 하이브리드 VLM 표 전사 함수. ``None``이면 ``vlm_client.transcribe_table``.
         """
         self._pool = pool
         self._producer = producer
@@ -115,6 +126,7 @@ class OcrPipeline:
         self._processor = processor or get_processor()
         self._masker = masker or get_masker()
         self._image_masker = ImageMasker(detect=self._masker.detect)
+        self._vlm_transcribe: VlmTranscribe = vlm_transcribe or transcribe_table
         self._upload: UploadFn = put_object
         self._image_pipeline: ImagePipeline = image_pipeline or self._default_image_pipeline
 
@@ -140,11 +152,25 @@ class OcrPipeline:
             clear_context()
 
     async def _process(self, job: OcrJob) -> None:
-        """신규 작업의 전체 처리 흐름(OCR→분석→이미지 마스킹→저장→발행)."""
+        """신규 작업의 전체 처리 흐름(OCR→분석→하이브리드 VLM→이미지 마스킹→저장→발행)."""
         result, images = await self._processor.process_with_images(job.s3_key, job.content_type)
 
         # 분류·추출·텍스트 마스킹은 CPU 바운드(정규식·NER) → 한 스레드 호출로 격리한다.
+        # surya 기반 masked_text는 자체 게이트(assert_no_residual)를 통과한 안전한
+        # 값이라, 아래 VLM 경로가 실패해도 항상 되돌아갈 수 있는 폴백으로 유지한다.
         analysis = await asyncio.to_thread(self._analyze, result, job.doc_type_hint)
+
+        # 표 문서 유형(다중 항목)은 surya 라인 순서가 표 구조를 못 살리므로, VLM이
+        # 재구성한 마크다운으로 masked_text를 교체한다(성공 시에만 — 실패하면 surya
+        # 기반 값 유지). masked_lines(이미지 검은블록 bbox)는 VLM이 좌표를 안 주므로
+        # 항상 surya 기반 그대로 둔다.
+        masked_text = analysis.masked_text
+        entities = analysis.entities
+        if analysis.doc_type in _TABLE_DOC_TYPES and images:
+            table_markdown = await self._extract_table(images[0])
+            if table_markdown is not None:
+                masked_text = table_markdown
+                entities = {**entities, "table_markdown": table_markdown}
 
         # 이미지 마스킹은 렌더한 페이지 이미지를 재사용한다(재다운로드/재렌더 없음).
         image_keys = await self._image_pipeline(job, result, images)
@@ -154,13 +180,32 @@ class OcrPipeline:
             doc_type=analysis.doc_type,
             doc_type_confidence=analysis.doc_type_confidence,
             ocr_confidence=result.mean_confidence,
-            masked_text=analysis.masked_text,
+            masked_text=masked_text,
             masked_lines=analysis.masked_lines,
-            entities=analysis.entities,
+            entities=entities,
             masked_image_s3_keys=image_keys,
         )
         ocr_result_id = await save_ocr_result(self._pool, record)
         await self._publish_report(job, ocr_result_id, analysis.doc_type)
+
+    async def _extract_table(self, image: PageImage) -> str | None:
+        """VLM으로 표를 전사하고 마스킹한다. 실패해도 ``None``을 반환해 surya 결과로 폴백한다."""
+        try:
+            raw = await self._vlm_transcribe(image)
+        except VlmClientError:
+            logger.warning("vlm_table_extraction_failed")
+            return None
+        return await asyncio.to_thread(self._mask_table, raw)
+
+    def _mask_table(self, raw: str) -> str | None:
+        """VLM 원문을 마스킹한다. 잔류 고민감 PII가 있으면 ``None``(surya 결과로 폴백)."""
+        masked = self._masker.mask(raw)
+        try:
+            assert_no_residual(masked)
+        except MaskingError:
+            logger.warning("vlm_table_masking_residual_pii")
+            return None
+        return masked
 
     def _analyze(self, result: OcrResult, hint: str | None) -> _Analysis:
         """분류·추출·텍스트 마스킹을 수행한다(순수/CPU — ``to_thread``에서 호출).

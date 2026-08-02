@@ -12,6 +12,9 @@ from ocr_worker.masking.patterns import (
     ACCOUNT_LOOKAHEAD,
     ACCOUNT_NUMBER_RE,
     ADDRESS_RE,
+    APPROVAL_NUMBER_KEYWORD_RE,
+    APPROVAL_NUMBER_LOOKAHEAD,
+    APPROVAL_NUMBER_VALUE_RE,
     BIZ_RE,
     CARD_RE,
     DOCTOR_NAME_COLON_RE,
@@ -23,12 +26,18 @@ from ocr_worker.masking.patterns import (
     MEDICAL_LICENSE_LOOKAHEAD,
     MEDICAL_LICENSE_VALUE_RE,
     PASSPORT_RE,
+    PATIENT_ID_KEYWORD_RE,
+    PATIENT_ID_LOOKAHEAD,
+    PATIENT_ID_VALUE_RE,
     PHONE_RE,
     POLICY_NUMBER_KEYWORD_RE,
     POLICY_NUMBER_LOOKAHEAD,
     POLICY_NUMBER_VALUE_RE,
     RRN_RE,
     SIGNATURE_NAME_RE,
+    WARD_ROOM_KEYWORD_RE,
+    WARD_ROOM_LOOKAHEAD,
+    WARD_ROOM_VALUE_RE,
     is_non_name,
 )
 from ocr_worker.masking.spans import PiiLabel, Span
@@ -83,6 +92,33 @@ class RegexDetector:
                 POLICY_NUMBER_VALUE_RE,
                 PiiLabel.POLICY_NUMBER,
                 POLICY_NUMBER_LOOKAHEAD,
+            )
+        )
+        spans.extend(
+            self._detect_anchored(
+                text,
+                WARD_ROOM_KEYWORD_RE,
+                WARD_ROOM_VALUE_RE,
+                PiiLabel.WARD_ROOM,
+                WARD_ROOM_LOOKAHEAD,
+            )
+        )
+        spans.extend(
+            self._detect_anchored(
+                text,
+                APPROVAL_NUMBER_KEYWORD_RE,
+                APPROVAL_NUMBER_VALUE_RE,
+                PiiLabel.APPROVAL_NUMBER,
+                APPROVAL_NUMBER_LOOKAHEAD,
+            )
+        )
+        spans.extend(
+            self._detect_anchored(
+                text,
+                PATIENT_ID_KEYWORD_RE,
+                PATIENT_ID_VALUE_RE,
+                PiiLabel.PATIENT_ID,
+                PATIENT_ID_LOOKAHEAD,
             )
         )
         for pattern, label in _SIMPLE_PATTERNS:

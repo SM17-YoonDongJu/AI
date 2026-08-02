@@ -51,6 +51,8 @@ class DocType(StrEnum):
     POLICY = "policy"  # 보험증권
     PAYOUT_NOTICE = "payout_notice"  # 지급결과안내문
     CLAIM = "claim"  # 청구서
+    HOSPITALIZATION_CERT = "hospitalization_cert"  # 입퇴원확인서
+    MEDICAL_RECEIPT = "medical_receipt"  # 진료비계산서·영수증
     OTHER = "other"  # 기타
 
 

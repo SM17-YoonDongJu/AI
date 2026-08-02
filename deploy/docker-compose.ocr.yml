@@ -53,6 +53,12 @@ services:
       EMBEDDING_BASE_URL: http://ollama:11434/v1          # 같은 박스 내부
       EMBEDDING_MODEL: ${EMBEDDING_MODEL}
       EMBEDDING_DIM: ${EMBEDDING_DIM}
+      # 하이브리드 표 문서 보조 경로(ocr_worker.vlm_client). Ollama 네이티브
+      # /api/generate라 EMBEDDING_BASE_URL과 달리 /v1 접미사 없음. 모델은 최초
+      # 1회 `docker exec brbs-ollama ollama pull qwen3-vl:8b-instruct` 필요.
+      VLM_BASE_URL: http://ollama:11434
+      VLM_MODEL: ${VLM_MODEL:-qwen3-vl:8b-instruct}
+      VLM_TIMEOUT_SECONDS: ${VLM_TIMEOUT_SECONDS:-60}
       AWS_REGION: ${AWS_REGION}
       S3_BUCKET: ${S3_BUCKET}
       TZ: Asia/Seoul

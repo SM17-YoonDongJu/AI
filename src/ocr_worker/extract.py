@@ -109,4 +109,8 @@ def extract(doc_type: DocType, text: str) -> dict[str, object]:
         }
     if doc_type is DocType.CLAIM:
         return {"payout_amount": _extract_amount_reference(text, _CLAIM_AMOUNT_KEYWORDS)}
+    if doc_type in (DocType.HOSPITALIZATION_CERT, DocType.MEDICAL_RECEIPT):
+        # 항목별 구조화 데이터(입원기간·진료 항목별 금액 등)는 표 구조가 필요해
+        # ocr_worker.pipeline의 하이브리드 VLM 경로가 entities["table_markdown"]에 채운다.
+        return {}
     return {}

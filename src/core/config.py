@@ -99,6 +99,13 @@ class Settings(BaseSettings):
     embedding_dim: int = DEFAULT_EMBEDDING_DIM
     ai_timeout_seconds: float = 60.0  # 추론 HTTP 요청 타임아웃
 
+    # --- VLM(Vision) 서빙 — Ollama 네이티브 /api/generate(OpenAI 호환 아님) ---
+    # 다중 항목 표 문서(지급결과서·청구서·입원확인서·진료비영수증)에서 surya 라인
+    # 순서가 표 구조를 못 살릴 때 보완하는 하이브리드 경로(ocr_worker.vlm_client) 전용.
+    vlm_base_url: str = "http://localhost:11434"  # ai_base_url과 별도(엔드포인트 형태 다름)
+    vlm_model: str = "qwen3-vl:8b-instruct"
+    vlm_timeout_seconds: float = 60.0  # 실측 평균 15초·최대 34초 — 여유 두고 60초
+
 
 @lru_cache
 def get_settings() -> Settings:

@@ -70,6 +70,27 @@ def test_report_job_doc_type_is_enum() -> None:
     assert job.doc_type is DocType.DIAGNOSIS
 
 
+def test_report_job_accepts_hospitalization_cert_and_medical_receipt() -> None:
+    # Arrange — 신규 DocType 2종이 계약에서 유효한지(다중 항목 표 문서)
+    base_payload = {
+        "report_id": "r",
+        "ocr_result_id": "o",
+        "job_id": "j",
+        "user_ref": "u",
+        "created_at": "2026-06-17T05:31:10Z",
+    }
+
+    # Act
+    hospitalization = ReportJob.model_validate(
+        {**base_payload, "doc_type": "hospitalization_cert"}
+    )
+    receipt = ReportJob.model_validate({**base_payload, "doc_type": "medical_receipt"})
+
+    # Assert
+    assert hospitalization.doc_type is DocType.HOSPITALIZATION_CERT
+    assert receipt.doc_type is DocType.MEDICAL_RECEIPT
+
+
 def test_report_job_rejects_unknown_doc_type() -> None:
     # Arrange
     payload = {
