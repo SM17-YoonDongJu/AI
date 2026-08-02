@@ -24,6 +24,16 @@ from core.contracts import DocType
 # 단어 중간 부분매칭을 막는다("KCD"의 글자나 일련번호가 잡히지 않게).
 KCD_RE = re.compile(r"(?<![A-Za-z0-9])([A-Z]\d{2}(?:\.\d)?)(?![0-9])")
 
+# ── 병명(한글, KCD 코드 없는 진단서용 폴백) ───────────────────────
+# 실측(실제 진단서 샘플): KCD 코드 없이 한글 병명만 적히는 문서가 더 흔하다.
+# 표 양식은 라벨 글자 사이·줄 사이에 공백/개행이 끼는 경우가 많다(예: "병 명\n및\n진 단"
+# 처럼 셀이 여러 줄로 쪼개짐) → 라벨 글자 사이 \s*로 이를 흡수한다.
+DIAGNOSIS_LABEL_RE = re.compile(
+    r"(?:상\s*병\s*명|병\s*명|진\s*단\s*명)(?:\s*및\s*진\s*단)?\s*[:：]?\s*([^\n]+)"  # noqa: RUF001 (전각 콜론)
+)
+# 라벨 캡처가 한 줄 전체를 삼키지 않도록 상한(PRODUCT_MAX_LEN과 동일 정책).
+DIAGNOSIS_NAME_MAX_LEN = 40
+
 # ── 보험사명 ─────────────────────────────────────────────────────
 # 회사명 접두 + 업권 접미사. 접미사를 강제해 일반어("생명보험" 단독)·사람 이름을
 # 배제한다(사람 이름은 이 접미사로 끝나지 않으므로 PII 혼입 위험 없음).
@@ -52,6 +62,20 @@ def _extract_kcd(text: str) -> str | None:
     """첫 KCD 코드를 반환한다(없으면 None)."""
     match = KCD_RE.search(text)
     return match.group(1) if match else None
+
+
+def _extract_diagnosis_name(text: str) -> str | None:
+    """진단명을 반환한다. KCD 코드가 있으면 코드를, 없으면 라벨 뒤 한글 병명을 쓴다.
+
+    코드가 우선인 이유: 코드는 모호함이 없는 표준값이다. 코드가 없는 문서가 더
+    흔하므로(실측), 라벨(병명·상병명·진단명) 뒤 텍스트를 폴백으로 잡아 완전히
+    빈 값이 되는 경우를 줄인다.
+    """
+    kcd = _extract_kcd(text)
+    if kcd is not None:
+        return kcd
+    label = DIAGNOSIS_LABEL_RE.search(text)
+    return label.group(1).strip()[:DIAGNOSIS_NAME_MAX_LEN] if label else None
 
 
 def _extract_insurer(text: str) -> str | None:
@@ -99,7 +123,7 @@ def extract(doc_type: DocType, text: str) -> dict[str, object]:
         ``DocType.OTHER``는 빈 dict.
     """
     if doc_type is DocType.DIAGNOSIS:
-        return {"diagnosis_name": _extract_kcd(text)}
+        return {"diagnosis_name": _extract_diagnosis_name(text)}
     if doc_type is DocType.POLICY:
         return {"insurer": _extract_insurer(text), "product": _extract_product(text)}
     if doc_type is DocType.PAYOUT_NOTICE:

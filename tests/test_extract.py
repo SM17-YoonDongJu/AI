@@ -19,9 +19,31 @@ def test_diagnosis_extracts_kcd_code() -> None:
     assert entities == {"diagnosis_name": "S82.1"}
 
 
-def test_diagnosis_kcd_none_when_absent() -> None:
-    # Arrange
-    text = "상병명: 급성 기관지염 (코드 누락)"
+def test_diagnosis_falls_back_to_label_text_when_kcd_absent() -> None:
+    # Arrange — 실측: KCD 코드 없이 한글 병명만 적힌 진단서가 더 흔하다.
+    text = "상병명: 급성 기관지염"
+    # Act
+    entities = extract(DocType.DIAGNOSIS, text)
+    # Assert
+    assert entities == {"diagnosis_name": "급성 기관지염"}
+
+
+def test_diagnosis_falls_back_across_split_label_lines() -> None:
+    # Arrange — 실제 샘플: 라벨 셀이 "병 명"/"및"/"진 단"으로 여러 줄에 걸쳐
+    # 쪼개지고, 값(병명)은 그다음 줄에 온다(표 양식, OCR 라인 분리).
+    text = (
+        "병 명\n및\n진 단\n만성 요통증\n"
+        " - 요통증은 6개월 이상 지속되는 지속적인 통증으로, 원인을 명확히 알 수 없는 경우를 말함"
+    )
+    # Act
+    entities = extract(DocType.DIAGNOSIS, text)
+    # Assert — 값 줄만 잡고 다음 줄(부연 설명)은 삼키지 않는다.
+    assert entities == {"diagnosis_name": "만성 요통증"}
+
+
+def test_diagnosis_name_none_when_no_kcd_and_no_label() -> None:
+    # Arrange — KCD 코드도, 병명/진단명 라벨도 전혀 없는 텍스트.
+    text = "환자는 정기 검진을 위해 내원하였다."
     # Act
     entities = extract(DocType.DIAGNOSIS, text)
     # Assert
@@ -137,6 +159,22 @@ def test_pii_never_enters_entities_diagnosis() -> None:
     entities = extract(DocType.DIAGNOSIS, text)
     # Assert — 도메인 값(KCD)만 들어가고 PII는 어떤 값에도 없음
     assert entities == {"diagnosis_name": "S82.1"}
+    serialized = repr(entities)
+    assert "홍길동" not in serialized
+    assert "901010" not in serialized
+    assert "1234-5678" not in serialized
+
+
+def test_pii_never_enters_entities_diagnosis_label_fallback() -> None:
+    # Arrange — KCD 코드 없이 병명 라벨만 있는 문서 + 이름·주민번호·전화(PII).
+    text = (
+        "환자의 성명 홍길동\n주민등록번호 901010-1234567\n연락처 010-1234-5678\n"
+        "병 명\n및\n진 단\n만성 요통증"
+    )
+    # Act
+    entities = extract(DocType.DIAGNOSIS, text)
+    # Assert — 병명 값만 들어가고 PII는 어떤 값에도 없음
+    assert entities == {"diagnosis_name": "만성 요통증"}
     serialized = repr(entities)
     assert "홍길동" not in serialized
     assert "901010" not in serialized

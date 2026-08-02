@@ -109,7 +109,7 @@
 `entities` 예시(문서 유형별 일부):
 ```json
 {
-  "diagnosis_name": "S82.1",        // KCD 코드
+  "diagnosis_name": "S82.1",        // KCD 코드 있으면 코드, 없으면 라벨 뒤 한글 병명 폴백(실측: 코드 없는 문서가 더 흔함)
   "insurer": "○○생명",
   "product": "무배당 ...",
   "payout_amount": null              // 단정 금지 — 추출값은 참고용
