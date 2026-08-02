@@ -20,7 +20,9 @@ _vlm_client: httpx.AsyncClient | None = None
 VLM_TABLE_PROMPT = (
     "이 이미지는 한국 보험/의료 문서입니다. 이미지 안의 모든 텍스트를 표 구조를 "
     "유지해 가능한 한 정확히 그대로 옮겨 적어주세요. 표는 마크다운 표로, "
-    "항목-금액 쌍은 누락 없이 옮겨주세요. 추측하지 말고 보이는 대로만 적어주세요."
+    "항목-금액 쌍은 누락 없이 옮겨주세요. 추측하지 말고 보이는 대로만 적어주세요. "
+    "특정 부분이 흐리거나 읽을 수 없으면 내용을 지어내지 말고 '[읽을 수 없음]'이라고만 "
+    "적어주세요."
 )
 
 
@@ -67,6 +69,9 @@ async def transcribe_table(image: PageImage) -> str:
         "prompt": VLM_TABLE_PROMPT,
         "images": [b64],
         "stream": False,
+        # temperature=0: 창작 경향을 낮춰 환각(이미지에 없는 내용 지어내기)을 줄인다.
+        # 완전히 막진 못하므로 pipeline._looks_grounded()가 별도 안전장치로 검증한다.
+        "options": {"temperature": 0.0},
     }
     try:
         resp = await client.post("/api/generate", json=payload)

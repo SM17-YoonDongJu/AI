@@ -67,6 +67,24 @@ async def test_transcribe_table_sends_base64_png_image() -> None:
     assert isinstance(images[0], str) and len(images[0]) > 0
 
 
+async def test_transcribe_table_sets_zero_temperature() -> None:
+    # Arrange: 환각(창작) 경향을 낮추기 위해 temperature=0.0을 보내는지 확인.
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        captured["options"] = body.get("options")
+        return httpx.Response(200, json={"response": "ok"})
+
+    _install_mock(handler)
+
+    # Act
+    await vlm_client.transcribe_table(_image())
+
+    # Assert
+    assert captured["options"] == {"temperature": 0.0}
+
+
 async def test_transcribe_table_wraps_http_error() -> None:
     # Arrange: 5xx 응답
     def handler(request: httpx.Request) -> httpx.Response:

@@ -89,6 +89,9 @@ class ReportJob(BaseModel):
     user_ref: str  # 사용자 참조
     claim_id: str | None = None  # USER_CLAIMS.id 패스스루(옵셔널)
     created_at: datetime  # 발행 시각(UTC, ISO-8601)
+    # ocr_worker의 자동 품질 판정(저신뢰도 + 이름/도메인 정보 미검출). needs_reupload면
+    # report_worker가 리포트 생성을 건너뛰어야 한다는 신호 — 실제 사용자 알림은 게이트웨이 몫.
+    ocr_quality: Literal["ok", "needs_reupload"] = "ok"
 
 
 # --------------------------------------------------------------------------- #

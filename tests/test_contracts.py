@@ -107,6 +107,60 @@ def test_report_job_rejects_unknown_doc_type() -> None:
         ReportJob.model_validate(payload)
 
 
+def test_report_job_ocr_quality_defaults_to_ok() -> None:
+    # Arrange — ocr_quality 생략 시 기본값
+    payload = {
+        "report_id": "r",
+        "ocr_result_id": "o",
+        "job_id": "j",
+        "doc_type": "diagnosis",
+        "user_ref": "u",
+        "created_at": "2026-06-17T05:31:10Z",
+    }
+
+    # Act
+    job = ReportJob.model_validate(payload)
+
+    # Assert
+    assert job.ocr_quality == "ok"
+
+
+def test_report_job_accepts_needs_reupload() -> None:
+    # Arrange
+    payload = {
+        "report_id": "r",
+        "ocr_result_id": "o",
+        "job_id": "j",
+        "doc_type": "diagnosis",
+        "user_ref": "u",
+        "created_at": "2026-06-17T05:31:10Z",
+        "ocr_quality": "needs_reupload",
+    }
+
+    # Act
+    job = ReportJob.model_validate(payload)
+
+    # Assert
+    assert job.ocr_quality == "needs_reupload"
+
+
+def test_report_job_rejects_unknown_ocr_quality() -> None:
+    # Arrange
+    payload = {
+        "report_id": "r",
+        "ocr_result_id": "o",
+        "job_id": "j",
+        "doc_type": "diagnosis",
+        "user_ref": "u",
+        "created_at": "2026-06-17T05:31:10Z",
+        "ocr_quality": "rejected",  # enum 밖
+    }
+
+    # Act / Assert
+    with pytest.raises(ValidationError):
+        ReportJob.model_validate(payload)
+
+
 def test_citation_has_no_source_url() -> None:
     # Arrange / Act
     fields = set(Citation.model_fields)

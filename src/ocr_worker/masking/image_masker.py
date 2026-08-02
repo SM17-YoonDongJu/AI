@@ -32,45 +32,63 @@ type DetectFn = Callable[[str], list[Span]]
 type RedactFn = Callable[[PageImage, OcrPage, set[int]], PageImage]
 
 
-def _line_char_ranges(page: OcrPage) -> list[tuple[int, int]]:
-    """각 라인이 ``page.text``에서 차지하는 ``[start, end)`` 문자 범위를 만든다.
+def reading_order(page: OcrPage) -> list[int]:
+    """bbox(y0, x0) 기준으로 정렬한 라인 인덱스 순서를 반환한다.
 
-    ``OcrPage.text``(``"\\n".join``)와 정확히 같은 오프셋 체계를 재현해, 텍스트에서
-    검출한 스팬을 라인으로 되짚을 수 있게 한다.
+    surya 검출 순서가 표의 시각적 순서(위→아래, 좌→우)와 다를 수 있어, 앵커 정규식의
+    lookahead가 "물리적으로 가까운" 라벨-값 쌍을 못 붙잡는 경우가 있다(예: 라벨과 값이
+    검출 순서상 멀리 떨어진 라인으로 나옴). 좌표로 재정렬해 이 문제를 완화한다.
     """
-    ranges: list[tuple[int, int]] = []
+    return sorted(
+        range(len(page.lines)), key=lambda i: (page.lines[i].bbox[1], page.lines[i].bbox[0])
+    )
+
+
+def reading_order_text(page: OcrPage, order: list[int]) -> str:
+    """``order`` 순서로 라인 텍스트를 이어붙인다(``_line_char_ranges``와 동일 구분자)."""
+    return _LINE_SEPARATOR.join(page.lines[i].text for i in order)
+
+
+def _line_char_ranges(page: OcrPage, order: list[int]) -> dict[int, tuple[int, int]]:
+    """``reading_order_text(page, order)`` 기준으로, 원래 라인 인덱스별 ``[start, end)``.
+
+    ``order``로 재배열해 조인한 텍스트에서 오프셋을 계산하되, 결과 딕셔너리의 키는
+    ``page.lines``의 **원래** 인덱스다 — 검출한 스팬을 원래 라인으로 되짚을 수 있게 한다.
+    """
+    ranges: dict[int, tuple[int, int]] = {}
     cursor = 0
-    for line in page.lines:
+    for i in order:
         start = cursor
-        end = start + len(line.text)
-        ranges.append((start, end))
+        end = start + len(page.lines[i].text)
+        ranges[i] = (start, end)
         cursor = end + len(_LINE_SEPARATOR)
     return ranges
 
 
 def pii_line_indices(
-    page: OcrPage, spans: list[Span], labels: set[PiiLabel] | None = None
+    page: OcrPage, spans: list[Span], order: list[int], labels: set[PiiLabel] | None = None
 ) -> set[int]:
     """PII 스팬이 걸친 라인 인덱스 집합을 반환한다(줄 단위 마스킹 대상).
 
-    스팬은 ``page.text`` 기준 문자 오프셋이다. 스팬이 라인 경계를 넘으면 닿는 라인을
-    모두 포함한다(안전 우선 — 부분 노출 방지).
+    스팬은 ``reading_order_text(page, order)`` 기준 문자 오프셋이다. 스팬이 라인 경계를
+    넘으면 닿는 라인을 모두 포함한다(안전 우선 — 부분 노출 방지).
 
     Args:
         page: OCR 페이지(라인 텍스트·좌표 보유).
-        spans: ``page.text``에서 검출된 PII 스팬.
+        spans: ``reading_order_text(page, order)``에서 검출된 PII 스팬.
+        order: ``reading_order(page)``가 반환한 정렬 순서(스팬 오프셋 계산과 일치해야 함).
         labels: 가릴 PII 분류 집합. ``None``이면 모든 PII를 가린다.
 
     Returns:
-        검은블럭으로 가릴 라인 인덱스 집합(가릴 것이 없으면 빈 집합).
+        검은블럭으로 가릴 라인 인덱스 집합(원래 ``page.lines`` 인덱스, 가릴 것이 없으면 빈 집합).
     """
     selected = [span for span in spans if labels is None or span.label in labels]
     if not selected:
         return set()
-    ranges = _line_char_ranges(page)
+    ranges = _line_char_ranges(page, order)
     indices: set[int] = set()
     for span in selected:
-        for index, (start, end) in enumerate(ranges):
+        for index, (start, end) in ranges.items():
             if span.start < end and span.end > start:  # 범위 겹침
                 indices.add(index)
     return indices
@@ -157,7 +175,8 @@ class ImageMasker:
             )
         redacted: list[PageImage] = []
         for image, page in zip(images, result.pages, strict=True):
-            spans = self._detect(page.text)
-            indices = pii_line_indices(page, spans, self._labels)
+            order = reading_order(page)
+            spans = self._detect(reading_order_text(page, order))
+            indices = pii_line_indices(page, spans, order, self._labels)
             redacted.append(self._redactor(image, page, indices) if indices else image)
         return redacted

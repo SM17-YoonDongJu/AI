@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 
 from core.contracts import DocType
+from ocr_worker.masking.spans import PiiLabel, Span
 from ocr_worker.ocr import OcrLine, OcrPage, OcrResult
 from ocr_worker.repository import (
     OcrResultRecord,
@@ -100,8 +101,14 @@ async def test_save_raises_when_no_row_returned() -> None:
         await save_ocr_result(pool, _record())  # type: ignore[arg-type]
 
 
+def _detect_all(text: str) -> list[Span]:
+    """전체 텍스트를 PII로 표시하는 페이크 detect(해당 라인에 항상 mask 적용됨)."""
+    return [Span(0, len(text), PiiLabel.NAME)] if text else []
+
+
 def test_build_masked_lines_masks_text_and_keeps_coords() -> None:
-    # Arrange: 라인 텍스트를 대문자로 바꾸는 페이크 마스킹(좌표 보존만 확인)
+    # Arrange: 라인 텍스트를 대문자로 바꾸는 페이크 마스킹(좌표 보존만 확인).
+    # detect가 전체를 PII로 표시해 해당 라인에 mask가 적용되게 한다.
     line = OcrLine(
         text="hello",
         bbox=(1.0, 2.0, 3.0, 4.0),
@@ -112,7 +119,7 @@ def test_build_masked_lines_masks_text_and_keeps_coords() -> None:
     result = OcrResult(pages=(page,))
 
     # Act
-    masked_lines = build_masked_lines(result, mask=str.upper)
+    masked_lines = build_masked_lines(result, mask=str.upper, detect=_detect_all)
 
     # Assert
     assert masked_lines == [
@@ -131,8 +138,42 @@ def test_build_masked_lines_is_json_serializable() -> None:
     result = OcrResult(pages=(OcrPage(index=0, width=1, height=1, lines=(line,)),))
 
     # Act
-    masked_lines = build_masked_lines(result, mask=lambda _text: "[이름]")
+    masked_lines = build_masked_lines(result, mask=lambda _text: "[이름]", detect=_detect_all)
 
     # Assert: jsonb 적재 전 직렬화가 깨지지 않아야 한다
     dumped = json.dumps(masked_lines, ensure_ascii=False)
     assert "[이름]" in dumped
+
+
+def test_build_masked_lines_catches_span_split_across_lines() -> None:
+    # 라벨과 값이 서로 다른 라인에 있을 때, 페이지 조인 텍스트 기준으로만 검출되는
+    # 상황(라인별 독립 검출로는 못 잡는 앵커 패턴)을 흉내낸다 — 페이지 단위 detect
+    # 통합 덕에 값 라인만 정확히 마스킹되는지 확인한다.
+    label_line = OcrLine(
+        text="환자성명:",
+        bbox=(0.0, 0.0, 10.0, 5.0),
+        polygon=((0.0, 0.0), (10.0, 0.0), (10.0, 5.0), (0.0, 5.0)),
+        confidence=0.9,
+    )
+    value_line = OcrLine(
+        text="홍길동",
+        bbox=(0.0, 6.0, 10.0, 10.0),
+        polygon=((0.0, 6.0), (10.0, 6.0), (10.0, 10.0), (0.0, 10.0)),
+        confidence=0.9,
+    )
+    page = OcrPage(index=0, width=100, height=50, lines=(label_line, value_line))
+    result = OcrResult(pages=(page,))
+
+    def fake_detect(text: str) -> list[Span]:
+        if "환자성명:" not in text or "홍길동" not in text:
+            return []
+        start = text.index("홍길동")
+        return [Span(start, start + len("홍길동"), PiiLabel.NAME)]
+
+    def fake_mask(text: str) -> str:
+        return text.replace("홍길동", "[이름]")
+
+    masked_lines = build_masked_lines(result, mask=fake_mask, detect=fake_detect)
+
+    assert masked_lines[0]["masked_text"] == "환자성명:"  # 라벨 라인엔 PII 없음 → 원문 유지
+    assert masked_lines[1]["masked_text"] == "[이름]"  # 값 라인은 마스킹됨

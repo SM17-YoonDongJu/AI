@@ -82,17 +82,17 @@ class _IdentityMasker:
 
 
 # ── 헬퍼 ─────────────────────────────────────────────────────────
-def _line(text: str) -> OcrLine:
+def _line(text: str, *, confidence: float = 0.9) -> OcrLine:
     return OcrLine(
         text=text,
         bbox=(0.0, 0.0, 10.0, 5.0),
         polygon=((0.0, 0.0), (10.0, 0.0), (10.0, 5.0), (0.0, 5.0)),
-        confidence=0.9,
+        confidence=confidence,
     )
 
 
-def _result(*texts: str) -> OcrResult:
-    lines = tuple(_line(text) for text in texts)
+def _result(*texts: str, confidence: float = 0.9) -> OcrResult:
+    lines = tuple(_line(text, confidence=confidence) for text in texts)
     return OcrResult(pages=(OcrPage(index=0, width=100, height=50, lines=lines),))
 
 
@@ -191,8 +191,10 @@ async def test_publishes_masked_image_keys_from_image_track() -> None:
 
 # ── 멱등 단락 ────────────────────────────────────────────────────
 async def test_idempotent_short_circuit_skips_ocr_and_republishes() -> None:
-    # Arrange: 이미 저장된 job_id(멱등 재소비).
-    pool = FakePool(existing={"id": _EXISTING_ID, "doc_type": "policy"})
+    # Arrange: 이미 저장된 job_id(멱등 재소비). 저장된 ocr_quality도 그대로 재사용된다.
+    pool = FakePool(
+        existing={"id": _EXISTING_ID, "doc_type": "policy", "ocr_quality": "needs_reupload"}
+    )
     producer = FakeProducer()
     processor = FakeProcessor(_result("무시됨"))
     pipeline = _pipeline(pool, producer, processor)
@@ -200,7 +202,7 @@ async def test_idempotent_short_circuit_skips_ocr_and_republishes() -> None:
     # Act
     await pipeline.handle(_job())
 
-    # Assert: OCR·저장을 건너뛰고 기존 id로 ReportJob만 재발행한다.
+    # Assert: OCR·저장을 건너뛰고 기존 id·품질로 ReportJob만 재발행한다.
     assert processor.called is False
     assert pool.insert_calls() == []
     assert len(producer.published) == 1
@@ -208,6 +210,7 @@ async def test_idempotent_short_circuit_skips_ocr_and_republishes() -> None:
     assert report.ocr_result_id == str(_EXISTING_ID)
     assert report.report_id == _derive_report_id(str(_EXISTING_ID))
     assert report.doc_type is DocType.POLICY
+    assert report.ocr_quality == "needs_reupload"
 
 
 # ── 결정적 report_id ─────────────────────────────────────────────
@@ -257,11 +260,15 @@ async def test_vlm_not_called_for_non_table_doc_type() -> None:
 
 
 async def test_vlm_success_replaces_masked_text_for_table_doc_type() -> None:
-    # Arrange: 지급결과안내문(표 문서 유형) + PII 없는 VLM 마크다운 표 결과.
+    # Arrange: 지급결과안내문(표 문서 유형) + PII 없는 VLM 마크다운 표 결과. surya 원문
+    # 단어(지급결정·내역 등)를 재사용해 groundedness 체크를 통과하게 한다(환각 아님).
     pool = FakePool(existing=None)
     producer = FakeProducer()
     processor = FakeProcessor(_result(*_PAYOUT_TEXTS))
-    vlm_text = "| 항목 | 금액 |\n|---|---|\n| 진찰료 | 10,000 |"
+    vlm_text = (
+        "| 항목 | 금액 |\n|---|---|\n"
+        "| 지급결정 내역 | 10,000 |\n| 산정내역 지급사유 설명 | 20,000 |"
+    )
     vlm = _RecordingVlm(text=vlm_text)
     pipeline = _pipeline(pool, producer, processor, vlm_transcribe=vlm)
 
@@ -334,6 +341,144 @@ async def test_masked_lines_unaffected_by_vlm_path() -> None:
     insert_args = pool.insert_calls()[0][1]
     masked_lines = json.loads(insert_args[5])
     assert len(masked_lines) == len(_PAYOUT_TEXTS)
+
+
+# ── 저신뢰도 VLM 트리거 ──────────────────────────────────────────
+async def test_vlm_called_for_non_table_doc_type_when_confidence_low() -> None:
+    # Arrange: 진단서(표 문서 아님)지만 surya 신뢰도가 낮으면(<0.90) 문서 유형과
+    # 무관하게 VLM 보완을 시도한다.
+    pool = FakePool(existing=None)
+    producer = FakeProducer()
+    processor = FakeProcessor(_result("진단서", "상병명 골절", confidence=0.5))
+    vlm = _RecordingVlm(text="진단서 상병명 골절")
+    pipeline = _pipeline(pool, producer, processor, vlm_transcribe=vlm)
+
+    # Act
+    await pipeline.handle(_job())
+
+    # Assert
+    assert vlm.called is True
+
+
+async def test_vlm_not_called_for_non_table_doc_type_when_confidence_high() -> None:
+    # Arrange: 표 문서도 아니고 신뢰도도 충분히 높으면(>=0.90) VLM을 호출하지 않는다.
+    pool = FakePool(existing=None)
+    producer = FakeProducer()
+    processor = FakeProcessor(_result("진단서", "상병명 골절", confidence=0.95))
+    vlm = _RecordingVlm(text="진단서 상병명 골절")
+    pipeline = _pipeline(pool, producer, processor, vlm_transcribe=vlm)
+
+    # Act
+    await pipeline.handle(_job())
+
+    # Assert
+    assert vlm.called is False
+
+
+# ── VLM 환각 완화(groundedness) ──────────────────────────────────
+async def test_vlm_ungrounded_result_discarded_and_falls_back_to_surya() -> None:
+    # Arrange: 표 문서지만 VLM이 surya 원문과 무관한 내용을 지어낸 상황(환각) —
+    # groundedness 체크로 폐기되고 surya 기반 값이 그대로 유지돼야 한다.
+    pool = FakePool(existing=None)
+    producer = FakeProducer()
+    processor = FakeProcessor(_result(*_PAYOUT_TEXTS))
+    vlm = _RecordingVlm(text="완전히 무관한 히알루론산 시술 안내 텍스트입니다")
+    pipeline = _pipeline(pool, producer, processor, vlm_transcribe=vlm)
+
+    # Act
+    await pipeline.handle(_job())
+
+    # Assert
+    assert vlm.called is True
+    insert_args = pool.insert_calls()[0][1]
+    masked_text = insert_args[4]
+    entities = json.loads(insert_args[6])
+    assert "지급결정" in masked_text  # surya 원문 유지(VLM 결과 폐기)
+    assert "table_markdown" not in entities
+
+
+# ── "재확인 필요"(ocr_quality) 판정 ──────────────────────────────
+async def test_ocr_quality_needs_reupload_when_low_confidence_no_name_no_domain_info() -> None:
+    # Arrange: 신뢰도 낮음 + 이름·도메인 정보(보험사·상품명) 전무. 저신뢰도는 VLM도
+    # 트리거하므로(문서 유형 무관) 네트워크 호출 없이 실패로 페이크해 surya 기반
+    # quality_source_text가 유지되게 한다.
+    pool = FakePool(existing=None)
+    producer = FakeProducer()
+    processor = FakeProcessor(
+        _result("보험증권", "증권번호 202301-042", confidence=0.5)
+    )
+    vlm = _RecordingVlm(error=VlmClientError("연결 실패"))
+    pipeline = _pipeline(pool, producer, processor, vlm_transcribe=vlm)
+
+    # Act
+    await pipeline.handle(_job())
+
+    # Assert
+    insert_args = pool.insert_calls()[0][1]
+    assert insert_args[8] == "needs_reupload"
+    assert producer.published[0][1].ocr_quality == "needs_reupload"
+
+
+async def test_ocr_quality_needs_reupload_when_name_present_but_domain_info_missing() -> None:
+    # Arrange: 이름은 검출되지만(서명란) 보험사·상품명 등 도메인 정보가 전무.
+    pool = FakePool(existing=None)
+    producer = FakeProducer()
+    processor = FakeProcessor(
+        _result("보험증권", "증권번호 202301-042", "홍길동(서명)", confidence=0.5)
+    )
+    vlm = _RecordingVlm(error=VlmClientError("연결 실패"))
+    pipeline = _pipeline(pool, producer, processor, vlm_transcribe=vlm)
+
+    # Act
+    await pipeline.handle(_job())
+
+    # Assert
+    insert_args = pool.insert_calls()[0][1]
+    assert insert_args[8] == "needs_reupload"
+
+
+async def test_ocr_quality_ok_when_low_confidence_but_name_and_domain_info_present() -> None:
+    # Arrange: 신뢰도는 낮지만 이름·도메인 정보(보험사·상품명)가 모두 검출됨.
+    pool = FakePool(existing=None)
+    producer = FakeProducer()
+    processor = FakeProcessor(
+        _result(
+            "보험증권",
+            "증권번호 202301-042",
+            "현대해상",
+            "상품명: 무배당건강보험",
+            "홍길동(서명)",
+            confidence=0.5,
+        )
+    )
+    vlm = _RecordingVlm(error=VlmClientError("연결 실패"))
+    pipeline = _pipeline(pool, producer, processor, vlm_transcribe=vlm)
+
+    # Act
+    await pipeline.handle(_job())
+
+    # Assert
+    insert_args = pool.insert_calls()[0][1]
+    assert insert_args[8] == "ok"
+    assert producer.published[0][1].ocr_quality == "ok"
+
+
+async def test_ocr_quality_ok_when_confidence_high_even_without_name_or_domain_info() -> None:
+    # Arrange: 이름·도메인 정보가 전무해도, 신뢰도가 충분히 높으면(>=0.90)
+    # needs_reupload로 판정하지 않는다(저신뢰 게이트가 AND 조건).
+    pool = FakePool(existing=None)
+    producer = FakeProducer()
+    processor = FakeProcessor(
+        _result("보험증권", "증권번호 202301-042", confidence=0.95)
+    )
+    pipeline = _pipeline(pool, producer, processor)
+
+    # Act
+    await pipeline.handle(_job())
+
+    # Assert
+    insert_args = pool.insert_calls()[0][1]
+    assert insert_args[8] == "ok"
 
 
 # ── fail-closed(마스킹 잔류) ─────────────────────────────────────

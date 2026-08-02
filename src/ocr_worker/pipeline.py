@@ -22,6 +22,7 @@ PII 규약(§13): OCR 원문(평문)은 이 핸들러 메모리에만 존재하�
 """
 
 import asyncio
+import re
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -37,6 +38,7 @@ from ocr_worker.classify import classify
 from ocr_worker.extract import extract
 from ocr_worker.masking.image_masker import ImageMasker, image_to_png_bytes
 from ocr_worker.masking.masker import Masker, get_masker
+from ocr_worker.masking.spans import PiiLabel
 from ocr_worker.masking.verify import MaskingError, assert_no_residual
 from ocr_worker.ocr import OcrProcessor, OcrResult, PageImage, get_processor
 from ocr_worker.repository import (
@@ -60,6 +62,41 @@ _MASKED_IMAGE_CONTENT_TYPE = "image/png"
 _TABLE_DOC_TYPES: frozenset[DocType] = frozenset(
     {DocType.PAYOUT_NOTICE, DocType.CLAIM, DocType.HOSPITALIZATION_CERT, DocType.MEDICAL_RECEIPT}
 )
+
+# 표 문서와 별개로, surya 신뢰도가 낮으면(실측: 클린 PDF 0.951+ vs 실제 폰카 사진
+# 0.861-) 문서 유형 무관하게 VLM 보완을 시도한다. 표본 3건 기준 시작값 — 운영 중 재조정.
+_LOW_CONFIDENCE_THRESHOLD: float = 0.90
+
+# VLM 결과 groundedness(환각 여부 대략 검사)용 토큰 추출·임계값. surya가 오타를 내도
+# 대부분의 토큰(날짜·숫자·구조어)은 겹치므로 낮게 잡아 정상 교정까지 걸리지 않게 한다.
+_TOKEN_RE = re.compile(r"[가-힣A-Za-z0-9]{2,}")
+_MIN_GROUNDED_OVERLAP = 0.3
+
+
+def _looks_grounded(vlm_text: str, source_text: str) -> bool:
+    """VLM 결과가 surya 원문과 무관한 내용을 지어낸 게 아닌지 대략적으로 검사한다.
+
+    ``assert_no_residual``은 PII 유출만 잡고 환각(이미지에 없는 내용 생성)은 못 잡으므로
+    별도 안전장치로 둔다. 완벽한 검증은 아니다 — 토큰 중복률 기반 근사치.
+    """
+    vlm_tokens = set(_TOKEN_RE.findall(vlm_text))
+    if not vlm_tokens:
+        return True  # 빈 결과는 마스킹 검증 등 다른 경로에서 처리
+    source_tokens = set(_TOKEN_RE.findall(source_text))
+    overlap = len(vlm_tokens & source_tokens) / len(vlm_tokens)
+    return overlap >= _MIN_GROUNDED_OVERLAP
+
+
+def _missing_domain_info(entities: dict[str, object]) -> bool:
+    """extract()(+VLM table_markdown)로 뽑힌 값이 하나도 없는지 확인한다.
+
+    "재확인 필요" 판정 신호 중 하나. doc_type별 필수 필드 정책을 새로 만들지 않고
+    이미 있는 추출 결과를 재사용한다 — 알려진 한계: entities 필드가 1개뿐인
+    DIAGNOSIS·CLAIM은 그 필드가 원래 없는 양식이어도 오탐할 수 있다.
+    """
+    if not entities:
+        return True
+    return all(v is None for v in entities.values())
 
 
 def _masked_image_key(job_id: str, page_index: int) -> str:
@@ -118,7 +155,8 @@ class OcrPipeline:
             processor: OCR 오케스트레이터. ``None``이면 프로세스 공용 ``get_processor()``.
             masker: 텍스트 마스커. ``None``이면 프로세스 공용 ``get_masker()``.
             image_pipeline: 이미지 마스킹 트랙. ``None``이면 기본(PIL 렌더+S3 업로드).
-            vlm_transcribe: 하이브리드 VLM 표 전사 함수. ``None``이면 ``vlm_client.transcribe_table``.
+            vlm_transcribe: 하이브리드 VLM 표 전사 함수. ``None``이면
+                ``vlm_client.transcribe_table``.
         """
         self._pool = pool
         self._producer = producer
@@ -143,16 +181,16 @@ class OcrPipeline:
         try:
             existing = await find_ocr_result(self._pool, job.job_id)
             if existing is not None:
-                ocr_result_id, doc_type = existing
+                ocr_result_id, doc_type, ocr_quality = existing
                 logger.info("job already processed → republish", ocr_result_id=ocr_result_id)
-                await self._publish_report(job, ocr_result_id, doc_type)
+                await self._publish_report(job, ocr_result_id, doc_type, ocr_quality)
                 return
             await self._process(job)
         finally:
             clear_context()
 
     async def _process(self, job: OcrJob) -> None:
-        """신규 작업의 전체 처리 흐름(OCR→분석→하이브리드 VLM→이미지 마스킹→저장→발행)."""
+        """신규 작업의 전체 처리 흐름(OCR→분석→하이브리드 VLM→품질 판정→저장→발행)."""
         result, images = await self._processor.process_with_images(job.s3_key, job.content_type)
 
         # 분류·추출·텍스트 마스킹은 CPU 바운드(정규식·NER) → 한 스레드 호출로 격리한다.
@@ -160,17 +198,37 @@ class OcrPipeline:
         # 값이라, 아래 VLM 경로가 실패해도 항상 되돌아갈 수 있는 폴백으로 유지한다.
         analysis = await asyncio.to_thread(self._analyze, result, job.doc_type_hint)
 
-        # 표 문서 유형(다중 항목)은 surya 라인 순서가 표 구조를 못 살리므로, VLM이
-        # 재구성한 마크다운으로 masked_text를 교체한다(성공 시에만 — 실패하면 surya
-        # 기반 값 유지). masked_lines(이미지 검은블록 bbox)는 VLM이 좌표를 안 주므로
-        # 항상 surya 기반 그대로 둔다.
+        # 표 문서 유형(다중 항목) 또는 surya 신뢰도가 낮으면(문서 유형 무관) VLM으로
+        # 보완한다. 성공 시(환각·잔류PII 검증 통과)에만 masked_text를 교체하고, 실패하면
+        # surya 기반 값을 유지한다. masked_lines(이미지 검은블록 bbox)는 VLM이 좌표를
+        # 안 주므로 항상 surya 기반 그대로 둔다.
         masked_text = analysis.masked_text
         entities = analysis.entities
-        if analysis.doc_type in _TABLE_DOC_TYPES and images:
-            table_markdown = await self._extract_table(images[0])
-            if table_markdown is not None:
-                masked_text = table_markdown
-                entities = {**entities, "table_markdown": table_markdown}
+        quality_source_text = result.full_text  # 최종 품질 판정 기준 원문(기본 surya)
+
+        needs_vlm = (
+            analysis.doc_type in _TABLE_DOC_TYPES
+            or result.mean_confidence < _LOW_CONFIDENCE_THRESHOLD
+        )
+        if needs_vlm and images:
+            vlm_outcome = await self._extract_table(images[0], result.full_text)
+            if vlm_outcome is not None:
+                raw, masked = vlm_outcome
+                masked_text = masked
+                entities = {**entities, "table_markdown": masked}
+                quality_source_text = raw  # VLM이 채택됐으면 품질 판정도 VLM 원문 기준
+
+        # "재확인 필요" 판정: surya 신뢰도가 낮은데(문서 자체가 저품질) 사람 이름조차
+        # 못 찾았거나 도메인 정보가 하나도 없으면, 자동 처리로는 신뢰할 수 없다고 본다.
+        has_name = any(
+            span.label is PiiLabel.NAME for span in self._masker.detect(quality_source_text)
+        )
+        ocr_quality = (
+            "needs_reupload"
+            if result.mean_confidence < _LOW_CONFIDENCE_THRESHOLD
+            and (not has_name or _missing_domain_info(entities))
+            else "ok"
+        )
 
         # 이미지 마스킹은 렌더한 페이지 이미지를 재사용한다(재다운로드/재렌더 없음).
         image_keys = await self._image_pipeline(job, result, images)
@@ -184,18 +242,34 @@ class OcrPipeline:
             masked_lines=analysis.masked_lines,
             entities=entities,
             masked_image_s3_keys=image_keys,
+            ocr_quality=ocr_quality,
         )
         ocr_result_id = await save_ocr_result(self._pool, record)
-        await self._publish_report(job, ocr_result_id, analysis.doc_type)
+        await self._publish_report(job, ocr_result_id, analysis.doc_type, ocr_quality)
 
-    async def _extract_table(self, image: PageImage) -> str | None:
-        """VLM으로 표를 전사하고 마스킹한다. 실패해도 ``None``을 반환해 surya 결과로 폴백한다."""
+    async def _extract_table(
+        self, image: PageImage, source_text: str
+    ) -> tuple[str, str] | None:
+        """VLM으로 표를 전사하고 검증·마스킹한다.
+
+        실패(호출 오류·환각·잔류PII)하면 ``None``을 반환해 surya 결과로 폴백한다.
+
+        Returns:
+            성공 시 ``(VLM 원문, 마스킹된 텍스트)``. 원문은 호출측의 품질 판정(이름
+            스팬 확인)에도 재사용한다.
+        """
         try:
             raw = await self._vlm_transcribe(image)
         except VlmClientError:
             logger.warning("vlm_table_extraction_failed")
             return None
-        return await asyncio.to_thread(self._mask_table, raw)
+        if not _looks_grounded(raw, source_text):
+            logger.warning("vlm_table_ungrounded")
+            return None
+        masked = await asyncio.to_thread(self._mask_table, raw)
+        if masked is None:
+            return None
+        return raw, masked
 
     def _mask_table(self, raw: str) -> str | None:
         """VLM 원문을 마스킹한다. 잔류 고민감 PII가 있으면 ``None``(surya 결과로 폴백)."""
@@ -217,7 +291,7 @@ class OcrPipeline:
         entities = extract(classification.doc_type, result.full_text)
         masked_text = self._masker.mask(result.full_text)
         assert_no_residual(masked_text)  # 고민감 PII 잔류 시 MaskingError(전파 → DLQ)
-        masked_lines = build_masked_lines(result, self._masker.mask)
+        masked_lines = build_masked_lines(result, self._masker.mask, self._masker.detect)
         return _Analysis(
             doc_type=classification.doc_type,
             doc_type_confidence=classification.confidence,
@@ -252,12 +326,16 @@ class OcrPipeline:
         redacted = self._image_masker.redact_pages(images, result)
         return [image_to_png_bytes(image) for image in redacted]
 
-    async def _publish_report(self, job: OcrJob, ocr_result_id: str, doc_type: DocType) -> None:
+    async def _publish_report(
+        self, job: OcrJob, ocr_result_id: str, doc_type: DocType, ocr_quality: str
+    ) -> None:
         """``ReportJob``을 ``report-job`` 토픽에 발행한다(파티션 키 = report_id).
 
         ``report_id``는 ``ocr_result_id``에서 결정적으로 파생해 재발행 시 동일하다 —
         report_worker가 ``report_id``/``ocr_result_id`` 어느 쪽으로 멱등 처리해도 안전하다.
         ``claim_id``는 가공 없이 패스스루한다(USER_CLAIMS는 report_worker가 직접 읽음).
+        ``ocr_quality``가 ``needs_reupload``면 report_worker가 리포트 생성을 건너뛸 신호다
+        (report_worker·게이트웨이 쪽 소비는 이번 범위 밖).
         """
         report_id = _derive_report_id(ocr_result_id)
         report = ReportJob(
@@ -268,5 +346,6 @@ class OcrPipeline:
             user_ref=job.user_ref,
             claim_id=job.claim_id,
             created_at=datetime.now(UTC),
+            ocr_quality=ocr_quality,
         )
         await self._producer.publish(self._settings.kafka_report_job_topic, report, key=report_id)

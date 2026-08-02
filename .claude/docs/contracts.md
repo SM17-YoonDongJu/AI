@@ -65,8 +65,11 @@
 | `user_ref` | string | ✓ | 사용자 참조 |
 | `claim_id` | string(UUID) \| null | – | `USER_CLAIMS.id` 패스스루(옵셔널). `report_worker`가 DB에서 직접 조회 |
 | `created_at` | string(ISO-8601) | ✓ | 발행 시각(UTC) |
+| `ocr_quality` | string | ✓ | `ocr_worker`의 자동 품질 판정(아래 enum). 기본값 `"ok"` |
 
 `doc_type` enum: `diagnosis`(진단서) · `policy`(보험증권) · `payout_notice`(지급결과안내문) · `claim`(청구서) · `hospitalization_cert`(입퇴원확인서) · `medical_receipt`(진료비계산서·영수증) · `other`(기타)
+
+`ocr_quality` enum: `ok`(정상) · `needs_reupload`(재확인 필요 — surya 신뢰도가 낮은데 이름·도메인 정보가 하나도 검출되지 않은 저품질 문서). **이 신호를 실제로 소비해 리포트 생성을 건너뛰고 사용자에게 재업로드를 알리는 것은 `report_worker` + 게이트웨이 몫** — `ocr_worker`는 판정만 하고 값만 실어 발행한다(이번 범위는 여기까지).
 
 > 토픽명은 `core.contracts`에 상수로 공유된다: `OCR_JOB_TOPIC = "ocr-job-queue"`, `REPORT_JOB_TOPIC = "report-job"`.
 
@@ -78,7 +81,8 @@
   "doc_type": "diagnosis",
   "user_ref": "u_4821",
   "claim_id": null,
-  "created_at": "2026-06-17T05:31:10Z"
+  "created_at": "2026-06-17T05:31:10Z",
+  "ocr_quality": "ok"
 }
 ```
 - **토픽**: `report-job` · **파티션 키**: `report_id` · 멱등 처리.
@@ -96,9 +100,10 @@
 | `doc_type_confidence` | real | 분류 신뢰도(0~1) |
 | `ocr_confidence` | real | OCR 라인 평균 신뢰도(0~1) — 저신뢰 QA 플래깅 |
 | `masked_text` | text | **PII 마스킹된** OCR 텍스트 (downstream 입력). 표 문서 4종(`payout_notice`·`claim`·`hospitalization_cert`·`medical_receipt`)은 하이브리드 VLM이 성공하면 마크다운 표 문법(`\|`·`---`)을 포함할 수 있음(실패 시 surya 평문 폴백) — LLM은 마크다운을 문제없이 소화하므로 `report_worker` 측 별도 분기는 불필요 |
-| `masked_lines` | jsonb | 라인 단위 `[{masked_text, bbox, polygon, confidence}]` — bbox/polygon/conf 보존, **텍스트는 마스킹본**(이미지 마스킹 좌표 재사용). **항상 surya 기반**(VLM은 좌표를 반환하지 않음) — 표가 심하게 스크램블된 문서는 이미지 검은블록 마스킹에서 일부 항목형 PII(병실번호·환자등록번호류)를 놓칠 잔여 위험이 있음(알려진 한계, 후속 과제) |
+| `masked_lines` | jsonb | 라인 단위 `[{masked_text, bbox, polygon, confidence}]` — bbox/polygon/conf 보존, **텍스트는 마스킹본**(이미지 마스킹 좌표 재사용). **항상 surya 기반**(VLM은 좌표를 반환하지 않음). 좌표 기반 리딩오더 정렬(시각적 위→아래·좌→우) 후 페이지 단위로 PII를 검출해, 라벨과 값이 서로 다른 라인으로 쪼개진 경우도 페이지 컨텍스트로 잡는다 — 이미지 검은블록 마스킹(`ImageMasker.redact_pages`)과 **동일 판정 로직을 공유**해 두 트랙 간 불일치가 없다. 잔여 한계: 라벨-값 사이에 매우 긴 문단이 끼어 앵커 정규식의 lookahead 범위를 넘는 극단적 경우는 여전히 놓칠 수 있음(후속 과제) |
 | `entities` | jsonb | 추출 엔티티(아래). `table_markdown`(string\|null, optional)은 표 문서 4종에서만 등장 — VLM 전사 후 마스킹 완료 상태 |
 | `masked_image_s3_keys` | jsonb | 검은블럭 비식별 이미지 사본 S3 키(페이지별 리스트) |
+| `ocr_quality` | text | 자동 품질 판정(`ok` \| `needs_reupload`). `ReportJob.ocr_quality`로 패스스루됨 |
 | `created_at` | timestamptz | |
 
 `entities` 예시(문서 유형별 일부):
@@ -131,6 +136,8 @@
 > **2026-06-30 (additive):** `doc_type_confidence`·`ocr_confidence`·`masked_lines`·`masked_image_s3_keys` 추가(이미지 마스킹 트랙 도입, #13 범위 확장). `masked_text`·`entities`는 불변 → `report_worker` 측 **비파괴**. 신규 컬럼은 `ocr_worker`만 기록, 비식별 이미지 소비(손해사정사 UI)는 `ocr_result_id`로 조회.
 >
 > **2026-08-02 (additive):** `doc_type` enum에 `hospitalization_cert`(입퇴원확인서)·`medical_receipt`(진료비계산서·영수증) 추가(CHECK 제약은 `migrations/003_ocr_results_doctype_expand.sql`로 확장). 이 2종 + 기존 `payout_notice`·`claim`은 다중 항목 표 문서라 하이브리드 VLM 경로(§3 하단 참고)가 `masked_text`/`entities.table_markdown`에 관여할 수 있다.
+>
+> **2026-08-02 (additive):** `ocr_results.ocr_quality`·`ReportJob.ocr_quality` 추가(CHECK 제약은 `migrations/004_ocr_results_quality.sql`). surya 신뢰도가 낮은데(<0.90) 문서 전체에서 이름·도메인 정보가 하나도 검출되지 않으면 `needs_reupload`로 표시된다. 이와 별개로, 표 문서 4종 한정이던 하이브리드 VLM 트리거를 신뢰도 조건(<0.90)으로 확대해 문서 유형 무관하게 저품질 문서에도 VLM 보완을 시도하며, VLM 결과는 surya 원문과의 토큰 중복률 기반 groundedness 체크를 통과해야만 채택된다(환각 방지, 실패 시 surya 폴백). `masked_lines`도 이미지 마스킹 트랙과 판정 로직을 공유하도록 갱신(위 표 참고). `doc_type`·`masked_text`·`entities` 등 기존 필드는 불변 → `report_worker` 측 비파괴. **`ocr_quality` 신호를 소비해 리포트 생성 여부를 결정하고 사용자에게 재업로드를 안내하는 것은 `report_worker` + 게이트웨이 범위** — 이번 변경은 `ocr_worker`의 판정·발행까지만 다룬다.
 
 ---
 
