@@ -221,14 +221,16 @@ class OcrPipeline:
             vlm_outcome = await self._extract_pages(images, result)
             if vlm_outcome is not None:
                 masked_text, quality_source_text, table_markdown = vlm_outcome
-                # extract()는 surya 원문에만 돌았던 상태라, surya가 못 뽑은(None) 필드도
-                # VLM이 더 깨끗하게 읽었으면 실제로는 값이 있는데 None으로 남을 수 있다.
-                # VLM 채택 원문에 extract()를 한 번 더 돌려 surya가 놓친 필드만 보강한다
-                # (surya가 이미 찾은 값은 덮어쓰지 않음 — 어느 쪽이 더 정확한지 비교할
-                # 근거가 없으므로 먼저 찾은 값을 우선한다).
+                # extract()는 surya 원문에만 돌았던 상태라, surya가 못 뽑았거나(None)
+                # 잘못 뽑은 필드도 VLM이 더 깨끗하게 읽었으면 실제 값과 다를 수 있다.
+                # VLM 채택 원문에 extract()를 한 번 더 돌려, 있으면 VLM 쪽 값을
+                # 우선한다 — VLM은 이미 groundedness 검증을 통과했고 애초에 surya
+                # 신뢰도가 낮거나 표 문서라서 호출된 것이므로, 둘 다 값이 있으면
+                # VLM 쪽을 더 신뢰할 근거가 있다(실측: surya가 금액을 숫자로 오독해
+                # 엉뚱한 값을 잘못 채운 사례 확인). surya만 값이 있으면 그대로 둔다.
                 vlm_entities = extract(analysis.doc_type, quality_source_text)
                 entities = {
-                    key: value if value is not None else vlm_entities.get(key)
+                    key: vlm_entities.get(key) if vlm_entities.get(key) is not None else value
                     for key, value in entities.items()
                 }
                 entities["table_markdown"] = table_markdown

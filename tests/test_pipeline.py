@@ -371,13 +371,33 @@ async def test_vlm_backfills_domain_field_surya_missed() -> None:
     assert entities["diagnosis_name"] == "급성 위염"
 
 
-async def test_vlm_does_not_overwrite_field_surya_already_found() -> None:
-    # Arrange: surya가 이미 KCD 코드를 찾았으면, VLM 원문에 다른 값이 있어도 surya
-    # 쪽 값을 유지한다(어느 쪽이 더 정확한지 비교할 근거가 없어 먼저 찾은 값 우선).
+async def test_vlm_value_overrides_field_surya_already_found() -> None:
+    # Arrange: surya가 이미 KCD 코드를 찾았어도, VLM이 채택되면 VLM 쪽 값을
+    # 우선한다 — VLM은 이미 groundedness 검증을 통과했고, 애초에 surya 신뢰도가
+    # 낮아서 호출된 것이므로 더 신뢰할 근거가 있다(실측: surya가 금액을 다른
+    # 문서 필드로 오독해 엉뚱한 값을 채운 사례를 근거로 우선순위를 뒤집었다).
     pool = FakePool(existing=None)
     producer = FakeProducer()
     processor = FakeProcessor(_result("진단서 A09.9 위염 스캔 품질 낮음", confidence=0.5))
     vlm = _RecordingVlm(text="진단서 상병명: 급성 위염 J20.9")
+    pipeline = _pipeline(pool, producer, processor, vlm_transcribe=vlm)
+
+    # Act
+    await pipeline.handle(_job())
+
+    # Assert
+    insert_args = pool.insert_calls()[0][1]
+    entities = json.loads(insert_args[6])
+    assert entities["diagnosis_name"] == "J20.9"
+
+
+async def test_vlm_keeps_surya_value_when_vlm_text_has_no_match() -> None:
+    # Arrange: surya가 KCD를 찾았고, VLM 채택 원문엔 KCD도 병명 라벨도 없다 —
+    # 이 경우 vlm_entities는 None이라 surya 값을 그대로 유지해야 한다.
+    pool = FakePool(existing=None)
+    producer = FakeProducer()
+    processor = FakeProcessor(_result("진단서 A09.9 위염 스캔 품질 낮음", confidence=0.5))
+    vlm = _RecordingVlm(text="진단서 위염 관련 스캔 품질 낮음")
     pipeline = _pipeline(pool, producer, processor, vlm_transcribe=vlm)
 
     # Act

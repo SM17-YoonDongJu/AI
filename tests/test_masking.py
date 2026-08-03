@@ -95,6 +95,29 @@ def test_card_regex_does_not_span_newlines() -> None:
     assert CARD_RE.search("1234-5678-9012-3456") is not None  # 한 줄이면 정상 매칭
 
 
+def test_masks_patient_name_by_label_even_if_uncommon() -> None:
+    # 실측(E2E): NER이 "이샘플"처럼 흔치 않은 합성 이름을 놓치는 사례가 있었다 —
+    # "환자 성명" 라벨 뒤 이름은 NER 성공 여부와 무관하게 정규식으로도 잡아야 한다.
+    masked = mask("환자 성명: 이샘플")
+    assert "[이름]" in masked
+    assert "이샘플" not in masked
+
+
+def test_masks_person_name_in_markdown_table_row() -> None:
+    # VLM 하이브리드 경로의 원문은 "| 라벨 | 값 |" 마크다운 표 형태다 — 라벨과 값
+    # 사이의 파이프(|)도 구분자로 흡수해야 한다.
+    masked = mask("| 피보험자 | 홍길동 |\n| 계약자 | 김철수 |")
+    assert "[이름]" in masked
+    assert "홍길동" not in masked
+    assert "김철수" not in masked
+
+
+def test_masks_beneficiary_name() -> None:
+    masked = mask("예금주 최테스트 계좌로 입금")
+    assert "[이름]" in masked
+    assert "최테스트" not in masked
+
+
 def test_masks_ward_room_number() -> None:
     masked = mask("병실번호 302호로 배정되었습니다")
     assert "[병실번호]" in masked
