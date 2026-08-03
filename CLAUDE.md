@@ -24,3 +24,4 @@
 | 2026-06-16 | 공유 설정(훅·Notion 권한)을 `settings.json`으로 분리, `.gitignore` 작성 | `.claude/settings.json`, `.gitignore` | .claude 커밋 — 훅은 공유, local.json은 개인용 제외 |
 | 2026-06-17 | 워커중심 구조로 변경 + 하네스 경로 동기화 | agents·skills·CLAUDE.md | 실제 구조(`src/ocr_worker`·`src/report_worker`·`src/chatbot/app.py`)와 정합 |
 | 2026-06-25 | git-committer 스킬 추가 (변경 분석→한국어 커밋, ruff·시크릿 점검, push 안 함) | `skills/git-committer` | 사용자 요청 — 커밋 메시지 작성·커밋 자동화 |
+| 2026-08-03 | 커밋·PR 스킬에서 AI 서명/트레일러 제거 (`Co-Authored-By`·`Generated with`) | `skills/git-committer`, `skills/pr-writer` | 사용자 요청 — 커밋/PR에 도구 흔적 미표기 |
