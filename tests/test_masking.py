@@ -112,6 +112,14 @@ def test_masks_person_name_in_markdown_table_row() -> None:
     assert "김철수" not in masked
 
 
+def test_masks_person_name_with_bold_markdown_label() -> None:
+    # 실측(E2E): VLM이 라벨을 "**환자 성명**"처럼 마크다운 볼드로 감싼 원문에서
+    # 별표(*)를 구분자로 흡수 못해 매칭이 끊긴 사례를 확인했다.
+    masked = mask("| **환자 성명** | 이샘플 |")
+    assert "[이름]" in masked
+    assert "이샘플" not in masked
+
+
 def test_masks_beneficiary_name() -> None:
     masked = mask("예금주 최테스트 계좌로 입금")
     assert "[이름]" in masked
