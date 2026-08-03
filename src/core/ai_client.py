@@ -5,6 +5,7 @@ base_url·모델명·인증키는 config에서 주입(하드코딩 금지). 챗�
 블로킹을 유발하지 않는다(httpx.AsyncClient).
 """
 
+import json
 from typing import Any
 
 import httpx
@@ -95,6 +96,40 @@ async def chat(messages: list[dict[str, str]], **opts: Any) -> str:
         raise AiClientError("chat 호출 실패") from exc
     except (KeyError, IndexError, TypeError) as exc:
         raise AiClientError("chat 응답 형식이 올바르지 않음") from exc
+
+
+async def chat_json(messages: list[dict[str, str]], **opts: Any) -> Any:
+    """chat 결과를 JSON으로 파싱한다(코드펜스 제거 + 중괄호 폴백).
+
+    리포트·챗봇·가드레일이 공유하는 JSON 모드 헬퍼. LLM이 ```json 펜스나 잡음을 섞어도
+    관용적으로 파싱하고, 파싱 불가 시에만 `{}`를 반환한다. `chat()`의 HTTP/형식 오류
+    (`AiClientError`)는 삼키지 않고 그대로 전파한다(호출자가 판단).
+
+    Args:
+        messages: OpenAI 형식 메시지 목록.
+        **opts: `chat`에 전달할 추가 파라미터(model 등).
+
+    Returns:
+        파싱된 JSON 값(보통 dict). 파싱 실패 시 `{}`.
+
+    Raises:
+        AiClientError: `chat()` 호출 자체가 실패한 경우.
+    """
+    raw = await chat(messages, **opts)
+    s = raw.strip()
+    if s.startswith("```"):
+        s = s.split("```", 2)[1] if s.count("```") >= 2 else s.strip("`")
+        s = s[4:].strip() if s.lower().startswith("json") else s.strip()
+    try:
+        return json.loads(s)
+    except (json.JSONDecodeError, ValueError):
+        start, end = s.find("{"), s.rfind("}")
+        if start != -1 and end != -1:
+            try:
+                return json.loads(s[start : end + 1])
+            except (json.JSONDecodeError, ValueError):
+                return {}
+        return {}
 
 
 async def embed(text: str) -> list[float]:
