@@ -205,6 +205,17 @@ async def _bge_embed(text: str) -> list[float]:
     return vector
 
 
+def _query_input(text: str) -> str:
+    """쿼리 임베딩 입력 — 임베더별 비대칭 프리픽스를 조건부 적용한다.
+
+    qwen3-embedding류는 instruction 프리픽스가 성능에 필요하지만 BGE-M3 등은 raw를 쓴다.
+    문서(적재)는 항상 raw이므로, 쿼리 프리픽스가 모델과 안 맞으면 검색이 오히려 저하된다.
+    """
+    if "qwen" in settings.embedding_model.lower():
+        return _QUERY_INSTRUCT + text
+    return text
+
+
 async def _embed_query(text: str) -> list[float] | None:
     """쿼리 임베딩. qwen3:embedding 실패 시 BGE-M3 폴백, 둘 다 실패면 None(degrade).
 
@@ -212,7 +223,7 @@ async def _embed_query(text: str) -> list[float] | None:
         1024d 임베딩 벡터, 또는 둘 다 실패 시 None(키워드 검색만으로 진행).
     """
     try:
-        return await ai_client.embed(_QUERY_INSTRUCT + text)
+        return await ai_client.embed(_query_input(text))
     except ai_client.AiClientError as exc:
         logger.warning("rag.embed.primary_failed", exc_info=exc)
 
