@@ -138,6 +138,8 @@
 > **2026-08-02 (additive):** `doc_type` enum에 `hospitalization_cert`(입퇴원확인서)·`medical_receipt`(진료비계산서·영수증) 추가(CHECK 제약은 `migrations/003_ocr_results_doctype_expand.sql`로 확장). 이 2종 + 기존 `payout_notice`·`claim`은 다중 항목 표 문서라 하이브리드 VLM 경로(§3 하단 참고)가 `masked_text`/`entities.table_markdown`에 관여할 수 있다.
 >
 > **2026-08-02 (additive):** `ocr_results.ocr_quality`·`ReportJob.ocr_quality` 추가(CHECK 제약은 `migrations/004_ocr_results_quality.sql`). surya 신뢰도가 낮은데(<0.90) 문서 전체에서 이름·도메인 정보가 하나도 검출되지 않으면 `needs_reupload`로 표시된다. 이와 별개로, 표 문서 4종 한정이던 하이브리드 VLM 트리거를 신뢰도 조건(<0.90)으로 확대해 문서 유형 무관하게 저품질 문서에도 VLM 보완을 시도하며, VLM 결과는 surya 원문과의 토큰 중복률 기반 groundedness 체크를 통과해야만 채택된다(환각 방지, 실패 시 surya 폴백). `masked_lines`도 이미지 마스킹 트랙과 판정 로직을 공유하도록 갱신(위 표 참고). `doc_type`·`masked_text`·`entities` 등 기존 필드는 불변 → `report_worker` 측 비파괴. **`ocr_quality` 신호를 소비해 리포트 생성 여부를 결정하고 사용자에게 재업로드를 안내하는 것은 `report_worker` + 게이트웨이 범위** — 이번 변경은 `ocr_worker`의 판정·발행까지만 다룬다.
+>
+> **2026-08-03 (additive):** 하이브리드 VLM 경로가 다중 페이지 문서에서 페이지별로 독립 채택되도록 수정. 이전엔 1페이지 VLM 성공만으로 `masked_text` 전체가 그 페이지 결과로 교체돼 2페이지 이후 내용이 유실되는 결함이 있었다 — 이제 페이지마다 VLM 성공/실패가 갈리고, 실패한 페이지는 그 페이지의 surya 결과로 개별 폴백한다. `entities.table_markdown`도 채택된 페이지만 구분자(`\n\n---\n\n`)로 이어붙인다(타입은 여전히 `string`, 계약 형태 불변).
 
 ---
 

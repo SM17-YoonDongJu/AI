@@ -72,6 +72,11 @@ _LOW_CONFIDENCE_THRESHOLD: float = 0.90
 _TOKEN_RE = re.compile(r"[가-힣A-Za-z0-9]{2,}")
 _MIN_GROUNDED_OVERLAP = 0.3
 
+# 다중 페이지 문서에서 일부 페이지만 VLM이 채택됐을 때 entities.table_markdown을
+# 페이지별로 구분해 이어붙이는 구분자(사람이 읽기 쉽게). masked_text/quality_source_text
+# 는 OcrResult.full_text와 같은 "\n" 접합을 그대로 써서 문서 형태를 일관되게 유지한다.
+_TABLE_PAGE_SEPARATOR = "\n\n---\n\n"
+
 
 def _looks_grounded(vlm_text: str, source_text: str) -> bool:
     """VLM 결과가 surya 원문과 무관한 내용을 지어낸 게 아닌지 대략적으로 검사한다.
@@ -199,9 +204,11 @@ class OcrPipeline:
         analysis = await asyncio.to_thread(self._analyze, result, job.doc_type_hint)
 
         # 표 문서 유형(다중 항목) 또는 surya 신뢰도가 낮으면(문서 유형 무관) VLM으로
-        # 보완한다. 성공 시(환각·잔류PII 검증 통과)에만 masked_text를 교체하고, 실패하면
-        # surya 기반 값을 유지한다. masked_lines(이미지 검은블록 bbox)는 VLM이 좌표를
-        # 안 주므로 항상 surya 기반 그대로 둔다.
+        # 보완한다. 페이지마다 독립적으로 채택 여부가 갈린다 — 한 페이지가 실패해도
+        # 그 페이지만 surya 결과로 폴백하고 나머지 페이지는 영향받지 않는다(과거엔
+        # 1페이지 VLM 성공만으로 문서 전체 masked_text가 교체돼 2페이지 이후가 통째로
+        # 유실됐었다). masked_lines(이미지 검은블록 bbox)는 VLM이 좌표를 안 주므로
+        # 항상 surya 기반 그대로 둔다.
         masked_text = analysis.masked_text
         entities = analysis.entities
         quality_source_text = result.full_text  # 최종 품질 판정 기준 원문(기본 surya)
@@ -211,12 +218,10 @@ class OcrPipeline:
             or result.mean_confidence < _LOW_CONFIDENCE_THRESHOLD
         )
         if needs_vlm and images:
-            vlm_outcome = await self._extract_table(images[0], result.full_text)
+            vlm_outcome = await self._extract_pages(images, result)
             if vlm_outcome is not None:
-                raw, masked = vlm_outcome
-                masked_text = masked
-                entities = {**entities, "table_markdown": masked}
-                quality_source_text = raw  # VLM이 채택됐으면 품질 판정도 VLM 원문 기준
+                masked_text, quality_source_text, table_markdown = vlm_outcome
+                entities = {**entities, "table_markdown": table_markdown}
 
         # "재확인 필요" 판정: surya 신뢰도가 낮은데(문서 자체가 저품질) 사람 이름조차
         # 못 찾았거나 도메인 정보가 하나도 없으면, 자동 처리로는 신뢰할 수 없다고 본다.
@@ -246,6 +251,46 @@ class OcrPipeline:
         )
         ocr_result_id = await save_ocr_result(self._pool, record)
         await self._publish_report(job, ocr_result_id, analysis.doc_type, ocr_quality)
+
+    async def _extract_pages(
+        self, images: list[PageImage], result: OcrResult
+    ) -> tuple[str, str, str] | None:
+        """페이지마다 독립적으로 VLM 보완을 시도해 문서 전체를 합성한다.
+
+        한 페이지의 VLM 실패(호출 오류·환각·잔류PII)가 다른 페이지까지 막지 않는다.
+        실패한 페이지는 그 페이지의 surya 결과로 폴백해 문서 전체 내용이 유실되지
+        않게 한다. masked_text/원문은 ``OcrResult.full_text``와 같은 "\\n" 접합을
+        써서 VLM 관여 여부와 무관하게 문서 형태가 일관되게 유지된다.
+
+        Returns:
+            어느 페이지든 VLM이 채택됐으면 ``(합성 masked_text, 합성 원문,
+            table_markdown)``. 전 페이지가 실패했으면 ``None``(호출측이 순수
+            surya 결과를 그대로 쓰게 한다).
+        """
+        masked_parts: list[str] = []
+        raw_parts: list[str] = []
+        table_parts: list[str] = []
+        adopted = False
+
+        for image, page in zip(images, result.pages, strict=True):
+            outcome = await self._extract_table(image, page.text)
+            if outcome is not None:
+                raw, masked = outcome
+                masked_parts.append(masked)
+                raw_parts.append(raw)
+                table_parts.append(masked)
+                adopted = True
+            else:
+                masked_parts.append(await asyncio.to_thread(self._masker.mask, page.text))
+                raw_parts.append(page.text)
+
+        if not adopted:
+            return None
+        return (
+            "\n".join(masked_parts),
+            "\n".join(raw_parts),
+            _TABLE_PAGE_SEPARATOR.join(table_parts),
+        )
 
     async def _extract_table(
         self, image: PageImage, source_text: str

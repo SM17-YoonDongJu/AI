@@ -68,7 +68,9 @@ class FakeProcessor:
         self, s3_key: str, content_type: str
     ) -> tuple[OcrResult, list[object]]:
         self.called = True
-        return self._result, [object()]  # 이미지 내용은 이미지 트랙 페이크가 무시
+        # 이미지 내용 자체는 이미지 트랙 페이크가 무시하지만, _extract_pages가
+        # images/pages를 zip(strict=True)하므로 개수는 페이지 수와 맞춰야 한다.
+        return self._result, [object() for _ in self._result.pages]
 
 
 class _IdentityMasker:
@@ -94,6 +96,15 @@ def _line(text: str, *, confidence: float = 0.9) -> OcrLine:
 def _result(*texts: str, confidence: float = 0.9) -> OcrResult:
     lines = tuple(_line(text, confidence=confidence) for text in texts)
     return OcrResult(pages=(OcrPage(index=0, width=100, height=50, lines=lines),))
+
+
+def _multi_page_result(*page_texts: str, confidence: float = 0.9) -> OcrResult:
+    """페이지마다 텍스트 한 줄씩 담은 다중 페이지 결과(페이지별 VLM 합성 테스트용)."""
+    pages = tuple(
+        OcrPage(index=i, width=100, height=50, lines=(_line(text, confidence=confidence),))
+        for i, text in enumerate(page_texts)
+    )
+    return OcrResult(pages=pages)
 
 
 def _job(**overrides: Any) -> OcrJob:
@@ -241,6 +252,21 @@ class _RecordingVlm:
         return self._text
 
 
+class _SequencedVlm:
+    """페이지마다 다른 결과/예외를 순서대로 돌려주는 VLM 대역(다중 페이지 테스트용)."""
+
+    def __init__(self, outcomes: list[str | Exception]) -> None:
+        self._outcomes = list(outcomes)
+        self.call_count = 0
+
+    async def __call__(self, image: object) -> str:
+        self.call_count += 1
+        outcome = self._outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
 _PAYOUT_TEXTS = ("보험금 지급결과 안내문", "지급결정 내역", "산정내역 및 지급사유 설명")
 
 
@@ -341,6 +367,88 @@ async def test_masked_lines_unaffected_by_vlm_path() -> None:
     insert_args = pool.insert_calls()[0][1]
     masked_lines = json.loads(insert_args[5])
     assert len(masked_lines) == len(_PAYOUT_TEXTS)
+
+
+# ── 다중 페이지 VLM 합성(페이지별 독립 폴백) ─────────────────────
+async def test_vlm_partial_page_failure_keeps_other_pages() -> None:
+    # Arrange: 2페이지 표 문서. 1페이지는 VLM 성공(원문 단어 재사용해 grounded),
+    # 2페이지는 VLM 호출 실패 — 실패한 페이지만 surya로 폴백하고 문서 전체가
+    # 유실되지 않아야 한다(예전엔 1페이지 성공만으로 masked_text 전체가 교체돼
+    # 2페이지 이후 내용이 통째로 사라졌었다).
+    pool = FakePool(existing=None)
+    producer = FakeProducer()
+    page1 = "보험금 지급결과 안내문 지급결정 내역"
+    page2 = "추가 산정 내역 진찰료 10000원"
+    processor = FakeProcessor(_multi_page_result(page1, page2))
+    vlm = _SequencedVlm(
+        [
+            "보험금 지급결과 안내문 지급결정 내역(표)",  # 1페이지: grounded → 채택
+            VlmClientError("연결 실패"),  # 2페이지: 실패 → surya 폴백
+        ]
+    )
+    pipeline = _pipeline(pool, producer, processor, vlm_transcribe=vlm)
+
+    # Act
+    await pipeline.handle(_job())
+
+    # Assert
+    assert vlm.call_count == 2  # 페이지마다 독립 호출
+    insert_args = pool.insert_calls()[0][1]
+    masked_text = insert_args[4]
+    assert "지급결정 내역(표)" in masked_text  # 1페이지: VLM 결과
+    assert "추가 산정 내역" in masked_text  # 2페이지: surya 폴백으로 유지(유실 안 됨)
+
+
+async def test_vlm_table_markdown_joins_only_adopted_pages() -> None:
+    # Arrange: 3페이지 중 1·3페이지만 VLM 채택, 2페이지는 실패.
+    pool = FakePool(existing=None)
+    producer = FakeProducer()
+    page1, page2, page3 = (
+        "보험금 지급결과 안내문",
+        "지급결정 내역 산정",
+        "산정내역 및 지급사유 설명",
+    )
+    processor = FakeProcessor(_multi_page_result(page1, page2, page3))
+    vlm = _SequencedVlm(
+        [
+            "보험금 지급결과 안내문(표1)",
+            VlmClientError("연결 실패"),
+            "산정내역 및 지급사유 설명(표3)",
+        ]
+    )
+    pipeline = _pipeline(pool, producer, processor, vlm_transcribe=vlm)
+
+    # Act
+    await pipeline.handle(_job())
+
+    # Assert: table_markdown엔 채택된 1·3페이지만 구분자로 이어붙는다(2페이지 없음).
+    insert_args = pool.insert_calls()[0][1]
+    entities = json.loads(insert_args[6])
+    assert "(표1)" in entities["table_markdown"]
+    assert "(표3)" in entities["table_markdown"]
+    assert "지급결정 내역 산정" not in entities["table_markdown"]
+
+
+async def test_vlm_all_pages_fail_falls_back_to_pure_surya() -> None:
+    # Arrange: 2페이지 모두 VLM 실패 — masked_text는 전 페이지 surya 원문 그대로,
+    # table_markdown 키 자체가 없어야 한다(단일 페이지 케이스와 동일한 계약 유지).
+    pool = FakePool(existing=None)
+    producer = FakeProducer()
+    page1, page2 = "보험금 지급결과 안내문", "지급결정 내역"
+    processor = FakeProcessor(_multi_page_result(page1, page2))
+    vlm = _SequencedVlm([VlmClientError("연결 실패"), VlmClientError("연결 실패")])
+    pipeline = _pipeline(pool, producer, processor, vlm_transcribe=vlm)
+
+    # Act
+    await pipeline.handle(_job())
+
+    # Assert
+    insert_args = pool.insert_calls()[0][1]
+    masked_text = insert_args[4]
+    entities = json.loads(insert_args[6])
+    assert page1 in masked_text
+    assert page2 in masked_text
+    assert "table_markdown" not in entities
 
 
 # ── 저신뢰도 VLM 트리거 ──────────────────────────────────────────
