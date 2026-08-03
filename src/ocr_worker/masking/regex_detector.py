@@ -36,6 +36,7 @@ from ocr_worker.masking.patterns import (
     POLICY_NUMBER_VALUE_RE,
     RRN_RE,
     SIGNATURE_NAME_RE,
+    STAFF_NAME_RE,
     WARD_ROOM_KEYWORD_RE,
     WARD_ROOM_LOOKAHEAD,
     WARD_ROOM_VALUE_RE,
@@ -186,6 +187,7 @@ class RegexDetector:
             DOCTOR_NAME_COLON_RE,
             SIGNATURE_NAME_RE,
             PERSON_LABEL_NAME_RE,
+            STAFF_NAME_RE,
         ):
             for match in pattern.finditer(text):
                 name = match.group(1)

@@ -117,6 +117,24 @@ def test_masks_person_name_with_bold_markdown_label() -> None:
     # 별표(*)를 구분자로 흡수 못해 매칭이 끊긴 사례를 확인했다.
     masked = mask("| **환자 성명** | 이샘플 |")
     assert "[이름]" in masked
+
+
+def test_masks_staff_name_skipping_department_word() -> None:
+    # 실측(E2E): "발급담당자: 원무팀 최테스트"처럼 라벨과 이름 사이에 부서명이
+    # 끼면, 부서명("원무팀")을 이름으로 오인하거나 실제 이름("최테스트")을
+    # 놓치는 문제가 있었다 — 팀/과/부/실로 끝나는 부서명은 건너뛰고 잡는다.
+    # 부서명 자체는 PII가 아니므로 그대로 남아 있어야 한다.
+    masked = mask("발급담당자: 원무팀 최테스트")
+    assert "[이름]" in masked
+    assert "최테스트" not in masked
+    assert "원무팀" in masked
+
+
+def test_masks_staff_name_without_department_word() -> None:
+    # 부서명 없이 라벨 바로 뒤 이름이 오는 형태도 계속 잡혀야 한다.
+    masked = mask("담당자: 최테스트")
+    assert "[이름]" in masked
+    assert "최테스트" not in masked
     assert "이샘플" not in masked
 
 
