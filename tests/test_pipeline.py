@@ -352,6 +352,43 @@ async def test_vlm_residual_pii_discards_table_and_falls_back() -> None:
     assert len(producer.published) == 1
 
 
+async def test_vlm_backfills_domain_field_surya_missed() -> None:
+    # Arrange: surya 원문엔 KCD 코드도 병명 라벨도 없어 diagnosis_name이 None이지만,
+    # VLM이 더 깨끗하게 읽은 원문엔 라벨이 있어 실제로는 값이 존재한다 — surya의
+    # extract()가 못 찾은 필드를 VLM 채택 원문 재추출로 보강해야 한다.
+    pool = FakePool(existing=None)
+    producer = FakeProducer()
+    processor = FakeProcessor(_result("진단서 위염 관련 스캔 품질 낮음", confidence=0.5))
+    vlm = _RecordingVlm(text="진단서 상병명: 급성 위염")
+    pipeline = _pipeline(pool, producer, processor, vlm_transcribe=vlm)
+
+    # Act
+    await pipeline.handle(_job())
+
+    # Assert
+    insert_args = pool.insert_calls()[0][1]
+    entities = json.loads(insert_args[6])
+    assert entities["diagnosis_name"] == "급성 위염"
+
+
+async def test_vlm_does_not_overwrite_field_surya_already_found() -> None:
+    # Arrange: surya가 이미 KCD 코드를 찾았으면, VLM 원문에 다른 값이 있어도 surya
+    # 쪽 값을 유지한다(어느 쪽이 더 정확한지 비교할 근거가 없어 먼저 찾은 값 우선).
+    pool = FakePool(existing=None)
+    producer = FakeProducer()
+    processor = FakeProcessor(_result("진단서 A09.9 위염 스캔 품질 낮음", confidence=0.5))
+    vlm = _RecordingVlm(text="진단서 상병명: 급성 위염 J20.9")
+    pipeline = _pipeline(pool, producer, processor, vlm_transcribe=vlm)
+
+    # Act
+    await pipeline.handle(_job())
+
+    # Assert
+    insert_args = pool.insert_calls()[0][1]
+    entities = json.loads(insert_args[6])
+    assert entities["diagnosis_name"] == "A09.9"
+
+
 async def test_masked_lines_unaffected_by_vlm_path() -> None:
     # Arrange: VLM 성공 여부와 무관하게 masked_lines(이미지 마스킹 bbox)는 surya 기반 그대로.
     pool = FakePool(existing=None)

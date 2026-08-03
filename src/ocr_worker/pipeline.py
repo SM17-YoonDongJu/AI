@@ -221,7 +221,17 @@ class OcrPipeline:
             vlm_outcome = await self._extract_pages(images, result)
             if vlm_outcome is not None:
                 masked_text, quality_source_text, table_markdown = vlm_outcome
-                entities = {**entities, "table_markdown": table_markdown}
+                # extract()는 surya 원문에만 돌았던 상태라, surya가 못 뽑은(None) 필드도
+                # VLM이 더 깨끗하게 읽었으면 실제로는 값이 있는데 None으로 남을 수 있다.
+                # VLM 채택 원문에 extract()를 한 번 더 돌려 surya가 놓친 필드만 보강한다
+                # (surya가 이미 찾은 값은 덮어쓰지 않음 — 어느 쪽이 더 정확한지 비교할
+                # 근거가 없으므로 먼저 찾은 값을 우선한다).
+                vlm_entities = extract(analysis.doc_type, quality_source_text)
+                entities = {
+                    key: value if value is not None else vlm_entities.get(key)
+                    for key, value in entities.items()
+                }
+                entities["table_markdown"] = table_markdown
 
         # "재확인 필요" 판정: surya 신뢰도가 낮은데(문서 자체가 저품질) 사람 이름조차
         # 못 찾았거나 도메인 정보가 하나도 없으면, 자동 처리로는 신뢰할 수 없다고 본다.
