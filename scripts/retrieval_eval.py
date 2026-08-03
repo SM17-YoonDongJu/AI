@@ -10,7 +10,7 @@
     # 2) 임베더 B(bge)로 재적재 후 후보 덤프
     ... retrieval_eval.py --discover --dump scripts/benchmark/results/pool_bge.json --top-k 30
     # 3) 두 덤프 union → 라벨용 출력(<태그>=어느 임베더가 뽑았는지)
-    ... retrieval_eval.py --pool scripts/benchmark/results/pool_qwen.json scripts/benchmark/results/pool_bge.json
+    ... retrieval_eval.py --pool <results>/pool_qwen.json <results>/pool_bge.json
     # 4) cases.RETRIEVAL_GOLD 채운 뒤, 각 임베더로 채점(임베더 바꿀 때마다 재적재)
     ... retrieval_eval.py
 
@@ -28,6 +28,7 @@ from typing import Any
 
 from benchmark import retrieval
 from benchmark.cases import RETRIEVAL_GOLD
+
 from core.db import close_pool, init_pool
 from report_worker.rag.hybrid import close_pool as close_rag_pool
 
@@ -46,18 +47,21 @@ def _print_candidates(query: str, cands: list[dict], sources: dict[str, set[str]
         print(f"      {c['text_head']}")
 
 
+def _write_json(path: str, obj: object) -> None:
+    """블로킹 JSON 쓰기(sync — async 함수 밖에서 호출)."""
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 async def _discover(top_k: int, dump: str | None) -> None:
     cand = await retrieval.discover(RETRIEVAL_GOLD, top_k=top_k)
     for item in cand:
         _print_candidates(item["query"], item["candidates"], None)
     if dump:
-        p = Path(dump)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(cand, ensure_ascii=False, indent=2), encoding="utf-8")
+        _write_json(dump, cand)
         print(f"\n덤프 저장: {dump}  (다른 임베더 덤프와 --pool로 합쳐 라벨링)")
-    print(
-        f"\n{_BAR}\n→ 정답 [source_ref]를 골라 cases.RETRIEVAL_GOLD의 relevant_chunk_ids에 채우세요."
-    )
+    print(f"\n{_BAR}\n→ 정답 [source_ref]를 cases.RETRIEVAL_GOLD에 채우세요.")
 
 
 def _pool(paths: list[str]) -> None:
