@@ -33,7 +33,9 @@ VLM_TABLE_PROMPT = (
 GROUNDING_PROMPT = (
     "이 이미지에서 개인정보(사람 이름, 주민등록번호, 전화번호, 환자등록번호, 계좌번호, "
     "주소)가 적힌 위치를 찾아주세요. 각 항목마다 종류(label)와 위치를 bounding box로 "
-    "알려주세요. 좌표는 이미지 왼쪽 위를 (0,0), 오른쪽 아래를 (1000,1000)으로 "
+    "알려주세요. label은 문서에 적힌 표현(예: '환자 성명', '연락처')이 아니라 반드시 "
+    "다음 6개 단어 중 하나만 쓰세요: 이름, 주민등록번호, 전화번호, 환자등록번호, "
+    "계좌번호, 주소. 좌표는 이미지 왼쪽 위를 (0,0), 오른쪽 아래를 (1000,1000)으로 "
     "정규화해서 JSON 배열로만 답하세요. 형식: "
     '[{"label": "이름", "bbox": [x1,y1,x2,y2]}, ...] '
     "다른 설명 없이 JSON만 출력하세요. 개인정보가 없으면 빈 배열 []만 출력하세요."
@@ -142,6 +144,28 @@ async def ground_pii(image: PageImage) -> list[tuple[PiiLabel, tuple[int, int, i
     return _parse_grounding_boxes(text, image.width, image.height)
 
 
+# 실측 확인: VLM은 프롬프트가 지시한 단일 단어("이름") 대신 문서 자체의 필드 캡션을
+# 그대로 라벨로 쓰는 경향이 있다(예: "환자 성명", "연락처") — PiiLabel 값과 정확히
+# 일치하지 않아 엄격한 PiiLabel(raw_label)이 조용히 다 놓치는 사례를 실측으로 확인했다
+# (이름이 하나도 안 가려짐). 부분 문자열 매칭으로 완화한다.
+_LABEL_ALIASES: dict[PiiLabel, tuple[str, ...]] = {
+    PiiLabel.NAME: ("이름", "성명"),
+    PiiLabel.RRN: ("주민등록번호", "주민번호"),
+    PiiLabel.PHONE: ("전화번호", "연락처", "휴대전화", "휴대폰"),
+    PiiLabel.PATIENT_ID: ("환자등록번호", "환자번호", "접수번호"),
+    PiiLabel.ACCOUNT: ("계좌번호", "계좌"),
+    PiiLabel.ADDRESS: ("주소",),
+}
+
+
+def _match_label(raw_label: str) -> PiiLabel | None:
+    """VLM이 자유롭게 쓴 라벨 문자열을 ``PiiLabel``로 정규화한다(부분 문자열 매칭)."""
+    for label, aliases in _LABEL_ALIASES.items():
+        if any(alias in raw_label for alias in aliases):
+            return label
+    return None
+
+
 def _parse_grounding_boxes(
     text: str, width: int, height: int
 ) -> list[tuple[PiiLabel, tuple[int, int, int, int]]]:
@@ -167,10 +191,9 @@ def _parse_grounding_boxes(
         bbox = item.get("bbox")
         if not isinstance(raw_label, str) or not (isinstance(bbox, list) and len(bbox) == 4):
             continue
-        try:
-            label = PiiLabel(raw_label)
-        except ValueError:
-            continue  # 모델이 정의 안 된 라벨을 만들어낸 경우 — 무시
+        label = _match_label(raw_label)
+        if label is None:
+            continue  # 알려진 PII 분류와 매칭 안 됨 — 무시
         try:
             x1, y1, x2, y2 = (float(v) for v in bbox)
         except (TypeError, ValueError):

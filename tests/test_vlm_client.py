@@ -217,7 +217,7 @@ async def test_ground_pii_returns_empty_list_on_non_json_body() -> None:
 
 
 async def test_ground_pii_skips_items_with_unknown_label() -> None:
-    # Arrange: 모델이 정의 안 된 라벨을 만들어낸 경우 — 그 항목만 무시
+    # Arrange: 알려진 PII 분류와 전혀 매칭 안 되는 라벨 — 그 항목만 무시
     body = json.dumps(
         [
             {"label": "알수없는분류", "bbox": [0, 0, 100, 100]},
@@ -235,14 +235,16 @@ async def test_ground_pii_skips_items_with_unknown_label() -> None:
     assert boxes == [(PiiLabel.NAME, (1, 2, 3, 4))]
 
 
-async def test_ground_pii_skips_items_with_invalid_bbox() -> None:
-    # Arrange: 좌표 역전(x1>x2)·범위 밖(>1000)·길이 이상 항목은 무시하고 유효한 것만 채택
+async def test_ground_pii_matches_document_style_labels() -> None:
+    # Arrange — 실측 확인(E2E): 프롬프트가 "이름"만 쓰라고 지시해도 모델이 문서 자체의
+    # 필드 캡션("환자 성명", "연락처")을 그대로 라벨로 쓰는 사례가 있었다. 엄격한
+    # PiiLabel(raw_label) 매칭이던 시절엔 이런 라벨이 전부 조용히 드롭돼 이름이 하나도
+    # 안 가려지는 실제 회귀가 있었다 — 부분 문자열 매칭으로 잡아야 한다.
     body = json.dumps(
         [
-            {"label": "이름", "bbox": [300, 200, 100, 400]},  # x1 > x2
-            {"label": "전화번호", "bbox": [0, 0, 1500, 100]},  # 범위 밖
-            {"label": "주소", "bbox": [0, 0, 100]},  # 길이 3
-            {"label": "이메일", "bbox": [100, 200, 300, 400]},  # 유효
+            {"label": "환자 성명", "bbox": [100, 200, 300, 400]},
+            {"label": "연락처", "bbox": [500, 200, 700, 400]},
+            {"label": "환자등록번호", "bbox": [100, 500, 300, 700]},
         ]
     )
 
@@ -253,4 +255,29 @@ async def test_ground_pii_skips_items_with_invalid_bbox() -> None:
 
     boxes = await vlm_client.ground_pii(_image())
 
-    assert boxes == [(PiiLabel.EMAIL, (1, 2, 3, 4))]
+    assert boxes == [
+        (PiiLabel.NAME, (1, 2, 3, 4)),
+        (PiiLabel.PHONE, (5, 2, 7, 4)),
+        (PiiLabel.PATIENT_ID, (1, 5, 3, 7)),
+    ]
+
+
+async def test_ground_pii_skips_items_with_invalid_bbox() -> None:
+    # Arrange: 좌표 역전(x1>x2)·범위 밖(>1000)·길이 이상 항목은 무시하고 유효한 것만 채택
+    body = json.dumps(
+        [
+            {"label": "이름", "bbox": [300, 200, 100, 400]},  # x1 > x2
+            {"label": "전화번호", "bbox": [0, 0, 1500, 100]},  # 범위 밖
+            {"label": "주소", "bbox": [0, 0, 100]},  # 길이 3
+            {"label": "계좌번호", "bbox": [100, 200, 300, 400]},  # 유효
+        ]
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"response": body})
+
+    _install_mock(handler)
+
+    boxes = await vlm_client.ground_pii(_image())
+
+    assert boxes == [(PiiLabel.ACCOUNT, (1, 2, 3, 4))]
