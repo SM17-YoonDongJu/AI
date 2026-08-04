@@ -50,6 +50,18 @@ def test_diagnosis_name_none_when_no_kcd_and_no_label() -> None:
     assert entities == {"diagnosis_name": None, "icd": None}
 
 
+def test_diagnosis_name_discarded_when_label_line_merges_pii() -> None:
+    # Arrange — 코드리뷰 지적(실측 가능성): OCR이 인접 셀을 한 줄로 병합하면
+    # "병명" 라벨의 [^\n]+ 캡처가 뒤에 오는 "성명: 홍길동"까지 통째로 삼킬 수 있다.
+    # 폴백 후보에 PII가 섞이면 절대 저장하지 않고 통째로 버려야 한다.
+    text = "병명: 급성 기관지염 성명: 홍길동"
+    # Act
+    entities = extract(DocType.DIAGNOSIS, text)
+    # Assert — PII 오염된 후보는 버려서 None(부분 편집이 아니라 통째 폐기)
+    assert entities["diagnosis_name"] is None
+    assert "홍길동" not in repr(entities)
+
+
 # ── 보험증권: insurer / product ─────────────────────────────────
 
 
@@ -69,6 +81,17 @@ def test_policy_fields_none_when_absent() -> None:
     entities = extract(DocType.POLICY, text)
     # Assert
     assert entities == {"insurer": None, "product": None}
+
+
+def test_product_falls_back_when_label_line_merges_pii() -> None:
+    # Arrange — "상품명" 라벨 값에 계약자 이름이 같은 줄로 병합된 경우, 그 값은
+    # 버리고 PII 혼입 위험이 없는 "무배당…보험" 폴백 패턴으로 다시 찾는다.
+    text = "상품명: 계약자 홍길동 무배당 든든종신보험"
+    # Act
+    entities = extract(DocType.POLICY, text)
+    # Assert
+    assert entities["product"] == "무배당 든든종신보험"
+    assert "홍길동" not in repr(entities)
 
 
 # ── 지급결과안내문: payout_amount(참고값) ───────────────────────

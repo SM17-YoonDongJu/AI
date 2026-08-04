@@ -293,25 +293,23 @@ indices = pii_line_indices(page, spans, order, self._labels)
 
 `pii_line_indices`도 `ranges = _line_char_ranges(page, order)`를 쓰도록 수정(딕셔너리 순회로 변경).
 
-**`repository.py`의 `build_masked_lines`도 같은 탐지·매핑을 재사용**하도록 변경 — 라인을 독립적으로 `mask()`하는 대신, `image_masker`의 `_reading_order`/`_line_char_ranges`/`pii_line_indices`를 import해서 **어느 라인이 PII에 걸리는지 판정을 공유**하고, 걸리는 라인은 전체 라인 텍스트를 `mask(line.text)`(이미 PII가 그 라인 자체에 있으면 정상 치환) 또는 그래도 전혀 안 걸리면 원문 그대로 둔다. 이렇게 하면 이미지 검은블록과 DB `masked_lines`가 **같은 판정 기준**을 공유해 둘 사이 불일치가 없어진다.
+**`repository.py`의 `build_masked_lines`도 같은 탐지를 재사용**하도록 변경. **정정(코드리뷰 지적, 실측 확인)**: 최초 구현은 "어느 라인이 PII인가"만 페이지 컨텍스트로 판정하고, 실제 치환은 라인 텍스트만 떼어 `mask(line.text)`를 다시 돌렸다 — 값만 있는 라인은 라벨 컨텍스트가 없어 재검출이 실패해 원문이 그대로 남는 경로가 있었다. 최종 구현은 재검출 없이, 페이지에서 검출한 스팬을 `line_local_spans`로 라인별 로컬 오프셋으로 잘라 `apply_mask`로 직접 치환한다(아래가 최종 코드).
 
 ```python
-def build_masked_lines(
-    result: OcrResult, mask: Callable[[str], str], detect: DetectFn
-) -> list[dict[str, object]]:
+def build_masked_lines(result: OcrResult, detect: DetectFn) -> list[dict[str, object]]:
     lines: list[dict[str, object]] = []
     for page in result.pages:
-        order = _reading_order(page)
-        spans = detect(_reading_order_text(page, order))
-        pii_indices = pii_line_indices(page, spans, order)
+        order = reading_order(page)
+        spans = detect(reading_order_text(page, order))
+        local_spans = line_local_spans(page, spans, order)
         for index, line in enumerate(page.lines):
-            text = mask(line.text) if index in pii_indices else line.text
+            text = apply_mask(line.text, local_spans[index]) if index in local_spans else line.text
             lines.append({"masked_text": text, "bbox": list(line.bbox),
                           "polygon": [list(p) for p in line.polygon], "confidence": line.confidence})
     return lines
 ```
 
-`build_masked_lines` 호출부(`pipeline.py`의 `_analyze`)에 `detect=self._masker.detect` 인자 추가.
+`build_masked_lines` 호출부(`pipeline.py`의 `_analyze`)는 `mask` 인자 없이 `detect=self._masker.detect`만 넘긴다.
 
 ### 5.3 `.claude/docs/contracts.md`의 "알려진 한계" 문구 정정
 

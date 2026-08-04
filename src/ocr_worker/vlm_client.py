@@ -80,5 +80,8 @@ async def transcribe_table(image: PageImage) -> str:
         return resp.json()["response"]
     except httpx.HTTPError as exc:
         raise VlmClientError("VLM 표 전사 호출 실패") from exc
-    except (KeyError, TypeError) as exc:
+    except (KeyError, TypeError, ValueError) as exc:
+        # ValueError: resp.json()이 비-JSON 본문에서 던지는 json.JSONDecodeError 포함.
+        # 여기서 변환 안 하면 예외가 그대로 전파돼 pipeline._extract_pages의 surya
+        # 폴백을 못 타고 작업 자체가 실패한다(코드리뷰 지적).
         raise VlmClientError("VLM 응답 형식이 올바르지 않음") from exc

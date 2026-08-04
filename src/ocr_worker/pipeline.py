@@ -86,23 +86,31 @@ def _looks_grounded(vlm_text: str, source_text: str) -> bool:
     """
     vlm_tokens = set(_TOKEN_RE.findall(vlm_text))
     if not vlm_tokens:
-        return True  # 빈 결과는 마스킹 검증 등 다른 경로에서 처리
+        # 빈 VLM 결과를 grounded로 처리하면 _extract_pages가 이 페이지를 "채택"으로
+        # 표시하고, 검증된 surya 텍스트를 빈 문자열로 덮어써버린다(실제 유실).
+        # 빈 결과는 실패로 취급해 surya 폴백을 타게 한다.
+        return False
     source_tokens = set(_TOKEN_RE.findall(source_text))
     overlap = len(vlm_tokens & source_tokens) / len(vlm_tokens)
     return overlap >= _MIN_GROUNDED_OVERLAP
 
 
 def _missing_domain_info(entities: dict[str, object]) -> bool:
-    """extract()(+VLM table_markdown)로 뽑힌 값이 하나도 없는지 확인한다.
+    """extract()로 뽑힌 doc_type 고유 엔티티가 하나도 없는지 확인한다.
 
     "재확인 필요" 판정 신호 중 하나. doc_type별 필수 필드 정책을 새로 만들지 않고
     이미 있는 추출 결과를 재사용한다 — 알려진 한계: entities 필드가 1개뿐인 CLAIM
     (payout_amount 하나)은 그 필드가 원래 없는 양식이어도 오탐할 수 있다. DIAGNOSIS는
     diagnosis_name/icd 두 필드 중 하나라도 있으면 통과하므로 상대적으로 덜 취약하다.
+
+    ``table_markdown``은 이 판정에서 제외한다(코드리뷰 지적) — VLM이 채택되면 페이지
+    전사 원문이 거의 항상 채워지므로, 이를 도메인 정보로 세면 실제 doc_type 필드가
+    하나도 안 뽑힌 저신뢰도 문서도 표 문서라는 이유만으로 늘 통과해버린다.
     """
-    if not entities:
+    domain_entities = {key: value for key, value in entities.items() if key != "table_markdown"}
+    if not domain_entities:
         return True
-    return all(v is None for v in entities.values())
+    return all(v is None for v in domain_entities.values())
 
 
 def _masked_image_key(job_id: str, page_index: int) -> str:

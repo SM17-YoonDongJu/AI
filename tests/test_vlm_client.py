@@ -109,6 +109,20 @@ async def test_transcribe_table_wraps_malformed_response() -> None:
         await vlm_client.transcribe_table(_image())
 
 
+async def test_transcribe_table_wraps_non_json_response() -> None:
+    # Arrange — 코드리뷰 지적: resp.json()이 던지는 JSONDecodeError(ValueError 하위)가
+    # 그대로 전파되면 VlmClientError로 안 잡혀 pipeline._extract_pages의 surya 폴백을
+    # 못 타고 작업 자체가 실패한다(예: ollama 앞단 프록시가 에러 페이지를 200으로 반환).
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="<html>error</html>")
+
+    _install_mock(handler)
+
+    # Act / Assert
+    with pytest.raises(vlm_client.VlmClientError):
+        await vlm_client.transcribe_table(_image())
+
+
 async def test_transcribe_table_wraps_connect_error() -> None:
     # Arrange: 타임아웃/연결 실패
     def handler(request: httpx.Request) -> httpx.Response:

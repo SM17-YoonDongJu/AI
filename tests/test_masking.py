@@ -138,6 +138,14 @@ def test_masks_staff_name_without_department_word() -> None:
     assert "이샘플" not in masked
 
 
+def test_staff_department_without_name_is_not_masked() -> None:
+    # 코드리뷰 지적: 부서명 그룹이 옵셔널이라, 이름 없이 부서명으로 끝나면
+    # 옵셔널 그룹을 건너뛰고 부서명 자체가 이름 그룹으로 오탐될 수 있었다.
+    masked = mask("담당자: 원무팀")
+    assert "[이름]" not in masked
+    assert "원무팀" in masked
+
+
 def test_masks_beneficiary_name() -> None:
     masked = mask("예금주 최테스트 계좌로 입금")
     assert "[이름]" in masked

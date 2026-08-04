@@ -19,6 +19,7 @@ import re
 from datetime import date
 
 from core.contracts import DocType
+from ocr_worker.masking.regex_detector import RegexDetector
 
 # ── KCD(한국표준질병사인분류) 코드 ──────────────────────────────
 # 영문 1 + 숫자 2 (+ 선택 소수점 1자리). 예: S82, S82.1, J20.9. 앞뒤 영숫자 경계로
@@ -75,6 +76,19 @@ DISCHARGE_DATE_RE = re.compile(rf"퇴원\s*일자?\s*[:：]?\s*{_DATE_RE}")  # n
 SURGERY_LABEL_RE = re.compile(r"수술\s*명\s*[:：]?\s*([^\n]+)")  # noqa: RUF001
 _SURGERY_NEGATIONS = frozenset({"없음", "해당없음", "해당 없음", "무", "-", "x", "X"})
 
+# ── 라벨 폴백 후보의 PII 오염 검사 ──────────────────────────────
+# DIAGNOSIS_LABEL_RE·PRODUCT_LABEL_RE의 [^\n]+는 라벨 뒤 줄 끝까지 통째로 캡처한다.
+# OCR이 인접 셀을 한 줄로 병합하면(예: "병명: 급성 기관지염 성명: 홍길동") 이름 같은
+# PII가 같이 캡처될 수 있다 — 마스킹(§13)은 이 값을 검사하지 않으므로 여기서 직접
+# 걸러야 한다. RegexDetector만 쓴다(정규식 전용, NER 모델 로드 없음 — extract()는
+# 순수·경량이어야 함).
+_PII_DETECTOR = RegexDetector()
+
+
+def _pii_free(candidate: str) -> str | None:
+    """후보 문자열에 PII가 섞여 있으면 통째로 버린다(부분 편집 없음, 실측 확인)."""
+    return None if _PII_DETECTOR.detect(candidate) else candidate
+
 
 def _extract_kcd(text: str) -> str | None:
     """첫 KCD 코드를 반환한다(없으면 None)."""
@@ -93,7 +107,9 @@ def _extract_diagnosis_name(text: str) -> str | None:
     if kcd is not None:
         return kcd
     label = DIAGNOSIS_LABEL_RE.search(text)
-    return label.group(1).strip()[:DIAGNOSIS_NAME_MAX_LEN] if label else None
+    if label is None:
+        return None
+    return _pii_free(label.group(1).strip()[:DIAGNOSIS_NAME_MAX_LEN])
 
 
 def _extract_insurer(text: str) -> str | None:
@@ -103,10 +119,16 @@ def _extract_insurer(text: str) -> str | None:
 
 
 def _extract_product(text: str) -> str | None:
-    """상품명을 반환한다('상품명' 라벨 우선, 없으면 '무배당…보험' 폴백, 둘 다 없으면 None)."""
+    """상품명을 반환한다('상품명' 라벨 우선, 없으면 '무배당…보험' 폴백, 둘 다 없으면 None).
+
+    라벨 값이 PII로 오염됐으면(같은 줄에 다른 항목이 병합된 경우) 그 값은 버리고
+    폴백 패턴으로 다시 시도한다 — 폴백은 "무배당…보험" 구조만 매칭해 PII 혼입 위험이 없다.
+    """
     label = PRODUCT_LABEL_RE.search(text)
     if label is not None:
-        return label.group(1).strip()[:PRODUCT_MAX_LEN]
+        candidate = _pii_free(label.group(1).strip()[:PRODUCT_MAX_LEN])
+        if candidate is not None:
+            return candidate
     fallback = PRODUCT_FALLBACK_RE.search(text)
     return fallback.group(1).strip() if fallback else None
 

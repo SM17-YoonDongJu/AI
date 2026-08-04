@@ -562,6 +562,28 @@ async def test_vlm_ungrounded_result_discarded_and_falls_back_to_surya() -> None
     assert "table_markdown" not in entities
 
 
+async def test_vlm_empty_result_treated_as_ungrounded_not_adopted() -> None:
+    # Arrange — 코드리뷰 지적: 빈 VLM 응답(토큰 없음)을 grounded로 처리하면 이 페이지가
+    # "채택"으로 표시되고 검증된 surya 텍스트가 빈 문자열로 덮어써진다(실유실). 빈 결과도
+    # 실패로 취급해 surya 폴백이 유지돼야 한다.
+    pool = FakePool(existing=None)
+    producer = FakeProducer()
+    processor = FakeProcessor(_result(*_PAYOUT_TEXTS))
+    vlm = _RecordingVlm(text="")
+    pipeline = _pipeline(pool, producer, processor, vlm_transcribe=vlm)
+
+    # Act
+    await pipeline.handle(_job())
+
+    # Assert
+    assert vlm.called is True
+    insert_args = pool.insert_calls()[0][1]
+    masked_text = insert_args[4]
+    entities = json.loads(insert_args[6])
+    assert "지급결정" in masked_text  # surya 원문 유지(빈 VLM 결과 폐기)
+    assert "table_markdown" not in entities
+
+
 # ── "재확인 필요"(ocr_quality) 판정 ──────────────────────────────
 async def test_ocr_quality_needs_reupload_when_low_confidence_no_name_no_domain_info() -> None:
     # Arrange: 신뢰도 낮음 + 이름·도메인 정보(보험사·상품명) 전무. 저신뢰도는 VLM도
@@ -600,6 +622,31 @@ async def test_ocr_quality_needs_reupload_when_name_present_but_domain_info_miss
     # Assert
     insert_args = pool.insert_calls()[0][1]
     assert insert_args[8] == "needs_reupload"
+
+
+async def test_ocr_quality_needs_reupload_when_vlm_adopted_but_no_domain_entities() -> None:
+    # Arrange — 코드리뷰 지적: VLM이 채택되면 entities.table_markdown이 거의 항상
+    # 채워지는데, 이를 도메인 정보로 세면 doc_type 고유 필드(admission_days/surgery)가
+    # 하나도 안 뽑힌 저신뢰도 문서도 "표 문서라 VLM이 성공했다"는 이유만으로 ok가
+    # 되어버렸다. 이름은 있지만 도메인 필드는 전무한 입퇴원확인서로 재현한다
+    # (HOSPITALIZATION_CERT는 표 문서 유형이라 VLM이 항상 시도됨).
+    pool = FakePool(existing=None)
+    producer = FakeProducer()
+    processor = FakeProcessor(_result("입원확인서", "환자 성명 홍길동", confidence=0.5))
+    vlm = _RecordingVlm(text="입원확인서 환자 성명 홍길동 입원사실을 확인합니다")
+    pipeline = _pipeline(pool, producer, processor, vlm_transcribe=vlm)
+
+    # Act
+    await pipeline.handle(_job())
+
+    # Assert
+    assert vlm.called is True
+    insert_args = pool.insert_calls()[0][1]
+    entities = json.loads(insert_args[6])
+    assert "table_markdown" in entities  # VLM은 채택됨
+    assert entities["admission_days"] is None
+    assert entities["surgery"] is None
+    assert insert_args[8] == "needs_reupload"  # table_markdown만으로 domain info 인정 안 함
 
 
 async def test_ocr_quality_ok_when_low_confidence_but_name_and_domain_info_present() -> None:
