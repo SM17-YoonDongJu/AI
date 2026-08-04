@@ -1,14 +1,16 @@
 """이미지 마스킹 트랙 단위 테스트 (이슈 #18).
 
-PIL 없이 검증한다 — "어느 라인이 PII인가"(``pii_line_indices``)는 순수 함수이고,
-``ImageMasker``는 detect·redactor를 주입해 렌더(PIL)를 배제한 채 오케스트레이션만 본다.
-스팬은 실제 검출 대신 오프셋·라벨을 직접 만들어 라인 매핑 로직을 고립 검증한다.
+PIL 없이 검증한다 — "어느 라인이 PII인가"(``pii_line_indices``)와 "그 라인 어느
+구간이 PII인가"(``line_local_spans``)는 순수 함수이고, ``ImageMasker``는 detect·
+redactor를 주입해 렌더(PIL)를 배제한 채 오케스트레이션만 본다. 스팬은 실제 검출
+대신 오프셋·라벨을 직접 만들어 라인 매핑 로직을 고립 검증한다.
 """
 
 import pytest
 
 from ocr_worker.masking.image_masker import (
     ImageMasker,
+    line_local_spans,
     pii_line_indices,
     reading_order,
     reading_order_text,
@@ -107,6 +109,57 @@ def test_pii_line_indices_maps_back_to_original_index_after_reorder() -> None:
     indices = pii_line_indices(page, [Span(start, start + 6, PiiLabel.NAME)], order)
 
     assert indices == {0}  # "target"의 원래 라인 인덱스(0)를 정확히 되짚는다
+
+
+# ── line_local_spans (순수) ───────────────────────────────────────
+def test_line_local_span_has_line_local_offset() -> None:
+    page = _page(["aaaa", "bbbb", "cccc"])
+    order = reading_order(page)
+
+    # line1 = [5,9) 안의 스팬 [5,7) → 라인 로컬 오프셋으로는 [0,2)
+    result = line_local_spans(page, [Span(5, 7, PiiLabel.NAME)], order)
+
+    assert result == {1: [Span(0, 2, PiiLabel.NAME)]}
+
+
+def test_line_local_span_crossing_newline_clips_each_line() -> None:
+    page = _page(["aaaa", "bbbb", "cccc"])
+    order = reading_order(page)
+
+    # [3,6)은 line0([0,4))과 line1([5,9)) 양쪽에 걸침 → 각자 라인 로컬 오프셋으로 클리핑
+    result = line_local_spans(page, [Span(3, 6, PiiLabel.RRN)], order)
+
+    assert result == {
+        0: [Span(3, 4, PiiLabel.RRN)],
+        1: [Span(0, 1, PiiLabel.RRN)],
+    }
+
+
+def test_line_local_spans_no_spans_returns_empty_dict() -> None:
+    page = _page(["aaaa", "bbbb"])
+
+    assert line_local_spans(page, [], reading_order(page)) == {}
+
+
+def test_line_local_spans_maps_back_to_original_index_after_reorder() -> None:
+    # 리딩오더로는 "label"(원래 인덱스1)이 먼저, "target"(원래 인덱스0)이 나중.
+    page = OcrPage(
+        index=0,
+        width=100,
+        height=50,
+        lines=(
+            _line("target", bbox=(0.0, 10.0, 10.0, 15.0)),  # 원래 인덱스 0
+            _line("label", bbox=(0.0, 0.0, 10.0, 5.0)),  # 원래 인덱스 1
+        ),
+    )
+    order = reading_order(page)  # [1, 0] → 조인 텍스트 "label\ntarget"
+    text = reading_order_text(page, order)
+    start = text.index("target")
+
+    result = line_local_spans(page, [Span(start, start + 6, PiiLabel.NAME)], order)
+
+    # "target"의 원래 라인 인덱스(0)로 되짚되, 로컬 오프셋은 그 라인 기준 [0,6)
+    assert result == {0: [Span(0, 6, PiiLabel.NAME)]}
 
 
 # ── ImageMasker 오케스트레이션 (PIL 없이, 주입) ──────────────────

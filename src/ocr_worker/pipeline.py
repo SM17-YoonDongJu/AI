@@ -347,7 +347,7 @@ class OcrPipeline:
         entities = extract(classification.doc_type, result.full_text)
         masked_text = self._masker.mask(result.full_text)
         assert_no_residual(masked_text)  # 고민감 PII 잔류 시 MaskingError(전파 → DLQ)
-        masked_lines = build_masked_lines(result, self._masker.mask, self._masker.detect)
+        masked_lines = build_masked_lines(result, self._masker.detect)
         return _Analysis(
             doc_type=classification.doc_type,
             doc_type_confidence=classification.confidence,

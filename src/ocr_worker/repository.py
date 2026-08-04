@@ -16,7 +16,6 @@ OCR·분류·추출·마스킹의 산출물을 ``ocr_results``(contracts.md §3)
 
 import json
 import uuid
-from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import asyncpg
@@ -25,10 +24,11 @@ from core.contracts import DocType
 from core.logging import get_logger
 from ocr_worker.masking.image_masker import (
     DetectFn,
-    pii_line_indices,
+    line_local_spans,
     reading_order,
     reading_order_text,
 )
+from ocr_worker.masking.spans import apply_mask
 from ocr_worker.ocr import OcrResult
 
 logger = get_logger(__name__)
@@ -86,21 +86,20 @@ class OcrResultRecord:
     ocr_quality: str = "ok"
 
 
-def build_masked_lines(
-    result: OcrResult, mask: Callable[[str], str], detect: DetectFn
-) -> list[dict[str, object]]:
+def build_masked_lines(result: OcrResult, detect: DetectFn) -> list[dict[str, object]]:
     """OCR 라인 좌표를 보존하되 텍스트만 마스킹해 ``masked_lines`` 구조를 만든다.
 
-    라인을 완전히 독립적으로 마스킹하면 라벨과 값이 다른 라인으로 쪼개진 PII(예:
-    "환자의 성명" 라인과 실제 이름 라인이 분리)를 놓친다. 이미지 마스킹 트랙
-    (``ImageMasker.redact_pages``)과 같은 판정 로직(``reading_order``·``pii_line_indices``)을
-    공유해, 페이지 단위(리딩오더 정렬)로 탐지한 뒤 스팬이 걸친 라인은 전체를 마스킹한다
-    — 검은블럭 이미지와 이 DB 컬럼이 같은 기준으로 PII 라인을 판정하게 된다.
+    라인을 완전히 독립적으로 재검출하면 라벨과 값이 다른 라인으로 쪼개진 PII(예:
+    "환자의 성명" 라인과 실제 이름 라인이 분리)를 놓친다 — 값만 있는 라인은 라벨
+    컨텍스트가 없어 앵커 정규식이 매칭되지 않을 수 있다(실측 확인). 그래서 페이지
+    단위(리딩오더 정렬)로 한 번만 탐지하고, 그 스팬을 라인별 로컬 오프셋으로 잘라
+    (``line_local_spans``) **재검출 없이 그대로** 치환(``apply_mask``)한다 — "어느
+    라인이 PII인가" 판정과 "그 라인의 어느 구간을 지울까"가 같은 스팬에서 나오므로
+    이미지 마스킹(``ImageMasker.redact_pages``)과도 항상 같은 기준을 공유한다.
 
     Args:
         result: 문서 전체 OCR 결과(페이지·라인 좌표 보유).
-        mask: 텍스트 → 마스킹 텍스트 함수(예: ``Masker.mask``).
-        detect: 텍스트 → PII 스팬 함수(예: ``Masker.detect``). 페이지 단위 판정에 쓴다.
+        detect: 텍스트 → PII 스팬 함수(예: ``Masker.detect``). 페이지 단위 탐지에 쓴다.
 
     Returns:
         ``[{masked_text, bbox, polygon, confidence}, ...]`` (jsonb 직렬화 가능).
@@ -109,9 +108,9 @@ def build_masked_lines(
     for page in result.pages:
         order = reading_order(page)
         spans = detect(reading_order_text(page, order))
-        pii_indices = pii_line_indices(page, spans, order)
+        local_spans = line_local_spans(page, spans, order)
         for index, line in enumerate(page.lines):
-            text = mask(line.text) if index in pii_indices else line.text
+            text = apply_mask(line.text, local_spans[index]) if index in local_spans else line.text
             lines.append(
                 {
                     "masked_text": text,

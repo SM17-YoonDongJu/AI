@@ -8,8 +8,9 @@
   치환과 이미지 좌표 마스킹이 한 번의 탐지를 공유한다.
 - **좌표만 사용**: 라인의 ``bbox``/``polygon``(PII 아님)으로 가릴 영역을 정한다. 텍스트
   자체는 노출하지 않는다.
-- **순수/렌더 분리**: "어느 라인이 PII인가"(``pii_line_indices``)는 순수 함수라 PIL 없이
-  테스트하고, PIL 렌더(``redact_page_image``)는 lazy import로 격리한다(배포 의존).
+- **순수/렌더 분리**: "어느 라인이 PII인가"(``pii_line_indices``)와 "그 라인 어느 구간이
+  PII인가"(``line_local_spans``)는 순수 함수라 PIL 없이 테스트하고, PIL 렌더
+  (``redact_page_image``)는 lazy import로 격리한다(배포 의존).
 - **소비자 프로파일**: ``labels``로 가릴 PII 분류를 제한할 수 있다(예: 고유식별정보만
   가리고 성명은 유지). ``None``이면 모든 PII.
 """
@@ -92,6 +93,37 @@ def pii_line_indices(
             if span.start < end and span.end > start:  # 범위 겹침
                 indices.add(index)
     return indices
+
+
+def line_local_spans(page: OcrPage, spans: list[Span], order: list[int]) -> dict[int, list[Span]]:
+    """PII 스팬을 겹치는 라인마다 그 라인의 로컬 오프셋으로 잘라 반환한다.
+
+    ``pii_line_indices``가 "어느 라인이 PII인가"만 답한다면, 이 함수는 "그 라인의
+    어느 구간이 PII인가"까지 답한다 — 라인을 다시 통째로 재검출(``mask(line.text)``)하지
+    않고 페이지 컨텍스트로 이미 검출한 스팬을 그대로 재사용해 라인 단위로 치환할 수
+    있게 한다(라벨과 값이 다른 줄로 쪼개진 경우, 값만 있는 라인은 컨텍스트 없이 재검출하면
+    못 잡을 수 있다 — 실측 확인).
+
+    Args:
+        page: OCR 페이지(라인 텍스트·좌표 보유).
+        spans: ``reading_order_text(page, order)``에서 검출된 PII 스팬.
+        order: ``reading_order(page)``가 반환한 정렬 순서(스팬 오프셋 계산과 일치해야 함).
+
+    Returns:
+        원래 라인 인덱스 → 그 라인 로컬 좌표로 클리핑된 스팬 목록. 겹치는 스팬이
+        없는 라인은 키 자체가 없다(``apply_mask``에 그대로 넘길 수 있는 형태).
+    """
+    ranges = _line_char_ranges(page, order)
+    result: dict[int, list[Span]] = {}
+    for span in spans:
+        for index, (start, end) in ranges.items():
+            if span.start < end and span.end > start:  # 범위 겹침
+                local_start = max(span.start, start) - start
+                local_end = min(span.end, end) - start
+                result.setdefault(index, []).append(
+                    Span(local_start, local_end, span.label, span.source, span.score)
+                )
+    return result
 
 
 def redact_page_image(
