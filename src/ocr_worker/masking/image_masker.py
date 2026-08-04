@@ -13,9 +13,14 @@
   (``redact_page_image``)는 lazy import로 격리한다(배포 의존).
 - **소비자 프로파일**: ``labels``로 가릴 PII 분류를 제한할 수 있다(예: 고유식별정보만
   가리고 성명은 유지). ``None``이면 모든 PII.
+- **VLM grounding 보강(선택)**: surya가 텍스트를 완전히 다른 문자로 오독하면 라인 기반
+  검출로는 그 라인을 PII로 못 잡는다 — ``ground``를 주입하면 저신뢰도 문서에서 VLM이
+  이미지에서 직접 짚은 PII 위치를 라인 기반 검은블록에 **추가**한다(대체 아님). 실패해도
+  기존 안전성보다 후퇴하지 않는다.
 """
 
-from collections.abc import Callable
+import asyncio
+from collections.abc import Awaitable, Callable
 
 from ocr_worker.masking.masker import Masker
 from ocr_worker.masking.spans import PiiLabel, Span
@@ -28,9 +33,13 @@ _REDACT_FILL = (0, 0, 0)
 # OCR bbox는 글자에 빡빡하게 잡혀 가장자리 획이 샐 수 있다 → 여백을 줘 확실히 덮는다
 # (노션 "이미지 마스킹 상세" 5.1: bbox 여백 = 원본보다 일정 픽셀 확장).
 BBOX_MARGIN_PX = 3
+# VLM grounding 좌표는 surya bbox보다 픽셀 정밀도가 떨어진다(실측: 글자 하나가 잘리는
+# 정도의 언더슈트) — 더 넉넉한 여백을 준다.
+VLM_BBOX_MARGIN_PX = 15
 
 type DetectFn = Callable[[str], list[Span]]
-type RedactFn = Callable[[PageImage, OcrPage, set[int]], PageImage]
+type GroundFn = Callable[[PageImage], Awaitable[list[tuple[PiiLabel, tuple[int, int, int, int]]]]]
+type RedactFn = Callable[[PageImage, OcrPage, set[int], list[tuple[int, int, int, int]]], PageImage]
 
 
 def reading_order(page: OcrPage) -> list[int]:
@@ -127,13 +136,22 @@ def line_local_spans(page: OcrPage, spans: list[Span], order: list[int]) -> dict
 
 
 def redact_page_image(
-    image: PageImage, page: OcrPage, line_indices: set[int], *, margin_px: int = BBOX_MARGIN_PX
+    image: PageImage,
+    page: OcrPage,
+    line_indices: set[int],
+    extra_boxes: list[tuple[int, int, int, int]],
+    *,
+    margin_px: int = BBOX_MARGIN_PX,
+    extra_margin_px: int = VLM_BBOX_MARGIN_PX,
 ) -> PageImage:
-    """지정 라인을 검은블럭으로 가린 페이지 이미지 **사본**을 반환한다(PIL, lazy).
+    """지정 라인·좌표를 검은블럭으로 가린 페이지 이미지 **사본**을 반환한다(PIL, lazy).
 
     A안(줄 전체 검게): 라인의 축정렬 ``bbox``를 ``margin_px``만큼 확장해 채운다 —
     축정렬 사각형이라 기울어진 글자도 빠짐없이 덮고(과마스킹 무방), 5.1 커버리지
     검사에서 bbox 영역이 100%에 가깝게 가려진다. 원본은 변형하지 않는다(사본에 그린다).
+
+    ``extra_boxes``(VLM grounding 결과, 픽셀 좌표)는 라인 인덱스와 무관하게 추가로
+    가린다 — surya 라인 자체가 없거나 오독으로 PII 판정에서 빠진 영역을 보완한다.
     """
     from PIL import ImageDraw
 
@@ -147,6 +165,14 @@ def redact_page_image(
             max(0, int(y0) - margin_px),
             min(width, int(x1) + margin_px),
             min(height, int(y1) + margin_px),
+        )
+        draw.rectangle(rect, fill=_REDACT_FILL)
+    for x0, y0, x1, y1 in extra_boxes:
+        rect = (
+            max(0, x0 - extra_margin_px),
+            max(0, y0 - extra_margin_px),
+            min(width, x1 + extra_margin_px),
+            min(height, y1 + extra_margin_px),
         )
         draw.rectangle(rect, fill=_REDACT_FILL)
     return redacted
@@ -174,41 +200,91 @@ class ImageMasker:
         detect: DetectFn | None = None,
         redactor: RedactFn | None = None,
         labels: set[PiiLabel] | None = None,
+        ground: GroundFn | None = None,
+        ground_confidence_threshold: float = 0.0,
     ) -> None:
         """이미지 마스커를 구성한다.
 
         Args:
             detect: 텍스트 → 스팬 검출 함수. 기본은 ``Masker().detect``(정규식+USE_NER).
-            redactor: 라인 검은블럭 렌더 함수. 기본은 ``redact_page_image``.
+            redactor: 라인·좌표 검은블럭 렌더 함수. 기본은 ``redact_page_image``.
             labels: 가릴 PII 분류. ``None``이면 모든 PII(소비자 프로파일 확장점).
+            ground: 이미지 → VLM grounding 결과 함수(``vlm_client.ground_pii``). ``None``이면
+                grounding을 아예 시도하지 않는다(비용·지연시간 없음, 기존 동작과 동일).
+            ground_confidence_threshold: ``result.mean_confidence``가 이 값 미만일 때만
+                grounding을 시도한다(고신뢰 문서는 surya 자체 검출로 충분해 비용 절약).
+                기본 0.0은 "항상 시도 안 함"과 같다 — 실제로 켜려면 호출측이 임계값을 넘겨야 한다.
         """
         self._detect: DetectFn = detect or Masker().detect
         self._redactor: RedactFn = redactor or redact_page_image
         self._labels = labels
+        self._ground = ground
+        self._ground_confidence_threshold = ground_confidence_threshold
 
-    def redact_pages(self, images: list[PageImage], result: OcrResult) -> list[PageImage]:
-        """페이지별로 PII 라인을 가린 이미지 목록을 반환한다.
+    async def ground_pages(
+        self, images: list[PageImage], result: OcrResult
+    ) -> list[list[tuple[int, int, int, int]]]:
+        """페이지별로 VLM에 PII 위치를 물어 픽셀 bbox 목록을 반환한다(호출 안 하면 빈 목록).
 
-        PII가 없는 페이지는 원본 이미지를 그대로 돌려준다(불필요한 사본 생성 회피).
+        surya 신뢰도가 임계값 이상이거나 ``ground``가 주입 안 됐으면 아무 것도 안 한다
+        (비용·지연시간 절약 — 고신뢰 문서는 라인 기반 검출로 충분하다고 본다). 반환값은
+        ``redact_pages``의 ``grounded_boxes``에 그대로 넘긴다.
+
+        Args:
+            images: 원본 페이지 이미지.
+            result: 같은 문서의 OCR 결과(``mean_confidence`` 게이팅에 사용).
+
+        Returns:
+            페이지별 픽셀 bbox 목록(``labels`` 필터 적용됨). grounding 미시도 시 각
+            페이지마다 빈 리스트.
+        """
+        if self._ground is None or result.mean_confidence >= self._ground_confidence_threshold:
+            return [[] for _ in images]
+        grounded_per_page = await asyncio.gather(*(self._ground(image) for image in images))
+        return [
+            [box for label, box in grounded if self._labels is None or label in self._labels]
+            for grounded in grounded_per_page
+        ]
+
+    def redact_pages(
+        self,
+        images: list[PageImage],
+        result: OcrResult,
+        grounded_boxes: list[list[tuple[int, int, int, int]]] | None = None,
+    ) -> list[PageImage]:
+        """페이지별로 PII 라인·영역을 가린 이미지 목록을 반환한다.
+
+        가릴 게 없는 페이지는 원본 이미지를 그대로 돌려준다(불필요한 사본 생성 회피).
 
         Args:
             images: 원본 페이지 이미지(``OcrProcessor``가 렌더한 것과 동일 순서·길이).
             result: 같은 문서의 OCR 결과(라인 좌표 보유).
+            grounded_boxes: ``ground_pages``가 돌려준 페이지별 추가 bbox(픽셀 좌표).
+                ``None``이면 라인 기반 검출만 쓴다(기존 동작).
 
         Returns:
             페이지별 비식별 이미지 목록.
 
         Raises:
-            ValueError: 이미지 수와 OCR 페이지 수가 다를 때(계약 위반).
+            ValueError: 이미지 수와 OCR 페이지 수(또는 grounded_boxes 수)가 다를 때(계약 위반).
         """
         if len(images) != len(result.pages):
             raise ValueError(
                 f"이미지/페이지 수 불일치: images={len(images)} pages={len(result.pages)}"
             )
+        extras = grounded_boxes if grounded_boxes is not None else [[] for _ in images]
+        if len(extras) != len(images):
+            raise ValueError(
+                f"이미지/grounded_boxes 수 불일치: "
+                f"images={len(images)} grounded_boxes={len(extras)}"
+            )
         redacted: list[PageImage] = []
-        for image, page in zip(images, result.pages, strict=True):
+        for image, page, extra_boxes in zip(images, result.pages, extras, strict=True):
             order = reading_order(page)
             spans = self._detect(reading_order_text(page, order))
             indices = pii_line_indices(page, spans, order, self._labels)
-            redacted.append(self._redactor(image, page, indices) if indices else image)
+            if indices or extra_boxes:
+                redacted.append(self._redactor(image, page, indices, extra_boxes))
+            else:
+                redacted.append(image)
         return redacted

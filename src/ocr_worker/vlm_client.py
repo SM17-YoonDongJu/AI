@@ -8,11 +8,13 @@ core가 아닌 여기 별도 모듈로 둔다.
 
 import base64
 import io
+import json
 from typing import Any
 
 import httpx
 
 from core.config import settings
+from ocr_worker.masking.spans import PiiLabel
 from ocr_worker.ocr import PageImage
 
 _vlm_client: httpx.AsyncClient | None = None
@@ -24,6 +26,17 @@ VLM_TABLE_PROMPT = (
     "표는 마크다운 표로, 항목-금액 쌍은 누락 없이 옮겨주세요. 추측하지 말고 "
     "보이는 대로만 적어주세요. 특정 부분이 흐리거나 읽을 수 없으면 내용을 "
     "지어내지 말고 '[읽을 수 없음]'이라고만 적어주세요."
+)
+
+# PiiLabel의 값(예: "이름", "주민등록번호")을 그대로 라벨 어휘로 써서, 응답을 파싱할
+# 때 별도 매핑표 없이 PiiLabel(raw_label)로 바로 역직렬화한다.
+GROUNDING_PROMPT = (
+    "이 이미지에서 개인정보(사람 이름, 주민등록번호, 전화번호, 환자등록번호, 계좌번호, "
+    "주소)가 적힌 위치를 찾아주세요. 각 항목마다 종류(label)와 위치를 bounding box로 "
+    "알려주세요. 좌표는 이미지 왼쪽 위를 (0,0), 오른쪽 아래를 (1000,1000)으로 "
+    "정규화해서 JSON 배열로만 답하세요. 형식: "
+    '[{"label": "이름", "bbox": [x1,y1,x2,y2]}, ...] '
+    "다른 설명 없이 JSON만 출력하세요. 개인정보가 없으면 빈 배열 []만 출력하세요."
 )
 
 
@@ -85,3 +98,94 @@ async def transcribe_table(image: PageImage) -> str:
         # 여기서 변환 안 하면 예외가 그대로 전파돼 pipeline._extract_pages의 surya
         # 폴백을 못 타고 작업 자체가 실패한다(코드리뷰 지적).
         raise VlmClientError("VLM 응답 형식이 올바르지 않음") from exc
+
+
+async def ground_pii(image: PageImage) -> list[tuple[PiiLabel, tuple[int, int, int, int]]]:
+    """이미지에서 PII로 보이는 영역의 위치를 찾아 픽셀 bbox로 반환한다(이미지 마스킹 보조).
+
+    surya가 텍스트를 완전히 다른 문자로 오독하면(예: 이름을 숫자열로 오독) 이미지
+    검은블록은 그 라인을 PII로 판정하지 못해 그대로 노출한다(§masked_lines 문서 참고) —
+    이 함수는 surya 판독과 무관하게 VLM이 직접 이미지에서 PII 위치를 짚게 해 그 gap을
+    메운다. 실측 확인: 이름을 "828"로 완전히 오독한 케이스에서도 VLM은 올바른 텍스트와
+    위치를 정확히 짚었다(좌표는 반드시 0~1000 정규화로 요청해야 한다 — 같은 모델도
+    픽셀 좌표로 물으면 엉뚱한 영역을 가리켰다, 실측 확인).
+
+    호출측(``ImageMasker``)은 이 결과를 기존 라인 기반 검은블록에 **추가만** 한다 —
+    실패하거나 좌표가 틀려도 최악의 경우 과잉 마스킹일 뿐, 기존 안전성보다 후퇴하지
+    않는다. 그래서 이 함수는 예외를 던지지 않고 실패 시 빈 리스트를 반환한다.
+
+    Args:
+        image: ``render_to_images``가 만든 PIL 페이지 이미지.
+
+    Returns:
+        ``(PiiLabel, (x1,y1,x2,y2))`` 목록(픽셀 좌표). 실패·형식 이상이면 빈 리스트.
+    """
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    client = _get_vlm_client()
+    payload: dict[str, Any] = {
+        "model": settings.vlm_model,
+        "prompt": GROUNDING_PROMPT,
+        "images": [b64],
+        "stream": False,
+        "options": {"temperature": 0.0},
+    }
+    try:
+        resp = await client.post("/api/generate", json=payload)
+        resp.raise_for_status()
+        text = resp.json()["response"]
+    except httpx.HTTPError:
+        return []
+    except (KeyError, TypeError, ValueError):
+        return []
+    return _parse_grounding_boxes(text, image.width, image.height)
+
+
+def _parse_grounding_boxes(
+    text: str, width: int, height: int
+) -> list[tuple[PiiLabel, tuple[int, int, int, int]]]:
+    """VLM 응답(순수 JSON 또는 ```json 코드펜스)을 픽셀 bbox 목록으로 변환한다.
+
+    참고용 보조 신호라 fail-closed일 필요는 없다 — 형식이 깨졌거나 항목 하나가
+    이상해도 예외를 던지지 않고, 파싱 가능한 항목만 채택하고 나머지는 건너뛴다.
+    """
+    stripped = text.strip().strip("`")
+    if stripped.startswith("json"):
+        stripped = stripped[4:]
+    try:
+        items = json.loads(stripped)
+    except ValueError:
+        return []
+    if not isinstance(items, list):
+        return []
+    boxes: list[tuple[PiiLabel, tuple[int, int, int, int]]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        raw_label = item.get("label")
+        bbox = item.get("bbox")
+        if not isinstance(raw_label, str) or not (isinstance(bbox, list) and len(bbox) == 4):
+            continue
+        try:
+            label = PiiLabel(raw_label)
+        except ValueError:
+            continue  # 모델이 정의 안 된 라벨을 만들어낸 경우 — 무시
+        try:
+            x1, y1, x2, y2 = (float(v) for v in bbox)
+        except (TypeError, ValueError):
+            continue
+        if not (0 <= x1 < x2 <= 1000 and 0 <= y1 < y2 <= 1000):
+            continue  # 좌표 역전·범위 밖 — 이 항목만 무시
+        boxes.append(
+            (
+                label,
+                (
+                    int(x1 / 1000 * width),
+                    int(y1 / 1000 * height),
+                    int(x2 / 1000 * width),
+                    int(y2 / 1000 * height),
+                ),
+            )
+        )
+    return boxes

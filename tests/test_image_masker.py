@@ -169,25 +169,131 @@ def test_redact_pages_only_redacts_pii_pages() -> None:
     result = OcrResult(pages=(page_pii, page_clean))
     images = ["img0", "img1"]
 
-    calls: list[tuple[str, set[int]]] = []
+    calls: list[tuple[str, set[int], tuple[object, ...]]] = []
 
     def fake_detect(text: str) -> list[Span]:
         return [Span(0, 3, PiiLabel.NAME)] if "pii" in text else []
 
-    def fake_redactor(image: object, page: OcrPage, indices: set[int]) -> str:
-        calls.append((str(image), indices))
+    def fake_redactor(
+        image: object, page: OcrPage, indices: set[int], extra_boxes: list[object]
+    ) -> str:
+        calls.append((str(image), indices, tuple(extra_boxes)))
         return f"redacted:{sorted(indices)}"
 
     masker = ImageMasker(detect=fake_detect, redactor=fake_redactor)
     out = masker.redact_pages(images, result)
 
     assert out == ["redacted:[0]", "img1"]  # PII 페이지만 사본, clean은 원본 그대로
-    assert calls == [("img0", {0})]  # redactor는 PII 페이지에만 호출
+    assert calls == [("img0", {0}, ())]  # redactor는 PII 페이지에만 호출
 
 
 def test_redact_pages_raises_on_count_mismatch() -> None:
     result = OcrResult(pages=(OcrPage(0, 100, 50, (_line("x"),)),))
 
-    masker = ImageMasker(detect=lambda _t: [], redactor=lambda i, _p, _idx: i)
+    masker = ImageMasker(detect=lambda _t: [], redactor=lambda i, _p, _idx, _boxes: i)
     with pytest.raises(ValueError, match="수 불일치"):
         masker.redact_pages(["a", "b"], result)
+
+
+def test_redact_pages_merges_grounded_boxes_even_without_line_pii() -> None:
+    # surya 라인 검출은 PII를 하나도 못 찾았지만(오독으로 못 잡힌 경우를 흉내), VLM
+    # grounding이 넘겨준 좌표는 여전히 반영돼야 한다 — 라인 판정과 무관하게 추가된다.
+    page = OcrPage(0, 100, 50, (_line("828"),))  # "828"은 PII로 안 잡힘(오독 흉내)
+    result = OcrResult(pages=(page,))
+    images = ["img0"]
+    grounded_boxes = [[(10, 20, 30, 40)]]
+
+    calls: list[tuple[set[int], tuple[object, ...]]] = []
+
+    def fake_redactor(
+        image: object, page: OcrPage, indices: set[int], extra_boxes: list[object]
+    ) -> str:
+        calls.append((indices, tuple(extra_boxes)))
+        return "redacted"
+
+    masker = ImageMasker(detect=lambda _t: [], redactor=fake_redactor)
+    out = masker.redact_pages(images, result, grounded_boxes)
+
+    assert out == ["redacted"]
+    assert calls == [(set(), ((10, 20, 30, 40),))]
+
+
+def test_redact_pages_raises_on_grounded_boxes_count_mismatch() -> None:
+    result = OcrResult(pages=(OcrPage(0, 100, 50, (_line("x"),)),))
+
+    masker = ImageMasker(detect=lambda _t: [], redactor=lambda i, _p, _idx, _boxes: i)
+    with pytest.raises(ValueError, match="grounded_boxes"):
+        masker.redact_pages(["a"], result, grounded_boxes=[[], []])
+
+
+# ── ground_pages (신뢰도 게이팅) ──────────────────────────────────
+async def test_ground_pages_skips_when_ground_not_provided() -> None:
+    result = OcrResult(pages=(OcrPage(0, 100, 50, (_line("x"),)),))
+    masker = ImageMasker(detect=lambda _t: [])  # ground 주입 안 함
+
+    out = await masker.ground_pages(["img0"], result)
+
+    assert out == [[]]
+
+
+async def test_ground_pages_skips_when_confidence_above_threshold() -> None:
+    line = _line("x")
+    page = OcrPage(0, 100, 50, (line,))
+    result = OcrResult(pages=(page,))  # 기본 confidence=1.0
+
+    called = False
+
+    async def fake_ground(image: object) -> list[tuple[PiiLabel, tuple[int, int, int, int]]]:
+        nonlocal called
+        called = True
+        return [(PiiLabel.NAME, (0, 0, 1, 1))]
+
+    masker = ImageMasker(detect=lambda _t: [], ground=fake_ground, ground_confidence_threshold=0.90)
+    out = await masker.ground_pages(["img0"], result)
+
+    assert out == [[]]
+    assert called is False
+
+
+async def test_ground_pages_calls_ground_when_confidence_low() -> None:
+    low_conf_line = OcrLine(
+        text="828",
+        bbox=(0.0, 0.0, 10.0, 5.0),
+        polygon=((0.0, 0.0), (10.0, 0.0), (10.0, 5.0), (0.0, 5.0)),
+        confidence=0.5,
+    )
+    page = OcrPage(0, 100, 50, (low_conf_line,))
+    result = OcrResult(pages=(page,))
+    assert result.mean_confidence < 0.90
+
+    async def fake_ground(image: object) -> list[tuple[PiiLabel, tuple[int, int, int, int]]]:
+        return [(PiiLabel.NAME, (10, 20, 30, 40)), (PiiLabel.RRN, (50, 60, 70, 80))]
+
+    masker = ImageMasker(detect=lambda _t: [], ground=fake_ground, ground_confidence_threshold=0.90)
+    out = await masker.ground_pages(["img0"], result)
+
+    assert out == [[(10, 20, 30, 40), (50, 60, 70, 80)]]
+
+
+async def test_ground_pages_filters_by_labels() -> None:
+    low_conf_line = OcrLine(
+        text="828",
+        bbox=(0.0, 0.0, 10.0, 5.0),
+        polygon=((0.0, 0.0), (10.0, 0.0), (10.0, 5.0), (0.0, 5.0)),
+        confidence=0.5,
+    )
+    page = OcrPage(0, 100, 50, (low_conf_line,))
+    result = OcrResult(pages=(page,))
+
+    async def fake_ground(image: object) -> list[tuple[PiiLabel, tuple[int, int, int, int]]]:
+        return [(PiiLabel.NAME, (10, 20, 30, 40)), (PiiLabel.RRN, (50, 60, 70, 80))]
+
+    masker = ImageMasker(
+        detect=lambda _t: [],
+        ground=fake_ground,
+        ground_confidence_threshold=0.90,
+        labels={PiiLabel.RRN},
+    )
+    out = await masker.ground_pages(["img0"], result)
+
+    assert out == [[(50, 60, 70, 80)]]  # NAME은 labels 필터에 안 걸려 제외

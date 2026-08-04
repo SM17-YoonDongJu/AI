@@ -48,7 +48,7 @@ from ocr_worker.repository import (
     save_ocr_result,
 )
 from ocr_worker.storage import put_object
-from ocr_worker.vlm_client import VlmClientError, transcribe_table
+from ocr_worker.vlm_client import VlmClientError, ground_pii, transcribe_table
 
 logger = get_logger(__name__)
 
@@ -177,7 +177,11 @@ class OcrPipeline:
         self._settings = settings or get_settings()
         self._processor = processor or get_processor()
         self._masker = masker or get_masker()
-        self._image_masker = ImageMasker(detect=self._masker.detect)
+        self._image_masker = ImageMasker(
+            detect=self._masker.detect,
+            ground=ground_pii,
+            ground_confidence_threshold=_LOW_CONFIDENCE_THRESHOLD,
+        )
         self._vlm_transcribe: VlmTranscribe = vlm_transcribe or transcribe_table
         self._upload: UploadFn = put_object
         self._image_pipeline: ImagePipeline = image_pipeline or self._default_image_pipeline
@@ -216,8 +220,10 @@ class OcrPipeline:
         # 보완한다. 페이지마다 독립적으로 채택 여부가 갈린다 — 한 페이지가 실패해도
         # 그 페이지만 surya 결과로 폴백하고 나머지 페이지는 영향받지 않는다(과거엔
         # 1페이지 VLM 성공만으로 문서 전체 masked_text가 교체돼 2페이지 이후가 통째로
-        # 유실됐었다). masked_lines(이미지 검은블록 bbox)는 VLM이 좌표를 안 주므로
-        # 항상 surya 기반 그대로 둔다.
+        # 유실됐었다). masked_lines(DB 텍스트)는 항상 surya 기반 그대로 둔다 — 좌표가
+        # surya 라인에 묶여 있어 VLM 채택 여부와 무관하다. 이미지 검은블록(_image_pipeline)
+        # 은 별도로 VLM grounding을 호출해 surya 라인 기반 검출에 없는 영역까지 보강한다
+        # (§ImageMasker.ground_pages, 저신뢰도일 때만 — needs_vlm과 동일 임계값 재사용).
         masked_text = analysis.masked_text
         entities = analysis.entities
         quality_source_text = result.full_text  # 최종 품질 판정 기준 원문(기본 surya)
@@ -374,7 +380,10 @@ class OcrPipeline:
         """
         if not images:
             return []
-        pngs = await asyncio.to_thread(self._redact_to_png, result, images)
+        # grounding은 VLM I/O라 async로 먼저 끝내고, PIL 렌더(CPU 바운드)만 to_thread로
+        # 격리한다 — redact_pages 자체는 동기 함수로 유지해 블로킹 규약(§7)을 지킨다.
+        grounded_boxes = await self._image_masker.ground_pages(images, result)
+        pngs = await asyncio.to_thread(self._redact_to_png, result, images, grounded_boxes)
         keys = [_masked_image_key(job.job_id, index) for index in range(len(pngs))]
         await asyncio.gather(
             *(
@@ -385,9 +394,14 @@ class OcrPipeline:
         logger.info("masked_images_uploaded", pages=len(keys))
         return keys
 
-    def _redact_to_png(self, result: OcrResult, images: list[PageImage]) -> list[bytes]:
+    def _redact_to_png(
+        self,
+        result: OcrResult,
+        images: list[PageImage],
+        grounded_boxes: list[list[tuple[int, int, int, int]]],
+    ) -> list[bytes]:
         """페이지별 검은블럭 사본을 PNG 바이트로 인코딩한다(동기 — PIL, ``to_thread``용)."""
-        redacted = self._image_masker.redact_pages(images, result)
+        redacted = self._image_masker.redact_pages(images, result, grounded_boxes)
         return [image_to_png_bytes(image) for image in redacted]
 
     async def _publish_report(
