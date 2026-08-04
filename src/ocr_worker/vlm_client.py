@@ -127,7 +127,10 @@ async def ground_pii(image: PageImage) -> list[tuple[PiiLabel, tuple[int, int, i
     b64 = base64.b64encode(buf.getvalue()).decode("ascii")
     client = _get_vlm_client()
     payload: dict[str, Any] = {
-        "model": settings.vlm_model,
+        # vlm_model(표 전사)과 별도 모델 — 실측: 표 전사에 더 정확한 모델이 grounding
+        # 좌표는 오히려 부정확했다(설정 docstring 참고). 좌표 정밀도가 안전에 직결돼
+        # 검증된 모델을 고정해서 쓴다.
+        "model": settings.vlm_grounding_model,
         "prompt": GROUNDING_PROMPT,
         "images": [b64],
         "stream": False,

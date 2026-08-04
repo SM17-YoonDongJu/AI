@@ -103,7 +103,15 @@ class Settings(BaseSettings):
     # 다중 항목 표 문서(지급결과서·청구서·입원확인서·진료비영수증)에서 surya 라인
     # 순서가 표 구조를 못 살릴 때 보완하는 하이브리드 경로(ocr_worker.vlm_client) 전용.
     vlm_base_url: str = "http://localhost:11434"  # ai_base_url과 별도(엔드포인트 형태 다름)
-    vlm_model: str = "qwen3-vl:8b-instruct"
+    # 표 전사(텍스트만, 좌표 없음) — 팀 합의 모델. 실측: qwen3-vl:8b-instruct보다 텍스트
+    # 정확도·속도(~11초 vs ~15초) 모두 좋음.
+    vlm_model: str = "qwen3.6:35b-a3b"
+    # 이미지 마스킹 보강용 PII 위치 grounding(좌표 출력) 전용 — vlm_model과 별도 모델.
+    # 실측: qwen3.6:35b-a3b는 vision capability는 있지만 grounding 좌표가 실제 텍스트
+    # 위치에서 벗어남(이름 박스가 이름 글자를 완전히 빗나감) — qwen3-vl:8b-instruct는
+    # 같은 문서에서 정확했다. 좌표 정밀도가 안전(과소 마스킹 방지)에 직결돼 텍스트
+    # 전사보다 훨씬 보수적으로 골라야 하므로, 검증된 모델을 별도로 고정한다.
+    vlm_grounding_model: str = "qwen3-vl:8b-instruct"
     vlm_timeout_seconds: float = 60.0  # 실측 평균 15초·최대 34초 — 여유 두고 60초
 
 

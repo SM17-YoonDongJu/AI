@@ -68,6 +68,24 @@ async def test_transcribe_table_sends_base64_png_image() -> None:
     assert isinstance(images[0], str) and len(images[0]) > 0
 
 
+async def test_transcribe_table_uses_vlm_model_setting(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 실측 확인: 표 전사용 모델이 grounding(좌표)엔 부정확해서 별도 설정으로 분리했다
+    # — transcribe_table은 vlm_model만 써야 한다(vlm_grounding_model과 섞이면 안 됨).
+    monkeypatch.setattr(vlm_client.settings, "vlm_model", "table-model")
+    monkeypatch.setattr(vlm_client.settings, "vlm_grounding_model", "grounding-model")
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["model"] = json.loads(request.content)["model"]
+        return httpx.Response(200, json={"response": "ok"})
+
+    _install_mock(handler)
+
+    await vlm_client.transcribe_table(_image())
+
+    assert captured["model"] == "table-model"
+
+
 async def test_transcribe_table_sets_zero_temperature() -> None:
     # Arrange: 환각(창작) 경향을 낮추기 위해 temperature=0.0을 보내는지 확인.
     captured: dict[str, object] = {}
@@ -154,6 +172,24 @@ async def test_ground_pii_parses_response_to_pixel_boxes() -> None:
 
     # Assert: 10x10 이미지 기준 정규화 [100,200,300,400] → 픽셀 [1,2,3,4]
     assert boxes == [(PiiLabel.NAME, (1, 2, 3, 4))]
+
+
+async def test_ground_pii_uses_grounding_model_setting(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 실측 확인(GPU E2E): vlm_model(표 전사용)을 grounding에도 쓰면 좌표가 실제 텍스트
+    # 위치를 벗어났다 — ground_pii는 반드시 vlm_grounding_model만 써야 한다.
+    monkeypatch.setattr(vlm_client.settings, "vlm_model", "table-model")
+    monkeypatch.setattr(vlm_client.settings, "vlm_grounding_model", "grounding-model")
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["model"] = json.loads(request.content)["model"]
+        return httpx.Response(200, json={"response": "[]"})
+
+    _install_mock(handler)
+
+    await vlm_client.ground_pii(_image())
+
+    assert captured["model"] == "grounding-model"
 
 
 async def test_ground_pii_strips_markdown_code_fence() -> None:
