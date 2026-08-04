@@ -151,6 +151,8 @@
 > **2026-08-04 (fix):** `masked_lines` 생성 로직(`build_masked_lines`)이 "이 라인이 PII인가" 판정(페이지 단위)과 "실제 치환"(라인 단위 재검출)에 서로 다른 탐지를 쓰던 불일치를 수정. 라벨과 값이 다른 줄로 쪼개진 경우, 값만 있는 라인은 라벨 컨텍스트 없이 재검출하면 정규식 앵커가 안 걸려 원문이 그대로 남을 수 있었다 — 코드리뷰로 지적됨, 실제 테스트가 이 케이스를 놓치고 있었음도 같이 확인(재검출 없이도 우연히 통과하는 페이크로 짜여 있었음). 이제 페이지에서 검출한 스팬을 `line_local_spans`로 라인별 로컬 오프셋으로 잘라 재검출 없이 `apply_mask`로 직접 치환한다 — `build_masked_lines`의 `mask` 매개변수 제거(더 이상 필요 없음), `detect`만 받음(브레이킹, 내부 함수라 `ocr_worker.pipeline` 호출부만 갱신하면 됨).
 >
 > **2026-08-04 (additive, 실측 기반):** 이미지 마스킹의 "VLM은 좌표를 안 준다"는 가정을 재검증 — `qwen3-vl:8b-instruct`에 PII 위치를 정규화(0~1000) 좌표로 직접 물으면(픽셀 좌표로 물으면 실패, 반드시 정규화 좌표) 실제로 정확한 bbox를 준다는 걸 실사진 10건 + surya 오독 재현 케이스(이름→"828")로 확인했다. `vlm_client.ground_pii()` 신설(정규화 응답을 픽셀로 변환, 실패 시 예외 없이 빈 리스트), `ImageMasker.ground_pages()`(신뢰도 게이팅, `_LOW_CONFIDENCE_THRESHOLD` 재사용)·`redact_pages(grounded_boxes=...)`(라인 기반 검은블록에 추가, 대체 아님) 신설. `masked_image_s3_keys` 이미지 트랙에만 적용 — `masked_text`/`masked_lines`(DB 텍스트)는 이 변경과 무관(불변).
+>
+> **2026-08-04 (fix):** 바로 위 `table_markdown` 제외 수정(2026-08-04 additive, `entities` 행)이 `MEDICAL_RECEIPT`에 회귀를 만들었음을 확인·수정. `MEDICAL_RECEIPT`는 `extract()`가 애초에 doc_type 고유 필드를 정의하지 않는 유형(항목별 데이터는 전부 `table_markdown`에만 담김)이라, `table_markdown`을 일괄 제외하면 확인할 필드 자체가 없어 신뢰도가 낮을 때 이름 유무·VLM 성공 여부와 무관하게 **항상** `needs_reupload`가 됐다. `_missing_domain_info(doc_type, entities)`로 시그니처를 바꿔, `MEDICAL_RECEIPT`(`_TABLE_MARKDOWN_ONLY_DOC_TYPES`)는 `table_markdown` 유무를 그대로 신호로 쓰고 나머지 doc_type은 기존대로 엄격히(테이블마크다운 제외) 판정한다.
 
 ---
 

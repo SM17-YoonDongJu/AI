@@ -649,6 +649,48 @@ async def test_ocr_quality_needs_reupload_when_vlm_adopted_but_no_domain_entitie
     assert insert_args[8] == "needs_reupload"  # table_markdown만으로 domain info 인정 안 함
 
 
+async def test_ocr_quality_ok_for_medical_receipt_when_vlm_adopted_and_name_present() -> None:
+    # Arrange — 위 테스트(#7 반영)의 부작용 회귀: MEDICAL_RECEIPT는 extract()가 애초에
+    # doc_type 고유 필드를 정의하지 않는 유형이라(진료비 항목은 table_markdown에만
+    # 담김), table_markdown을 일괄 제외하면 이 유형만 VLM이 성공해도 확인할 필드 자체가
+    # 없어 항상 needs_reupload가 되던 문제가 있었다. 이 유형은 table_markdown 유무를
+    # 그대로 신호로 써야 한다 — VLM 성공 + 이름 존재면 ok여야 한다.
+    pool = FakePool(existing=None)
+    producer = FakeProducer()
+    processor = FakeProcessor(_result("진료비영수증", "환자 성명 홍길동", confidence=0.5))
+    vlm = _RecordingVlm(text="진료비영수증 환자 성명 홍길동 영수금액 47500원")
+    pipeline = _pipeline(pool, producer, processor, vlm_transcribe=vlm)
+
+    # Act
+    await pipeline.handle(_job())
+
+    # Assert
+    assert vlm.called is True
+    insert_args = pool.insert_calls()[0][1]
+    entities = json.loads(insert_args[6])
+    assert entities == {"table_markdown": entities["table_markdown"]}  # 고유 필드 없음
+    assert insert_args[8] == "ok"
+
+
+async def test_ocr_quality_needs_reupload_for_medical_receipt_when_vlm_fails() -> None:
+    # Arrange — MEDICAL_RECEIPT라도 VLM이 아예 실패해 table_markdown조차 없으면
+    # (entities == {}) 여전히 needs_reupload여야 한다(위 fix가 무조건 ok로 바꾸면 안 됨).
+    pool = FakePool(existing=None)
+    producer = FakeProducer()
+    processor = FakeProcessor(_result("진료비영수증", "영수금액 47500원", confidence=0.5))
+    vlm = _RecordingVlm(error=VlmClientError("연결 실패"))
+    pipeline = _pipeline(pool, producer, processor, vlm_transcribe=vlm)
+
+    # Act
+    await pipeline.handle(_job())
+
+    # Assert
+    insert_args = pool.insert_calls()[0][1]
+    entities = json.loads(insert_args[6])
+    assert entities == {}
+    assert insert_args[8] == "needs_reupload"
+
+
 async def test_ocr_quality_ok_when_low_confidence_but_name_and_domain_info_present() -> None:
     # Arrange: 신뢰도는 낮지만 이름·도메인 정보(보험사·상품명)가 모두 검출됨.
     pool = FakePool(existing=None)

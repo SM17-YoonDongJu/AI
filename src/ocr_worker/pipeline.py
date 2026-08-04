@@ -95,7 +95,13 @@ def _looks_grounded(vlm_text: str, source_text: str) -> bool:
     return overlap >= _MIN_GROUNDED_OVERLAP
 
 
-def _missing_domain_info(entities: dict[str, object]) -> bool:
+# extract()가 doc_type 고유 필드를 아예 정의하지 않는 유형 — 항목별 데이터가 전부
+# table_markdown에만 담긴다(extract.py 참고). 이 유형은 table_markdown 유무 자체를
+# 도메인 정보 신호로 쓴다 — 그 외엔 애초에 확인할 필드가 없다.
+_TABLE_MARKDOWN_ONLY_DOC_TYPES: frozenset[DocType] = frozenset({DocType.MEDICAL_RECEIPT})
+
+
+def _missing_domain_info(doc_type: DocType, entities: dict[str, object]) -> bool:
     """extract()로 뽑힌 doc_type 고유 엔티티가 하나도 없는지 확인한다.
 
     "재확인 필요" 판정 신호 중 하나. doc_type별 필수 필드 정책을 새로 만들지 않고
@@ -103,10 +109,16 @@ def _missing_domain_info(entities: dict[str, object]) -> bool:
     (payout_amount 하나)은 그 필드가 원래 없는 양식이어도 오탐할 수 있다. DIAGNOSIS는
     diagnosis_name/icd 두 필드 중 하나라도 있으면 통과하므로 상대적으로 덜 취약하다.
 
-    ``table_markdown``은 이 판정에서 제외한다(코드리뷰 지적) — VLM이 채택되면 페이지
-    전사 원문이 거의 항상 채워지므로, 이를 도메인 정보로 세면 실제 doc_type 필드가
-    하나도 안 뽑힌 저신뢰도 문서도 표 문서라는 이유만으로 늘 통과해버린다.
+    ``_TABLE_MARKDOWN_ONLY_DOC_TYPES``(예: MEDICAL_RECEIPT)는 ``table_markdown``
+    유무를 그대로 쓴다 — 실측 확인: 이 예외 없이 일괄 제외하면, extract()가 애초에
+    고유 필드를 정의하지 않는 이 유형만 신뢰도가 낮을 때 이름 유무·VLM 성공 여부와
+    무관하게 항상 재확인 필요로 판정되는 회귀가 있었다(확인할 필드 자체가 없어서
+    남는 게 늘 빈 dict가 됨). 나머지 doc_type은 ``table_markdown``을 제외한다 — VLM이
+    채택되면 페이지 전사 원문이 거의 항상 채워지므로, 이를 도메인 정보로 세면 실제
+    doc_type 필드가 하나도 안 뽑힌 저신뢰도 문서도 표 문서라는 이유만으로 늘 통과해버린다.
     """
+    if doc_type in _TABLE_MARKDOWN_ONLY_DOC_TYPES:
+        return not entities
     domain_entities = {key: value for key, value in entities.items() if key != "table_markdown"}
     if not domain_entities:
         return True
@@ -258,7 +270,7 @@ class OcrPipeline:
         ocr_quality = (
             "needs_reupload"
             if result.mean_confidence < _LOW_CONFIDENCE_THRESHOLD
-            and (not has_name or _missing_domain_info(entities))
+            and (not has_name or _missing_domain_info(analysis.doc_type, entities))
             else "ok"
         )
 
