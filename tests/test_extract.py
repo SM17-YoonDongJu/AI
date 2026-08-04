@@ -15,8 +15,8 @@ def test_diagnosis_extracts_kcd_code() -> None:
     text = "최종진단 상병명: 발목 골절 (KCD S82.1)"
     # Act
     entities = extract(DocType.DIAGNOSIS, text)
-    # Assert
-    assert entities == {"diagnosis_name": "S82.1"}
+    # Assert — icd는 report_worker(#11)가 참조하는 필드명, diagnosis_name과 별개로 유지
+    assert entities == {"diagnosis_name": "S82.1", "icd": "S82.1"}
 
 
 def test_diagnosis_falls_back_to_label_text_when_kcd_absent() -> None:
@@ -24,8 +24,8 @@ def test_diagnosis_falls_back_to_label_text_when_kcd_absent() -> None:
     text = "상병명: 급성 기관지염"
     # Act
     entities = extract(DocType.DIAGNOSIS, text)
-    # Assert
-    assert entities == {"diagnosis_name": "급성 기관지염"}
+    # Assert — icd는 코드가 없으면 한글 병명으로 폴백하지 않고 None
+    assert entities == {"diagnosis_name": "급성 기관지염", "icd": None}
 
 
 def test_diagnosis_falls_back_across_split_label_lines() -> None:
@@ -38,7 +38,7 @@ def test_diagnosis_falls_back_across_split_label_lines() -> None:
     # Act
     entities = extract(DocType.DIAGNOSIS, text)
     # Assert — 값 줄만 잡고 다음 줄(부연 설명)은 삼키지 않는다.
-    assert entities == {"diagnosis_name": "만성 요통증"}
+    assert entities == {"diagnosis_name": "만성 요통증", "icd": None}
 
 
 def test_diagnosis_name_none_when_no_kcd_and_no_label() -> None:
@@ -47,7 +47,7 @@ def test_diagnosis_name_none_when_no_kcd_and_no_label() -> None:
     # Act
     entities = extract(DocType.DIAGNOSIS, text)
     # Assert
-    assert entities == {"diagnosis_name": None}
+    assert entities == {"diagnosis_name": None, "icd": None}
 
 
 # ── 보험증권: insurer / product ─────────────────────────────────
@@ -113,16 +113,70 @@ def test_claim_extracts_amount_reference() -> None:
     assert entities == {"payout_amount": 950000}
 
 
-# ── 입퇴원확인서·진료비영수증: 표 구조화는 하이브리드 VLM 경로 담당 ──
+# ── 입퇴원확인서: admission_days(참고값) / surgery ──────────────
 
 
-def test_hospitalization_cert_returns_empty_entities() -> None:
-    # Arrange
+def test_hospitalization_cert_extracts_days_from_range_label() -> None:
+    # Arrange — "입원기간" 한 라벨 아래 시작~종료 날짜가 함께 오는 형태.
     text = "입원확인서\n입원기간 2026-01-01부터 2026-01-05까지"
     # Act
     entities = extract(DocType.HOSPITALIZATION_CERT, text)
-    # Assert — 항목별 구조화는 pipeline의 하이브리드 VLM 경로가 담당
-    assert entities == {}
+    # Assert
+    assert entities == {"admission_days": 4, "surgery": None}
+
+
+def test_hospitalization_cert_extracts_days_from_direct_label() -> None:
+    # Arrange — "입원일수: N일" 직접 표기가 있으면 최우선으로 쓴다.
+    text = "입원확인서\n입원일수: 7일"
+    # Act
+    entities = extract(DocType.HOSPITALIZATION_CERT, text)
+    # Assert
+    assert entities["admission_days"] == 7
+
+
+def test_hospitalization_cert_extracts_days_from_separate_labels() -> None:
+    # Arrange — 입원일/퇴원일이 서로 다른 라벨로 떨어져 있는 형태.
+    text = "입원일자: 2026-02-10\n퇴원일자: 2026-02-15"
+    # Act
+    entities = extract(DocType.HOSPITALIZATION_CERT, text)
+    # Assert
+    assert entities["admission_days"] == 5
+
+
+def test_hospitalization_cert_days_none_when_dates_absent() -> None:
+    # Arrange — 날짜 표기가 전혀 없는 텍스트.
+    text = "입원확인서\n환자는 경과가 양호하다."
+    # Act
+    entities = extract(DocType.HOSPITALIZATION_CERT, text)
+    # Assert
+    assert entities["admission_days"] is None
+
+
+def test_hospitalization_cert_surgery_true_when_named() -> None:
+    # Arrange
+    text = "입원확인서\n수술명: 골절정복술"
+    # Act
+    entities = extract(DocType.HOSPITALIZATION_CERT, text)
+    # Assert
+    assert entities["surgery"] is True
+
+
+def test_hospitalization_cert_surgery_false_when_negated() -> None:
+    # Arrange — 라벨은 있지만 값이 "없음"이면 시행하지 않은 것으로 본다.
+    text = "입원확인서\n수술명: 없음"
+    # Act
+    entities = extract(DocType.HOSPITALIZATION_CERT, text)
+    # Assert
+    assert entities["surgery"] is False
+
+
+def test_hospitalization_cert_surgery_none_when_label_absent() -> None:
+    # Arrange — 라벨 자체가 없으면 알 수 없음(True/False 단정 금지).
+    text = "입원확인서\n입원일수: 3일"
+    # Act
+    entities = extract(DocType.HOSPITALIZATION_CERT, text)
+    # Assert
+    assert entities["surgery"] is None
 
 
 def test_medical_receipt_returns_empty_entities() -> None:
@@ -158,7 +212,7 @@ def test_pii_never_enters_entities_diagnosis() -> None:
     # Act
     entities = extract(DocType.DIAGNOSIS, text)
     # Assert — 도메인 값(KCD)만 들어가고 PII는 어떤 값에도 없음
-    assert entities == {"diagnosis_name": "S82.1"}
+    assert entities == {"diagnosis_name": "S82.1", "icd": "S82.1"}
     serialized = repr(entities)
     assert "홍길동" not in serialized
     assert "901010" not in serialized
@@ -174,7 +228,7 @@ def test_pii_never_enters_entities_diagnosis_label_fallback() -> None:
     # Act
     entities = extract(DocType.DIAGNOSIS, text)
     # Assert — 병명 값만 들어가고 PII는 어떤 값에도 없음
-    assert entities == {"diagnosis_name": "만성 요통증"}
+    assert entities == {"diagnosis_name": "만성 요통증", "icd": None}
     serialized = repr(entities)
     assert "홍길동" not in serialized
     assert "901010" not in serialized
@@ -193,3 +247,18 @@ def test_pii_never_enters_entities_policy() -> None:
     serialized = repr(entities)
     assert "김철수" not in serialized
     assert "567890" not in serialized
+
+
+def test_pii_never_enters_entities_hospitalization_cert() -> None:
+    # Arrange — 이름·주민번호가 섞인 입퇴원확인서 텍스트
+    text = (
+        "환자 성명: 이샘플\n주민등록번호 901010-1234567\n"
+        "입원기간 2026-01-01부터 2026-01-05까지\n수술명: 골절정복술"
+    )
+    # Act
+    entities = extract(DocType.HOSPITALIZATION_CERT, text)
+    # Assert — 입원일수·수술여부만 들어가고 PII는 어떤 값에도 없음
+    assert entities == {"admission_days": 4, "surgery": True}
+    serialized = repr(entities)
+    assert "이샘플" not in serialized
+    assert "901010" not in serialized

@@ -96,8 +96,9 @@ def _missing_domain_info(entities: dict[str, object]) -> bool:
     """extract()(+VLM table_markdown)로 뽑힌 값이 하나도 없는지 확인한다.
 
     "재확인 필요" 판정 신호 중 하나. doc_type별 필수 필드 정책을 새로 만들지 않고
-    이미 있는 추출 결과를 재사용한다 — 알려진 한계: entities 필드가 1개뿐인
-    DIAGNOSIS·CLAIM은 그 필드가 원래 없는 양식이어도 오탐할 수 있다.
+    이미 있는 추출 결과를 재사용한다 — 알려진 한계: entities 필드가 1개뿐인 CLAIM
+    (payout_amount 하나)은 그 필드가 원래 없는 양식이어도 오탐할 수 있다. DIAGNOSIS는
+    diagnosis_name/icd 두 필드 중 하나라도 있으면 통과하므로 상대적으로 덜 취약하다.
     """
     if not entities:
         return True
@@ -304,9 +305,7 @@ class OcrPipeline:
             _TABLE_PAGE_SEPARATOR.join(table_parts),
         )
 
-    async def _extract_table(
-        self, image: PageImage, source_text: str
-    ) -> tuple[str, str] | None:
+    async def _extract_table(self, image: PageImage, source_text: str) -> tuple[str, str] | None:
         """VLM으로 표를 전사하고 검증·마스킹한다.
 
         실패(호출 오류·환각·잔류PII)하면 ``None``을 반환해 surya 결과로 폴백한다.

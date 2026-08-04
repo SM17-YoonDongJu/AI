@@ -101,7 +101,7 @@
 | `ocr_confidence` | real | OCR 라인 평균 신뢰도(0~1) — 저신뢰 QA 플래깅 |
 | `masked_text` | text | **PII 마스킹된** OCR 텍스트 (downstream 입력). 표 문서 4종(`payout_notice`·`claim`·`hospitalization_cert`·`medical_receipt`)은 하이브리드 VLM이 성공하면 마크다운 표 문법(`\|`·`---`)을 포함할 수 있음(실패 시 surya 평문 폴백) — LLM은 마크다운을 문제없이 소화하므로 `report_worker` 측 별도 분기는 불필요 |
 | `masked_lines` | jsonb | 라인 단위 `[{masked_text, bbox, polygon, confidence}]` — bbox/polygon/conf 보존, **텍스트는 마스킹본**(이미지 마스킹 좌표 재사용). **항상 surya 기반**(VLM은 좌표를 반환하지 않음). 좌표 기반 리딩오더 정렬(시각적 위→아래·좌→우) 후 페이지 단위로 PII를 검출해, 라벨과 값이 서로 다른 라인으로 쪼개진 경우도 페이지 컨텍스트로 잡는다 — 이미지 검은블록 마스킹(`ImageMasker.redact_pages`)과 **동일 판정 로직을 공유**해 두 트랙 간 불일치가 없다. 잔여 한계: 라벨-값 사이에 매우 긴 문단이 끼어 앵커 정규식의 lookahead 범위를 넘는 극단적 경우는 여전히 놓칠 수 있음(후속 과제). **더 근본적인 한계(실측 확인, 2026-08-04)**: surya가 PII를 완전히 다른 문자로 오독하면(예: 실제 이름을 숫자열로 오독) 이미지 마스킹은 그 라인을 PII로 판정 못 하고 그대로 노출한다 — 같은 페이지를 VLM이 정확히 읽어 텍스트 마스킹(`masked_text`)은 안전해도, 이미지 마스킹은 **항상 surya bbox 기반**이라 VLM의 더 나은 판독이 이 트랙엔 전혀 반영되지 않는다. VLM은 좌표를 반환하지 않아 구조적으로 해결이 어렵고, 완화책으로는 저신뢰도(`ocr_confidence < 0.90`) 문서의 비식별 이미지 사본에 별도 경고를 붙이거나 열람을 제한하는 절차적 방법이 있다(미구현) |
-| `entities` | jsonb | 추출 엔티티(아래). `table_markdown`(string\|null, optional)은 표 문서 4종에서만 등장 — VLM 전사 후 마스킹 완료 상태. **알려진 한계(실측 확인, 2026-08-04)**: `payout_amount`(`PAYOUT_NOTICE`·`CLAIM`)는 다중 항목 표에서 문맥 키워드에 가장 먼저 부합하는 금액 하나만 뽑는 구조라, "합계"·최종 지급 예정액이 아닌 개별 항목 금액을 뽑거나 — 최악의 경우 **부지급(거절)된 항목의 청구금액**을 뽑을 수 있다. 참고용으로만 쓰고 절대 단정하지 말 것(`report_worker`는 `table_markdown` 원문을 직접 참조 권장) |
+| `entities` | jsonb | 추출 엔티티(아래). `table_markdown`(string\|null, optional)은 표 문서 4종에서만 등장 — VLM 전사 후 마스킹 완료 상태. **소비 구분(2026-08-04)**: `icd`(`DIAGNOSIS`)·`admission_days`/`surgery`(`HOSPITALIZATION_CERT`)는 `report_worker`(#11)의 지급액 산정 로직이 실제로 참조하는 필드명이다. `insurer`/`product`(`POLICY`)·`payout_amount`(`PAYOUT_NOTICE`·`CLAIM`)·`diagnosis_name`(`DIAGNOSIS`, 코드 없을 때 한글 병명 폴백)은 `report_worker`가 소비하지 않고 `ocr_worker` 내부 `ocr_quality`(재확인 필요) 판정에만 쓰인다 — report_worker는 이 값들 대신 `user_insurances`/`user_claims` 테이블을 직접 조회한다. **알려진 한계(실측 확인, 2026-08-04)**: `payout_amount`는 다중 항목 표에서 문맥 키워드에 가장 먼저 부합하는 금액 하나만 뽑는 구조라, "합계"·최종 지급 예정액이 아닌 개별 항목 금액을 뽑거나 — 최악의 경우 **부지급(거절)된 항목의 청구금액**을 뽑을 수 있다(어느 쪽이든 report_worker가 안 쓰므로 리포트 정확도엔 영향 없음). 참고용으로만 쓰고 절대 단정하지 말 것 |
 | `masked_image_s3_keys` | jsonb | 검은블럭 비식별 이미지 사본 S3 키(페이지별 리스트) |
 | `ocr_quality` | text | 자동 품질 판정(`ok` \| `needs_reupload`). `ReportJob.ocr_quality`로 패스스루됨 |
 | `created_at` | timestamptz | |
@@ -109,10 +109,13 @@
 `entities` 예시(문서 유형별 일부):
 ```json
 {
-  "diagnosis_name": "S82.1",        // KCD 코드 있으면 코드, 없으면 라벨 뒤 한글 병명 폴백(실측: 코드 없는 문서가 더 흔함)
-  "insurer": "○○생명",
-  "product": "무배당 ...",
-  "payout_amount": null              // 단정 금지 — 추출값은 참고용
+  "diagnosis_name": "S82.1",        // KCD 코드 있으면 코드, 없으면 라벨 뒤 한글 병명 폴백(실측: 코드 없는 문서가 더 흔함) — quality 판정용
+  "icd": "S82.1",                    // 코드 없으면 폴백 없이 null — report_worker 소비 필드
+  "insurer": "○○생명",               // quality 판정용, report_worker 비소비
+  "product": "무배당 ...",           // quality 판정용, report_worker 비소비
+  "payout_amount": null,             // 단정 금지 — 참고용, report_worker 비소비
+  "admission_days": 5,               // HOSPITALIZATION_CERT — report_worker 소비 필드(참고값)
+  "surgery": true                    // HOSPITALIZATION_CERT — '수술명' 라벨 없으면 null(알 수 없음)
 }
 ```
 
@@ -142,6 +145,8 @@
 > **2026-08-03 (additive):** 하이브리드 VLM 경로가 다중 페이지 문서에서 페이지별로 독립 채택되도록 수정. 이전엔 1페이지 VLM 성공만으로 `masked_text` 전체가 그 페이지 결과로 교체돼 2페이지 이후 내용이 유실되는 결함이 있었다 — 이제 페이지마다 VLM 성공/실패가 갈리고, 실패한 페이지는 그 페이지의 surya 결과로 개별 폴백한다. `entities.table_markdown`도 채택된 페이지만 구분자(`\n\n---\n\n`)로 이어붙인다(타입은 여전히 `string`, 계약 형태 불변).
 >
 > **2026-08-04 (additive, 실측 기반):** 실제 문서(진단서·보험증권·지급결과통보서·입퇴원확인서·진료비영수증 × 3화질)로 E2E 재검증 중 발견한 것들을 반영. (1) NER이 흔치 않은 합성 이름(예: "이샘플")을 화질과 무관하게 놓치는 사례를 확인해, "환자 성명"·"피보험자"·"계약자"·"예금주" 등 라벨 뒤 이름을 잡는 정규식 안전망(`PERSON_LABEL_NAME_RE`)을 NER과 별개로 추가 — 마크다운 표 형태(`\| 라벨 \| 값 \|`)의 VLM 원문에서도 동작한다. (2) `entities` 병합 우선순위를 반전 — surya가 이미 값을 찾았어도 VLM이 채택되면 VLM 쪽 값을 우선한다(VLM은 이미 groundedness 검증을 통과했고 애초에 surya 신뢰도가 낮아 호출된 것이므로 더 신뢰할 근거가 있음 — surya가 금액을 다른 문서 필드로 오독해 엉뚱한 값을 채운 사례가 실측으로 확인됨). (3) VLM 프롬프트에 "표뿐 아니라 상단 라벨-값 블록도 빠짐없이 포함" 지시를 추가(완전성 편차 완화 시도). `payout_amount` 다중 항목 한계와 이미지 마스킹의 OCR 파괴형 유출 한계는 위 표에 각각 명시 — 이번 라운드에서 코드로 고치지 않고 known limitation으로만 기록.
+>
+> **2026-08-04 (additive):** `report_worker`(#11, 미머지) 코드 리뷰 결과 `entities.icd`/`entities.admission_days`/`entities.surgery`를 참조하고 있으나 `ocr_worker`가 그 키를 만든 적이 없어(항상 미스매치) 실질적으로 죽은 경로였음을 확인. `DocType.DIAGNOSIS`에 `icd`(KCD 코드, 없으면 null — `diagnosis_name`과 달리 한글 병명 폴백 없음), `DocType.HOSPITALIZATION_CERT`에 `admission_days`(입원~퇴원 일수, 직접 표기·날짜쌍 계산 순으로 시도)·`surgery`(수술명 라벨 존재·값 기반 불리언, 라벨 자체가 없으면 null) 추가로 계약 정렬. 기존 `diagnosis_name`/`insurer`/`product`/`payout_amount`는 report_worker가 소비하지 않는 것으로 확인돼(user_insurances/user_claims 테이블에서 별도 조회) 스키마 변경 없이 `ocr_quality` 판정 전용으로 남긴다 — doc_type별로 "report_worker 소비 필드"와 "quality 판정 전용 필드"가 분리된 상태(위 표·예시에 구분 명시).
 
 ---
 

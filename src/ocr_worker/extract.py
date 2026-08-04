@@ -16,6 +16,7 @@ KCD 코드·보험사명·상품명·금액(참고값)처럼 개인을 식별하
 """
 
 import re
+from datetime import date
 
 from core.contracts import DocType
 
@@ -56,6 +57,23 @@ AMOUNT_KEYWORD_WINDOW = 15
 # 유형별 금액 문맥 키워드.
 _PAYOUT_AMOUNT_KEYWORDS = ("지급", "보험금", "결정")
 _CLAIM_AMOUNT_KEYWORDS = ("청구", "보험금")
+
+# ── 입원일수(참고값) ────────────────────────────────────────────
+# YYYY-MM-DD / YYYY.MM.DD / YYYY년 MM월 DD일 형태를 폭넓게 허용.
+_DATE_RE = r"(\d{4})[.\-./년]\s*(\d{1,2})[.\-./월]\s*(\d{1,2})일?"
+# 직접 일수 표기("입원일수: 5일", "재원일수 5일")가 있으면 최우선으로 쓴다.
+ADMISSION_DAYS_LABEL_RE = re.compile(r"(?:입원|재원)\s*일수\s*[:：]?\s*(\d{1,4})\s*일")  # noqa: RUF001
+# "입원기간 2026-01-01부터 2026-01-05까지"처럼 한 라벨 아래 범위로 오는 형태.
+ADMISSION_RANGE_RE = re.compile(
+    rf"입원\s*(?:기간|일자?)\s*[:：]?\s*{_DATE_RE}\s*(?:부터|~|-|–)\s*{_DATE_RE}\s*까지?"  # noqa: RUF001
+)
+# "입원일"/"퇴원일"이 서로 다른 라벨로 떨어져 있는 형태.
+ADMISSION_DATE_RE = re.compile(rf"입원\s*일자?\s*[:：]?\s*{_DATE_RE}")  # noqa: RUF001
+DISCHARGE_DATE_RE = re.compile(rf"퇴원\s*일자?\s*[:：]?\s*{_DATE_RE}")  # noqa: RUF001
+
+# ── 수술 여부 ────────────────────────────────────────────────────
+SURGERY_LABEL_RE = re.compile(r"수술\s*명\s*[:：]?\s*([^\n]+)")  # noqa: RUF001
+_SURGERY_NEGATIONS = frozenset({"없음", "해당없음", "해당 없음", "무", "-", "x", "X"})
 
 
 def _extract_kcd(text: str) -> str | None:
@@ -107,6 +125,50 @@ def _extract_amount_reference(text: str, keywords: tuple[str, ...]) -> int | Non
     return None
 
 
+def _parse_date(y: str, m: str, d: str) -> date | None:
+    """캡처된 연/월/일 문자열을 날짜로 파싱한다(잘못된 값이면 None)."""
+    try:
+        return date(int(y), int(m), int(d))
+    except ValueError:
+        return None
+
+
+def _extract_admission_days(text: str) -> int | None:
+    """입원일수를 반환한다(참고값, 없으면 None).
+
+    "입원일수: N일"처럼 직접 표기가 있으면 그대로 쓰고, 없으면 입원~퇴원 날짜 쌍에서
+    일수를 계산한다(한 라벨 아래 범위 표기 우선, 그다음 입원일/퇴원일 별도 라벨).
+    """
+    label = ADMISSION_DAYS_LABEL_RE.search(text)
+    if label is not None:
+        return int(label.group(1))
+
+    range_match = ADMISSION_RANGE_RE.search(text)
+    if range_match is not None:
+        start = _parse_date(*range_match.group(1, 2, 3))
+        end = _parse_date(*range_match.group(4, 5, 6))
+    else:
+        start_match = ADMISSION_DATE_RE.search(text)
+        end_match = DISCHARGE_DATE_RE.search(text)
+        if start_match is None or end_match is None:
+            return None
+        start = _parse_date(*start_match.group(1, 2, 3))
+        end = _parse_date(*end_match.group(1, 2, 3))
+
+    if start is None or end is None or end < start:
+        return None
+    return (end - start).days
+
+
+def _extract_surgery(text: str) -> bool | None:
+    """수술 시행 여부를 반환한다. '수술명' 라벨 자체가 없으면 알 수 없음(None)."""
+    match = SURGERY_LABEL_RE.search(text)
+    if match is None:
+        return None
+    value = match.group(1).strip()
+    return bool(value) and value not in _SURGERY_NEGATIONS
+
+
 def extract(doc_type: DocType, text: str) -> dict[str, object]:
     """문서 유형에 맞는 비-PII 도메인 엔티티를 추출한다.
 
@@ -123,18 +185,32 @@ def extract(doc_type: DocType, text: str) -> dict[str, object]:
         ``DocType.OTHER``는 빈 dict.
     """
     if doc_type is DocType.DIAGNOSIS:
-        return {"diagnosis_name": _extract_diagnosis_name(text)}
+        # icd: report_worker(리포트 05번)의 지급액 산정 로직이 참조하는 필드명.
+        # diagnosis_name과 값이 같을 수 있으나(둘 다 KCD 코드 우선), diagnosis_name은
+        # 코드가 없을 때 한글 병명으로 폴백하는 반면 icd는 코드가 없으면 None으로
+        # 남긴다 — 폴백값을 코드로 오인해 쓰면 안 되는 소비자를 위한 별도 필드.
+        return {"diagnosis_name": _extract_diagnosis_name(text), "icd": _extract_kcd(text)}
     if doc_type is DocType.POLICY:
+        # insurer/product는 report_worker가 참조하지 않는다(user_insurances 테이블에서
+        # 따로 조회) — 여기 값은 ocr_quality(재확인 필요) 판정용으로만 쓰인다.
         return {"insurer": _extract_insurer(text), "product": _extract_product(text)}
     if doc_type is DocType.PAYOUT_NOTICE:
+        # payout_amount도 위와 같은 이유로 quality 판정용 참고값일 뿐 report_worker
+        # 소비 대상이 아니다 — 다중 항목 표에서 오추출될 수 있는 알려진 한계 포함.
         return {
             "insurer": _extract_insurer(text),
             "payout_amount": _extract_amount_reference(text, _PAYOUT_AMOUNT_KEYWORDS),
         }
     if doc_type is DocType.CLAIM:
         return {"payout_amount": _extract_amount_reference(text, _CLAIM_AMOUNT_KEYWORDS)}
-    if doc_type in (DocType.HOSPITALIZATION_CERT, DocType.MEDICAL_RECEIPT):
-        # 항목별 구조화 데이터(입원기간·진료 항목별 금액 등)는 표 구조가 필요해
-        # ocr_worker.pipeline의 하이브리드 VLM 경로가 entities["table_markdown"]에 채운다.
+    if doc_type is DocType.HOSPITALIZATION_CERT:
+        # admission_days/surgery: report_worker의 지급액 산정 로직이 참조하는 필드명.
+        return {
+            "admission_days": _extract_admission_days(text),
+            "surgery": _extract_surgery(text),
+        }
+    if doc_type is DocType.MEDICAL_RECEIPT:
+        # 항목별 진료비 세부내역은 표 구조가 필요해 ocr_worker.pipeline의 하이브리드
+        # VLM 경로가 entities["table_markdown"]에 채운다.
         return {}
     return {}
