@@ -102,7 +102,7 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.service }}
           cache-to: type=gha,mode=max,scope=${{ matrix.service }}
 
-      # 대상 EC2/compose 경로를 target에 따라 결정. ocr=GPU EC2 / corpus=경량 EC2(brbs-etl) / backend=범용 EC2, 모두 SSM 직접 배포.
+      # 대상 EC2/compose 경로를 target에 따라 결정. ocr=GPU EC2 / backend=범용 EC2, 둘 다 SSM 직접 배포.
       - name: Resolve deploy target
         id: t
         shell: bash
@@ -112,8 +112,7 @@ jobs:
             echo "compose=/opt/ocr/docker-compose.ocr.yml" >> "$GITHUB_OUTPUT"
             echo "envfile=/opt/ocr/.env.ocr" >> "$GITHUB_OUTPUT"
           elif [ "${{ matrix.target }}" = "corpus" ]; then
-            # GPU·Kafka·ollama 불필요한 경량 워커라 OCR과 분리된 EC2(brbs-etl)에 둔다.
-            echo "instance=${{ vars.CORPUS_EC2_INSTANCE_ID }}" >> "$GITHUB_OUTPUT"
+            echo "instance=${{ vars.OCR_EC2_INSTANCE_ID }}" >> "$GITHUB_OUTPUT"  # OCR과 같은 GPU EC2 co-locate
             echo "compose=/opt/corpus/docker-compose.corpus.yml" >> "$GITHUB_OUTPUT"
             echo "envfile=/opt/corpus/.env.corpus" >> "$GITHUB_OUTPUT"
           else
