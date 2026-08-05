@@ -15,4 +15,7 @@ OCR은 범위 밖이다.
 - ``s3``: 내용주소 dedup HeadObject + 멀티파트 ``upload_file``(스레드 격리).
 - ``pipeline``: 문서 1건 스테이징(멱등 재개·dedup·로컬 미잔류).
 - ``__main__``: sync·drain 두 태스크를 도는 상시 워커(우아한 종료).
+
+CD 배선 검증: corpus 배포 타겟을 brbs-etl(CORPUS_EC2_INSTANCE_ID)로 분리한 뒤
+실제 배포 job이 해당 인스턴스로 도는지 확인하기 위한 무해한 트리거 커밋.
 """
