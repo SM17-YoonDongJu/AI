@@ -6,23 +6,40 @@ Kafka·DB·GPU·PIL 없이 경계(프로듀서·풀·OCR 프로세서·이미지
 - 멱등 단락: 이미 저장된 job_id는 OCR을 건너뛰고 ReportJob만 재발행하는가.
 - 결정적 report_id: 같은 ocr_result_id면 같은 report_id인가(재발행 멱등).
 - fail-closed: 마스킹 후 고민감 PII가 남으면 저장·발행 없이 예외로 격리되는가.
+- 원본 삭제 게이트: 이미지 마스킹 검증(5.1+5.2)을 전 페이지가 통과할 때만 S3 원본을
+  지우는가(실패 시 보존 + 로그, 예외 없음). 삭제는 저장 성공 **이후에** 트리거되지만
+  ``ReportJob`` 발행이 그 완료를 기다리지 않는가(fire-and-forget).
+- 삭제 outbox: 저장이 삭제 대상('pending')·비대상('not_eligible')을 남기는가, 즉시
+  삭제의 성공/실패가 outbox에 반영되는가, 스윕이 남은 건을 재시도·기록하는가.
 
 마스킹 자체(정규식·NER)의 정확성은 test_masking 계열이 다룬다 — 여기서는 실제
 기본 마스커(정규식, torch 불필요)를 써 배선이 실제로 PII를 가리는지까지 확인한다.
 """
 
+import asyncio
 import json
 import uuid
 from datetime import UTC, datetime
 from typing import Any
 
 import pytest
+from structlog.testing import capture_logs
 
+from core.config import Settings
 from core.contracts import DocType, OcrJob, ReportJob
+from core.exceptions import OcrError
+from ocr_worker import pipeline as pipeline_module
+from ocr_worker.masking.image_masker import ImageMasker
+from ocr_worker.masking.spans import PiiLabel, Span
 from ocr_worker.masking.verify import MaskingError
 from ocr_worker.ocr import OcrLine, OcrPage, OcrResult
-from ocr_worker.pipeline import OcrPipeline, _derive_report_id
+from ocr_worker.pipeline import ImageTrackResult, OcrPipeline, _derive_report_id
+from ocr_worker.repository import DeleteRetryState, PendingDeletion
 from ocr_worker.vlm_client import VlmClientError
+
+# 삭제가 다시 블로킹이 되면 테스트가 영원히 멎지 않도록 두는 안전 상한(초).
+# 정상 경로는 이 타이머를 쓰지 않고 즉시 끝나므로 flaky 요인이 아니다.
+_NON_BLOCKING_TIMEOUT_S = 5.0
 
 _JOB_ID = "11111111-1111-1111-1111-111111111111"
 _SAVE_ID = uuid.UUID("22222222-2222-2222-2222-222222222222")
@@ -57,12 +74,25 @@ class FakePool:
         return [call for call in self.calls if "INSERT" in call[0]]
 
 
+class _FakeImage:
+    """PIL 이미지 대역 — ``image_to_png_bytes``가 쓰는 ``save``만 흉내낸다(PIL 불필요)."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def save(self, buffer: Any, format: str) -> None:
+        # 인자명은 PIL 시그니처(image.save(fp, format=...))를 그대로 따른다.
+        buffer.write(self.name.encode())
+
+
 class FakeProcessor:
     """OcrProcessor.process_with_images 대역 — 고정 결과·이미지를 돌려주고 호출을 기록한다."""
 
-    def __init__(self, result: OcrResult) -> None:
+    def __init__(self, result: OcrResult, *, engine: Any = None) -> None:
         self._result = result
         self.called = False
+        # 재OCR 검증(5.2)이 프로세서의 엔진을 재사용하므로 같은 속성을 노출한다.
+        self.engine = engine
 
     async def process_with_images(
         self, s3_key: str, content_type: str
@@ -70,7 +100,7 @@ class FakeProcessor:
         self.called = True
         # 이미지 내용 자체는 이미지 트랙 페이크가 무시하지만, _extract_pages가
         # images/pages를 zip(strict=True)하므로 개수는 페이지 수와 맞춰야 한다.
-        return self._result, [object() for _ in self._result.pages]
+        return self._result, [_FakeImage(f"page-{page.index}") for page in self._result.pages]
 
 
 class _IdentityMasker:
@@ -121,8 +151,11 @@ def _job(**overrides: Any) -> OcrJob:
     return OcrJob(**base)
 
 
-async def _fake_image_pipeline(job: OcrJob, result: OcrResult, images: list[object]) -> list[str]:
-    return [f"masked/{job.job_id}/page-0.png"]
+async def _fake_image_pipeline(
+    job: OcrJob, result: OcrResult, images: list[object]
+) -> ImageTrackResult:
+    """이미지 트랙 대역 — 사본 키만 돌려주고 원본 삭제는 판정하지 않는다(게이트는 별도 섹션)."""
+    return ImageTrackResult(keys=[f"masked/{job.job_id}/page-0.png"], delete_original=False)
 
 
 def _pipeline(
@@ -178,8 +211,13 @@ async def test_publishes_masked_image_keys_from_image_track() -> None:
     producer = FakeProducer()
     processor = FakeProcessor(_result("진단서", "상병명 골절"))
 
-    async def two_page_keys(job: OcrJob, result: OcrResult, images: list[object]) -> list[str]:
-        return [f"masked/{job.job_id}/page-0.png", f"masked/{job.job_id}/page-1.png"]
+    async def two_page_keys(
+        job: OcrJob, result: OcrResult, images: list[object]
+    ) -> ImageTrackResult:
+        return ImageTrackResult(
+            keys=[f"masked/{job.job_id}/page-0.png", f"masked/{job.job_id}/page-1.png"],
+            delete_original=False,
+        )
 
     pipeline = OcrPipeline(
         pool=pool,
@@ -733,6 +771,865 @@ async def test_ocr_quality_ok_when_confidence_high_even_without_name_or_domain_i
     # Assert
     insert_args = pool.insert_calls()[0][1]
     assert insert_args[8] == "ok"
+
+
+# ── 원본 삭제 게이트(이미지 마스킹 검증 5.1+5.2) ─────────────────
+class _RecordingS3:
+    """S3 업로드·삭제 대역 — 호출 순서를 한 로그에 담아 "업로드 후 삭제" 계약까지 고정한다.
+
+    ``events``를 밖에서 주입하면 다른 경계(예: DB 저장)의 이벤트와 한 타임라인에 섞어
+    "저장 후 삭제" 같은 교차 순서까지 고정할 수 있다. ``delete_gate``는 삭제를 테스트가
+    열어줄 때까지 붙잡아 둔다 — sleep 없이 "발행이 삭제를 기다리지 않는다"를 결정적으로
+    관찰하기 위한 장치다.
+    """
+
+    def __init__(
+        self,
+        *,
+        delete_error: Exception | None = None,
+        delete_errors: dict[str, Exception] | None = None,
+        events: list[tuple[str, str]] | None = None,
+        delete_gate: asyncio.Event | None = None,
+    ) -> None:
+        self.events: list[tuple[str, str]] = [] if events is None else events
+        self._delete_error = delete_error
+        # 키별 실패 지정(스윕 배치에서 일부만 실패하는 상황용).
+        self._delete_errors = delete_errors or {}
+        self._delete_gate = delete_gate
+        # 삭제 호출이 실제로 끝났는지(성공·실패 무관) — 발행 시점 관찰용.
+        self.delete_finished = asyncio.Event()
+        # 삭제 호출에 **진입**했는지 — "S3 왕복 중"을 붙잡고 취소하는 테스트용.
+        self.delete_started = asyncio.Event()
+
+    async def upload(self, key: str, data: bytes, content_type: str) -> None:
+        self.events.append(("upload", key))
+
+    async def delete(self, key: str) -> None:
+        self.delete_started.set()
+        if self._delete_gate is not None:
+            await self._delete_gate.wait()
+        self.events.append(("delete", key))
+        self.delete_finished.set()
+        error = self._delete_errors.get(key, self._delete_error)
+        if error is not None:
+            raise error
+
+    @property
+    def deleted(self) -> list[str]:
+        return [key for kind, key in self.events if kind == "delete"]
+
+
+class _TimelinePool(FakePool):
+    """저장(INSERT) 시점을 S3 이벤트 로그에 함께 남기는 풀 대역(교차 순서 검증용)."""
+
+    def __init__(self, events: list[tuple[str, str]]) -> None:
+        super().__init__(existing=None)
+        self._events = events
+
+    async def fetchrow(self, sql: str, *args: Any) -> dict[str, Any] | None:
+        # 실제 asyncpg는 네트워크 왕복에서 반드시 루프에 양보한다. 그 양보를 흉내내지
+        # 않으면(진짜 await point 없는 순수 async def) 저장 **전에** 스케줄된 삭제 task가
+        # 끼어들 틈이 없어, 순서가 뒤바뀐 코드도 항상 통과하는 착시가 생긴다.
+        await asyncio.sleep(0)
+        row = await super().fetchrow(sql, *args)
+        if "INSERT" in sql:
+            self._events.append(("save", str(_SAVE_ID)))
+        return row
+
+
+class _ProbingProducer(FakeProducer):
+    """발행 **시점에** 원본 삭제가 끝나 있었는지를 함께 기록하는 프로듀서 대역."""
+
+    def __init__(self, s3: _RecordingS3) -> None:
+        super().__init__()
+        self._s3 = s3
+        self.delete_finished_at_publish: list[bool] = []
+
+    async def publish(self, topic: str, message: ReportJob, *, key: str) -> None:
+        self.delete_finished_at_publish.append(self._s3.delete_finished.is_set())
+        await super().publish(topic, message, key=key)
+
+
+class _FakeReocrEngine:
+    """재OCR(5.2) 엔진 대역 — 마스킹 사본에서 읽히는 텍스트를 고정으로 돌려준다."""
+
+    def __init__(self, text: str = "") -> None:
+        self._text = text
+        self.seen_images: list[str] = []
+
+    def recognize(self, images: list[Any]) -> list[list[OcrLine]]:
+        self.seen_images.append(images[0].name)
+        return [[_line(self._text)]]
+
+
+class _RecordingCoverage:
+    """커버리지 측정(5.1) 대역 — 어떤 이미지의 어느 라인을 쟀는지 기록한다(numpy 불필요)."""
+
+    def __init__(self, ratio: float = 1.0) -> None:
+        self._ratio = ratio
+        self.calls: list[tuple[str, set[int]]] = []
+
+    def __call__(self, image: Any, page: OcrPage, line_indices: set[int]) -> dict[int, float]:
+        self.calls.append((image.name, set(line_indices)))
+        return {index: self._ratio for index in line_indices}
+
+
+def _detect_name(text: str) -> list[Span]:
+    """'홍길동'만 PII로 보는 검출기 대역 — 어느 라인이 가려지는지를 테스트가 통제한다."""
+    start = text.find("홍길동")
+    return [Span(start, start + 3, PiiLabel.NAME)] if start >= 0 else []
+
+
+def _fake_redactor(image: Any, page: OcrPage, indices: set[int], boxes: list[Any]) -> _FakeImage:
+    """검은블럭 렌더 대역 — 원본과 구분되는 이름의 사본을 돌려준다(PIL 불필요)."""
+    return _FakeImage(f"redacted-{page.index}")
+
+
+def _gate_pipeline(
+    pool: FakePool,
+    producer: FakeProducer,
+    processor: FakeProcessor,
+    s3: _RecordingS3,
+    coverage: _RecordingCoverage,
+    **kwargs: Any,
+) -> OcrPipeline:
+    """실제 ``_default_image_pipeline``(렌더→업로드→검증→삭제)을 타는 파이프라인."""
+    return OcrPipeline(
+        pool=pool,
+        producer=producer,  # type: ignore[arg-type]
+        processor=processor,  # type: ignore[arg-type]
+        image_masker=ImageMasker(detect=_detect_name, redactor=_fake_redactor),
+        coverage=coverage,
+        upload=s3.upload,
+        delete=s3.delete,
+        **kwargs,
+    )
+
+
+async def test_original_deleted_after_upload_when_all_pages_verified() -> None:
+    # Arrange: 1페이지엔 PII(가림), 2페이지엔 없음. 커버리지 충분 + 재OCR 잔류 없음.
+    pool = FakePool(existing=None)
+    producer = FakeProducer()
+    engine = _FakeReocrEngine("")
+    processor = FakeProcessor(
+        _multi_page_result("보험증권 계약자 홍길동", "증권번호 202301-042"), engine=engine
+    )
+    s3 = _RecordingS3()
+    coverage = _RecordingCoverage(ratio=1.0)
+    pipeline = _gate_pipeline(pool, producer, processor, s3, coverage)
+
+    # Act: 삭제는 백그라운드 task라 훅으로 완료를 기다린다(sleep 없이 결정적).
+    await pipeline.handle(_job())
+    await pipeline.wait_for_pending_deletes()
+
+    # Assert: 사본 2장 업로드가 모두 끝난 **뒤에** 원본을 지운다.
+    assert s3.events == [
+        ("upload", f"masked/{_JOB_ID}/page-0.png"),
+        ("upload", f"masked/{_JOB_ID}/page-1.png"),
+        ("delete", "uploads/x.pdf"),
+    ]
+    # 검증은 원본이 아니라 **마스킹 사본**을 대상으로, redact가 가린 라인을 그대로 잰다.
+    assert coverage.calls == [("redacted-0", {0})]
+    assert engine.seen_images == ["redacted-0"]
+
+
+async def test_original_kept_when_coverage_below_threshold() -> None:
+    # Arrange: 5.1 커버리지 미달(검은블럭이 bbox를 덜 덮음).
+    pool = FakePool(existing=None)
+    producer = FakeProducer()
+    processor = FakeProcessor(
+        _multi_page_result("보험증권 계약자 홍길동"), engine=_FakeReocrEngine("")
+    )
+    s3 = _RecordingS3()
+    pipeline = _gate_pipeline(pool, producer, processor, s3, _RecordingCoverage(ratio=0.5))
+
+    # Act
+    await pipeline.handle(_job())
+
+    # Assert: 원본 보존. 예외는 던지지 않고 저장·발행은 정상 진행된다(사본은 이미 업로드됨).
+    assert s3.deleted == []
+    assert json.loads(pool.insert_calls()[0][1][7]) == [f"masked/{_JOB_ID}/page-0.png"]
+    assert len(producer.published) == 1
+    # 검증 실패분은 outbox에서도 'not_eligible' — 스윕이 나중에 집어 지우면 게이트를
+    # 우회하는 셈이 된다(원본 삭제는 되돌릴 수 없다).
+    assert pool.insert_calls()[0][1][10] == "not_eligible"
+
+
+async def test_original_kept_when_reocr_finds_residual_pii() -> None:
+    # Arrange: 5.2 — 블럭이 빗나가 사본 재OCR에서 주민번호가 다시 읽힌다.
+    pool = FakePool(existing=None)
+    producer = FakeProducer()
+    processor = FakeProcessor(
+        _multi_page_result("보험증권 계약자 홍길동"), engine=_FakeReocrEngine("901010-1234567")
+    )
+    s3 = _RecordingS3()
+    pipeline = _gate_pipeline(pool, producer, processor, s3, _RecordingCoverage(ratio=1.0))
+
+    # Act
+    await pipeline.handle(_job())
+
+    # Assert
+    assert s3.deleted == []
+    assert len(producer.published) == 1  # 파이프라인은 정상 완료(DLQ 사안 아님)
+
+
+async def test_pages_without_pii_are_not_reocred_and_do_not_block_delete() -> None:
+    # Arrange: 어느 페이지에도 PII가 없다 — 가린 게 없으니 검증(재OCR)도 돌리지 않지만,
+    # OCR 텍스트 자체는 읽혔으므로 원본 삭제는 막지 않는다.
+    pool = FakePool(existing=None)
+    producer = FakeProducer()
+    engine = _FakeReocrEngine("")
+    processor = FakeProcessor(_multi_page_result("보험증권", "증권번호 202301-042"), engine=engine)
+    s3 = _RecordingS3()
+    coverage = _RecordingCoverage(ratio=1.0)
+    pipeline = _gate_pipeline(pool, producer, processor, s3, coverage)
+
+    # Act
+    await pipeline.handle(_job())
+    await pipeline.wait_for_pending_deletes()
+
+    # Assert
+    assert engine.seen_images == []  # 가장 비싼 재OCR을 무의미하게 돌리지 않는다
+    assert coverage.calls == []
+    assert s3.deleted == ["uploads/x.pdf"]
+
+
+async def test_original_kept_when_ocr_read_no_text() -> None:
+    # Arrange: OCR이 한 줄도 못 읽음 — "가릴 게 없다"와 "못 읽어서 못 가렸다"를 구분할 수
+    # 없으므로 원본을 지우지 않는다(사본 == 원본). 저신뢰도라 VLM도 트리거되므로 실패로 페이크.
+    pool = FakePool(existing=None)
+    producer = FakeProducer()
+    empty = OcrResult(pages=(OcrPage(index=0, width=100, height=50, lines=()),))
+    processor = FakeProcessor(empty, engine=_FakeReocrEngine(""))
+    s3 = _RecordingS3()
+    pipeline = _gate_pipeline(
+        pool,
+        producer,
+        processor,
+        s3,
+        _RecordingCoverage(ratio=1.0),
+        vlm_transcribe=_RecordingVlm(error=VlmClientError("연결 실패")),
+    )
+
+    # Act
+    await pipeline.handle(_job())
+
+    # Assert
+    assert s3.deleted == []
+    assert len(producer.published) == 1
+
+
+async def test_original_kept_when_only_one_page_has_no_ocr_text() -> None:
+    # Arrange: 혼합 문서 — 1페이지는 읽혔고(PII까지 가려짐) 2페이지만 라인 0개.
+    # 가드가 **페이지 단위**여야 이 문서를 잡는다. 문서 레벨(`all(not page.lines)`)로
+    # 되돌리면 "읽힌 페이지가 하나라도 있으니 통과"가 돼, 미마스킹 원본 그대로인
+    # 2페이지 사본을 남긴 채 원본을 지워버린다(복구 불가).
+    pool = FakePool(existing=None)
+    producer = FakeProducer()
+    mixed = OcrResult(
+        pages=(
+            OcrPage(index=0, width=100, height=50, lines=(_line("보험증권 계약자 홍길동"),)),
+            OcrPage(index=1, width=100, height=50, lines=()),
+        )
+    )
+    processor = FakeProcessor(mixed, engine=_FakeReocrEngine(""))
+    s3 = _RecordingS3()
+    pipeline = _gate_pipeline(pool, producer, processor, s3, _RecordingCoverage(ratio=1.0))
+
+    # Act
+    await pipeline.handle(_job())
+    await pipeline.wait_for_pending_deletes()
+
+    # Assert: 사본 2장은 올라가되 원본은 남는다(예외 없이 저장·발행은 정상 진행).
+    assert s3.deleted == []
+    assert json.loads(pool.insert_calls()[0][1][7]) == [
+        f"masked/{_JOB_ID}/page-0.png",
+        f"masked/{_JOB_ID}/page-1.png",
+    ]
+    assert len(producer.published) == 1
+
+
+async def test_delete_failure_does_not_fail_the_job() -> None:
+    # Arrange: 검증은 통과했지만 S3 삭제가 실패 — 사본·저장은 이미 유효하므로 작업을
+    # 되돌리지 않는다(원본이 남을 뿐, 운영 정리 대상). 백그라운드 task라 Kafka 재시도가
+    # 이 실패를 받아주지 못하므로, 조용히 사라지지 않고 경고로 드러나는지까지 본다.
+    pool = FakePool(existing=None)
+    producer = FakeProducer()
+    processor = FakeProcessor(
+        _multi_page_result("보험증권 계약자 홍길동"), engine=_FakeReocrEngine("")
+    )
+    s3 = _RecordingS3(delete_error=OcrError("S3 삭제 실패: uploads/x.pdf"))
+    pipeline = _gate_pipeline(pool, producer, processor, s3, _RecordingCoverage(ratio=1.0))
+
+    # Act
+    with capture_logs() as logs:
+        await pipeline.handle(_job())
+        published_before_delete = len(producer.published)
+        await pipeline.wait_for_pending_deletes()
+
+    # Assert
+    assert published_before_delete == 1  # 실패할 삭제를 기다리지 않고 이미 발행됐다
+    assert s3.deleted == ["uploads/x.pdf"]  # 시도는 했다
+    events = [entry["event"] for entry in logs]
+    assert "original_delete_failed" in events  # task 완료 후 경고가 남는다
+    # _delete_original이 이미 흡수했으므로 콜백의 "예기치 못한 예외" 경로는 타지 않는다.
+    assert "original_delete_task_error" not in events
+    assert pipeline._pending_deletes == set()  # 실패해도 task 참조를 흘리지 않는다
+
+
+async def test_unexpected_delete_exception_is_retrieved_and_logged() -> None:
+    # Arrange: _delete_original의 `except OcrError` 방어선을 빠져나가는 예외.
+    # fire-and-forget이라 아무도 결과를 안 읽으면 asyncio의 "Task exception was never
+    # retrieved"만 뜨고 실패가 묻힌다 — 콜백이 꺼내 경고로 드러내는지 확인한다.
+    pool = FakePool(existing=None)
+    producer = FakeProducer()
+    processor = FakeProcessor(
+        _multi_page_result("보험증권 계약자 홍길동"), engine=_FakeReocrEngine("")
+    )
+    s3 = _RecordingS3(delete_error=RuntimeError("boto3 내부 오류"))
+    pipeline = _gate_pipeline(pool, producer, processor, s3, _RecordingCoverage(ratio=1.0))
+
+    # Act
+    with capture_logs() as logs:
+        await pipeline.handle(_job())
+        await pipeline.wait_for_pending_deletes()
+
+    # Assert: 작업 자체는 정상 완료되고, 예외는 타입만 로그로 남는다(§9 — 메시지 금지).
+    assert len(producer.published) == 1
+    task_errors = [entry for entry in logs if entry["event"] == "original_delete_task_error"]
+    assert [entry["error_type"] for entry in task_errors] == ["RuntimeError"]
+    assert "boto3 내부 오류" not in json.dumps(logs, default=str)
+    assert pipeline._pending_deletes == set()
+
+
+async def test_cancelled_delete_task_is_logged_and_released() -> None:
+    # Arrange: 삭제 task가 취소되는 경우(종료 중 루프 teardown 등). 콜백이 CancelledError를
+    # exception()으로 건드리지 않고(그러면 되던지기) 경고만 남기고 참조를 놓는지 본다.
+    gate = asyncio.Event()  # 열지 않는다 — task를 취소 가능한 상태로 붙잡아 둔다.
+    s3 = _RecordingS3(delete_gate=gate)
+    pipeline = _gate_pipeline(
+        FakePool(existing=None),
+        FakeProducer(),
+        FakeProcessor(_multi_page_result("보험증권"), engine=_FakeReocrEngine("")),
+        s3,
+        _RecordingCoverage(ratio=1.0),
+    )
+
+    # Act: 파이프라인 전체를 돌릴 필요 없이 스케줄러만 직접 호출한다(콜백 단위 검증).
+    with capture_logs() as logs:
+        pipeline._schedule_original_delete(_job(), str(_SAVE_ID))
+        task = next(iter(pipeline._pending_deletes))
+        task.cancel()
+        await pipeline.wait_for_pending_deletes()
+
+    # Assert
+    assert task.cancelled()
+    assert s3.deleted == []  # 게이트를 못 넘었으므로 S3는 건드리지 않았다
+    assert "original_delete_cancelled" in [entry["event"] for entry in logs]
+    assert pipeline._pending_deletes == set()
+
+
+async def test_report_is_published_without_waiting_for_original_delete() -> None:
+    # Arrange: 삭제를 게이트로 붙잡아 둔다 — 발행이 S3 왕복 완료를 기다리는지 본다.
+    # sleep 대신 asyncio.Event를 써서 타이밍 의존(flaky) 없이 결정적으로 관찰한다.
+    gate = asyncio.Event()
+    s3 = _RecordingS3(delete_gate=gate)
+    pool = FakePool(existing=None)
+    producer = _ProbingProducer(s3)
+    processor = FakeProcessor(
+        _multi_page_result("보험증권 계약자 홍길동"), engine=_FakeReocrEngine("")
+    )
+    pipeline = _gate_pipeline(pool, producer, processor, s3, _RecordingCoverage(ratio=1.0))
+
+    # Act: 게이트를 열지 않은 채로 핸들러가 끝나야 한다. 블로킹으로 되돌아가면 영원히
+    # 멎으므로 상한을 둔다 — 정상 경로에선 대기가 없어 벽시계 시간을 쓰지 않는다.
+    async with asyncio.timeout(_NON_BLOCKING_TIMEOUT_S):
+        await pipeline.handle(_job())
+
+    # Assert: 발행은 끝났고, 그 시점에 삭제는 아직 진행 중이었다.
+    assert producer.delete_finished_at_publish == [False]
+    assert len(producer.published) == 1
+    assert s3.deleted == []
+
+    # 게이트를 열면 백그라운드 task가 삭제를 마치고 참조도 정리된다.
+    gate.set()
+    await pipeline.wait_for_pending_deletes()
+    assert s3.deleted == ["uploads/x.pdf"]
+    assert pipeline._pending_deletes == set()
+
+
+async def test_original_delete_is_triggered_only_after_ocr_result_saved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Arrange: 저장(INSERT)·S3·outbox 기록을 한 타임라인에 기록한다 — non-blocking 전환
+    # 후에도 "저장 성공 이후에만 삭제"라는 순서 계약(저장 전 삭제 = 복구 불가)이
+    # 유지되는지, 그리고 종결 기록이 **실제 삭제 뒤에** 오는지(먼저 쓰면 지우지도 않은
+    # 원본을 'deleted'로 종결시켜 스윕이 영영 재시도하지 않는다) 고정한다.
+    # 페이크(_TimelinePool·_RecordingOutbox)는 실제 asyncpg처럼 루프에 양보한다 —
+    # 양보하지 않으면 백그라운드 삭제 task가 끼어들 틈이 없어 순서 회귀를 못 잡는다.
+    events: list[tuple[str, str]] = []
+    outbox = _RecordingOutbox(events=events)
+    _install_outbox(monkeypatch, outbox)
+    pool = _TimelinePool(events)
+    producer = FakeProducer()
+    processor = FakeProcessor(
+        _multi_page_result("보험증권 계약자 홍길동"), engine=_FakeReocrEngine("")
+    )
+    s3 = _RecordingS3(events=events)
+    pipeline = _gate_pipeline(pool, producer, processor, s3, _RecordingCoverage(ratio=1.0))
+
+    # Act
+    await pipeline.handle(_job())
+    await pipeline.wait_for_pending_deletes()
+
+    # Assert
+    assert [kind for kind, _ in events] == ["upload", "save", "delete", "record_success"]
+
+
+async def test_original_not_deleted_when_no_pages_rendered() -> None:
+    # Arrange: 페이지 이미지가 없으면 비식별 사본 자체가 없다 → 삭제 게이트 진입 금지.
+    pool = FakePool(existing=None)
+    producer = FakeProducer()
+    processor = FakeProcessor(OcrResult(pages=()), engine=_FakeReocrEngine(""))
+    s3 = _RecordingS3()
+    pipeline = _gate_pipeline(pool, producer, processor, s3, _RecordingCoverage(ratio=1.0))
+
+    # Act
+    await pipeline.handle(_job())
+
+    # Assert
+    assert s3.events == []
+    assert json.loads(pool.insert_calls()[0][1][7]) == []
+
+
+# ── 원본 삭제 outbox(재시도) ─────────────────────────────────────
+class _RecordingOutbox:
+    """repository의 outbox 기록 함수 대역 — 어떤 결과를 어떤 인자로 남겼는지 포착한다.
+
+    ``events``를 주입하면 S3·DB 이벤트와 한 타임라인에 섞어 "삭제 → 기록" 같은 교차
+    순서까지 고정할 수 있다. 각 메서드는 실제 asyncpg처럼 **루프에 양보한다**
+    (``asyncio.sleep(0)``) — 양보하지 않는 순수 ``async def``는 백그라운드 task가
+    끼어들 틈을 없애, 순서가 뒤바뀐 코드도 통과시키는 착시를 만든다.
+    """
+
+    def __init__(
+        self,
+        *,
+        events: list[tuple[str, str]] | None = None,
+        error_on: str | None = None,
+        attempts: dict[str, int] | None = None,
+    ) -> None:
+        self.events: list[tuple[str, str]] = [] if events is None else events
+        self.successes: list[str] = []
+        self.failures: list[tuple[str, int, float]] = []
+        self._error_on = error_on  # 이 ocr_result_id 기록 시 DB 오류를 낸다
+        # 행별 누적 시도 횟수(= DB 컬럼). SQL의 CASE와 같은 규칙으로 상태를 계산해,
+        # 호출측이 **반환값**으로 exhausted를 판정하는지 검증할 수 있게 한다.
+        self._attempts: dict[str, int] = dict(attempts or {})
+
+    async def record_success(self, pool: Any, ocr_result_id: str) -> None:
+        await asyncio.sleep(0)
+        if self._error_on == ocr_result_id:
+            raise RuntimeError("DB 연결 끊김")
+        self.successes.append(ocr_result_id)
+        self.events.append(("record_success", ocr_result_id))
+
+    async def record_failure(
+        self, pool: Any, ocr_result_id: str, max_attempts: int, retry_interval_seconds: float
+    ) -> DeleteRetryState:
+        await asyncio.sleep(0)
+        if self._error_on == ocr_result_id:
+            raise RuntimeError("DB 연결 끊김")
+        self.failures.append((ocr_result_id, max_attempts, retry_interval_seconds))
+        self.events.append(("record_failure", ocr_result_id))
+        attempts = self._attempts.get(ocr_result_id, 0) + 1
+        self._attempts[ocr_result_id] = attempts
+        # UPDATE ... RETURNING이 돌려주는 **갱신 후** 상태(SQL CASE와 같은 규칙).
+        status = "exhausted" if attempts >= max_attempts else "pending"
+        return DeleteRetryState(status=status, attempts=attempts)
+
+
+class _FakeDueDeletions:
+    """``fetch_due_deletions`` 대역 — 고정 배치를 돌려주고 요청 limit을 기록한다."""
+
+    def __init__(self, rows: list[PendingDeletion]) -> None:
+        self._rows = rows
+        self.limits: list[int] = []
+
+    async def __call__(self, pool: Any, limit: int) -> list[PendingDeletion]:
+        await asyncio.sleep(0)  # 실제 조회의 네트워크 왕복 양보를 흉내
+        self.limits.append(limit)
+        return self._rows
+
+
+def _install_outbox(
+    monkeypatch: pytest.MonkeyPatch,
+    outbox: _RecordingOutbox,
+    due: _FakeDueDeletions | None = None,
+) -> None:
+    """파이프라인이 부르는 repository 함수를 페이크로 갈아끼운다(DB 불필요)."""
+    monkeypatch.setattr(pipeline_module, "record_delete_success", outbox.record_success)
+    monkeypatch.setattr(pipeline_module, "record_delete_failure", outbox.record_failure)
+    if due is not None:
+        monkeypatch.setattr(pipeline_module, "fetch_due_deletions", due)
+
+
+def _sweep_pipeline(s3: _RecordingS3, settings: Settings | None = None) -> OcrPipeline:
+    """스윕만 돌리는 최소 파이프라인(OCR·이미지 트랙은 타지 않는다)."""
+    return OcrPipeline(
+        pool=FakePool(existing=None),  # type: ignore[arg-type]
+        producer=FakeProducer(),  # type: ignore[arg-type]
+        processor=FakeProcessor(OcrResult(pages=())),  # type: ignore[arg-type]
+        image_masker=ImageMasker(detect=_detect_name, redactor=_fake_redactor),
+        upload=s3.upload,
+        delete=s3.delete,
+        settings=settings,
+    )
+
+
+def _due(key: str, *, attempts: int = 0, row_id: str = "row-1") -> PendingDeletion:
+    return PendingDeletion(id=row_id, original_s3_key=key, original_delete_attempts=attempts)
+
+
+async def test_save_marks_outbox_pending_for_deletable_original(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Arrange: 검증 통과 → 저장 시 outbox에 삭제 대상('pending')으로 남아야 한다.
+    # 이게 있어야 즉시 삭제 전에 crash가 나도 스윕이 이어받을 근거가 생긴다.
+    outbox = _RecordingOutbox()
+    _install_outbox(monkeypatch, outbox)
+    pool = FakePool(existing=None)
+    processor = FakeProcessor(
+        _multi_page_result("보험증권 계약자 홍길동"), engine=_FakeReocrEngine("")
+    )
+    s3 = _RecordingS3()
+    pipeline = _gate_pipeline(pool, FakeProducer(), processor, s3, _RecordingCoverage(ratio=1.0))
+
+    # Act
+    await pipeline.handle(_job())
+    await pipeline.wait_for_pending_deletes()
+
+    # Assert
+    insert_args = pool.insert_calls()[0][1]
+    assert insert_args[9] == "uploads/x.pdf"  # 스윕이 다시 쓸 원본 키
+    assert insert_args[10] == "pending"
+
+
+async def test_immediate_delete_success_marks_outbox_deleted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Arrange
+    outbox = _RecordingOutbox()
+    _install_outbox(monkeypatch, outbox)
+    processor = FakeProcessor(
+        _multi_page_result("보험증권 계약자 홍길동"), engine=_FakeReocrEngine("")
+    )
+    s3 = _RecordingS3()
+    pipeline = _gate_pipeline(
+        FakePool(existing=None), FakeProducer(), processor, s3, _RecordingCoverage(ratio=1.0)
+    )
+
+    # Act
+    await pipeline.handle(_job())
+    await pipeline.wait_for_pending_deletes()
+
+    # Assert: 저장이 돌려준 id로 종결 기록 — 스윕이 같은 행을 다시 집지 않는다.
+    assert s3.deleted == ["uploads/x.pdf"]
+    assert outbox.successes == [str(_SAVE_ID)]
+    assert outbox.failures == []
+
+
+async def test_immediate_delete_failure_records_retry_with_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Arrange: 즉시 삭제 실패는 Kafka 재시도가 못 받는다(fire-and-forget) — 유일한
+    # 재시도 경로가 outbox이므로, 실패가 설정된 상한·간격과 함께 기록돼야 한다.
+    outbox = _RecordingOutbox()
+    _install_outbox(monkeypatch, outbox)
+    processor = FakeProcessor(
+        _multi_page_result("보험증권 계약자 홍길동"), engine=_FakeReocrEngine("")
+    )
+    s3 = _RecordingS3(delete_error=OcrError("S3 삭제 실패: uploads/x.pdf"))
+    pipeline = _gate_pipeline(
+        FakePool(existing=None),
+        FakeProducer(),
+        processor,
+        s3,
+        _RecordingCoverage(ratio=1.0),
+        settings=Settings(ocr_delete_max_attempts=3, ocr_delete_retry_interval_seconds=60.0),
+    )
+
+    # Act
+    with capture_logs() as logs:
+        await pipeline.handle(_job())
+        await pipeline.wait_for_pending_deletes()
+
+    # Assert
+    assert outbox.failures == [(str(_SAVE_ID), 3, 60.0)]
+    assert outbox.successes == []
+    assert "original_delete_failed" in [entry["event"] for entry in logs]  # 기존 로그 유지
+
+
+async def test_outbox_update_failure_does_not_break_delete_flow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Arrange: outbox 갱신(DB)이 죽어도 삭제 로깅·task 정리는 그대로여야 한다 — 둘은
+    # 독립이다. 기록 실패는 "스윕이 한 번 더 지운다"(멱등)로 흡수된다.
+    outbox = _RecordingOutbox(error_on=str(_SAVE_ID))
+    _install_outbox(monkeypatch, outbox)
+    processor = FakeProcessor(
+        _multi_page_result("보험증권 계약자 홍길동"), engine=_FakeReocrEngine("")
+    )
+    s3 = _RecordingS3()
+    pipeline = _gate_pipeline(
+        FakePool(existing=None), FakeProducer(), processor, s3, _RecordingCoverage(ratio=1.0)
+    )
+
+    # Act
+    with capture_logs() as logs:
+        await pipeline.handle(_job())
+        await pipeline.wait_for_pending_deletes()
+
+    # Assert
+    events = [entry["event"] for entry in logs]
+    assert s3.deleted == ["uploads/x.pdf"]
+    assert "original_deleted" in events  # 삭제 사실은 그대로 남는다
+    assert "original_delete_outbox_update_failed" in events
+    # 예외가 task 밖으로 새지 않는다(§9: 메시지 말고 타입만).
+    assert "original_delete_task_error" not in events
+    assert "DB 연결 끊김" not in json.dumps(logs, default=str)
+    assert pipeline._pending_deletes == set()
+
+
+async def test_sweep_retries_pending_rows_and_records_each_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Arrange: 두 건 중 하나만 S3 삭제가 실패한다.
+    outbox = _RecordingOutbox()
+    due = _FakeDueDeletions(
+        [
+            _due("uploads/a.pdf", row_id="row-a"),
+            _due("uploads/b.pdf", row_id="row-b", attempts=1),
+        ]
+    )
+    _install_outbox(monkeypatch, outbox, due)
+    s3 = _RecordingS3(delete_errors={"uploads/b.pdf": OcrError("S3 삭제 실패: uploads/b.pdf")})
+    pipeline = _sweep_pipeline(
+        s3, Settings(ocr_delete_max_attempts=5, ocr_delete_retry_interval_seconds=900.0)
+    )
+
+    # Act
+    with capture_logs() as logs:
+        swept = await pipeline.sweep_pending_deletes(batch_size=10)
+
+    # Assert
+    assert swept == 2  # 시도 건수(성공·실패 무관)
+    assert due.limits == [10]
+    assert s3.deleted == ["uploads/a.pdf", "uploads/b.pdf"]
+    assert outbox.successes == ["row-a"]
+    assert outbox.failures == [("row-b", 5, 900.0)]
+    events = [entry["event"] for entry in logs]
+    assert "sweep_delete_succeeded" in events
+    assert "sweep_delete_failed" in events
+
+
+async def test_sweep_row_error_does_not_block_remaining_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Arrange: 첫 행에서 OcrError 방어선을 빠져나가는 예외가 난다. 배치가 통째로
+    # 멈추면 그 뒤 행들은 다음 주기까지(15분) 방치된다.
+    outbox = _RecordingOutbox()
+    due = _FakeDueDeletions(
+        [_due("uploads/a.pdf", row_id="row-a"), _due("uploads/b.pdf", row_id="row-b")]
+    )
+    _install_outbox(monkeypatch, outbox, due)
+    s3 = _RecordingS3(delete_errors={"uploads/a.pdf": RuntimeError("boto3 내부 오류")})
+    pipeline = _sweep_pipeline(s3)
+
+    # Act
+    with capture_logs() as logs:
+        swept = await pipeline.sweep_pending_deletes()
+
+    # Assert: 두 번째 행은 정상 처리된다.
+    assert swept == 2
+    assert outbox.successes == ["row-b"]
+    row_errors = [entry for entry in logs if entry["event"] == "sweep_delete_error"]
+    assert [entry["error_type"] for entry in row_errors] == ["RuntimeError"]
+    assert "boto3 내부 오류" not in json.dumps(logs, default=str)  # §9 — 메시지 금지
+
+
+async def test_sweep_logs_error_when_attempts_exhausted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Arrange: 이번 실패로 상한(3)을 채우는 행 + 아직 여유가 있는 행.
+    # 소진은 자동 재시도가 끝났다는 뜻이라 운영 개입 신호(error)여야 한다.
+    # 판정은 **DB가 돌려준 갱신 후 상태**로 한다 — fetch 스냅샷(row.attempts)으로
+    # 미리 계산하면 조회~UPDATE 사이 갱신을 놓쳐 로그와 DB가 어긋난다. 그래서 이
+    # 테스트는 fetch 쪽 attempts를 **일부러 0으로 주고**(stale 흉내) outbox 쪽에만
+    # 실제 누적치를 심는다 — 사전 계산으로 되돌리면 두 행 모두 warning이 돼 실패한다.
+    outbox = _RecordingOutbox(attempts={"row-last": 2})
+    due = _FakeDueDeletions(
+        [
+            _due("uploads/last.pdf", row_id="row-last", attempts=0),
+            _due("uploads/more.pdf", row_id="row-more", attempts=0),
+        ]
+    )
+    _install_outbox(monkeypatch, outbox, due)
+    s3 = _RecordingS3(delete_error=OcrError("S3 삭제 실패"))
+    pipeline = _sweep_pipeline(s3, Settings(ocr_delete_max_attempts=3))
+
+    # Act
+    with capture_logs() as logs:
+        await pipeline.sweep_pending_deletes()
+
+    # Assert
+    failures = [entry for entry in logs if entry["event"] == "sweep_delete_failed"]
+    exhausted = [entry for entry in failures if entry["ocr_result_id"] == "row-last"]
+    retrying = [entry for entry in failures if entry["ocr_result_id"] == "row-more"]
+    assert [(entry["log_level"], entry["exhausted"], entry["attempts"]) for entry in exhausted] == [
+        ("error", True, 3)
+    ]
+    assert [(entry["log_level"], entry["exhausted"]) for entry in retrying] == [("warning", False)]
+
+
+async def test_immediate_delete_logs_error_when_it_exhausts_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Arrange: max_attempts=1(재시도 비활성 목적으로 쓸 수 있는 설정)이면 **즉시 삭제
+    # 실패 한 번이 그 자리에서 exhausted로 종결**시킨다. 그러면 스윕은 그 행을 다시
+    # 조회하지 못하므로(pending이 아니다) 여기서 error를 안 남기면 운영 신호가 지연이
+    # 아니라 **영구 소실**된다 — PII 원본이 S3에 고아로 남는데 아무도 모른다.
+    outbox = _RecordingOutbox()
+    _install_outbox(monkeypatch, outbox)
+    processor = FakeProcessor(
+        _multi_page_result("보험증권 계약자 홍길동"), engine=_FakeReocrEngine("")
+    )
+    s3 = _RecordingS3(delete_error=OcrError("S3 삭제 실패: uploads/x.pdf"))
+    pipeline = _gate_pipeline(
+        FakePool(existing=None),
+        FakeProducer(),
+        processor,
+        s3,
+        _RecordingCoverage(ratio=1.0),
+        settings=Settings(ocr_delete_max_attempts=1),
+    )
+
+    # Act
+    with capture_logs() as logs:
+        await pipeline.handle(_job())
+        await pipeline.wait_for_pending_deletes()
+
+    # Assert
+    failed = [entry for entry in logs if entry["event"] == "original_delete_failed"]
+    assert [(entry["log_level"], entry["exhausted"], entry["attempts"]) for entry in failed] == [
+        ("error", True, 1)
+    ]
+
+
+async def test_immediate_delete_failure_below_limit_stays_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Arrange: 상한에 여유가 있으면 스윕이 이어받으므로 경고면 충분하다(알림 노이즈 방지).
+    outbox = _RecordingOutbox()
+    _install_outbox(monkeypatch, outbox)
+    processor = FakeProcessor(
+        _multi_page_result("보험증권 계약자 홍길동"), engine=_FakeReocrEngine("")
+    )
+    s3 = _RecordingS3(delete_error=OcrError("S3 삭제 실패: uploads/x.pdf"))
+    pipeline = _gate_pipeline(
+        FakePool(existing=None),
+        FakeProducer(),
+        processor,
+        s3,
+        _RecordingCoverage(ratio=1.0),
+        settings=Settings(ocr_delete_max_attempts=5),
+    )
+
+    # Act
+    with capture_logs() as logs:
+        await pipeline.handle(_job())
+        await pipeline.wait_for_pending_deletes()
+
+    # Assert
+    failed = [entry for entry in logs if entry["event"] == "original_delete_failed"]
+    assert [(entry["log_level"], entry["exhausted"]) for entry in failed] == [("warning", False)]
+
+
+async def test_delete_failure_log_falls_back_to_warning_when_outbox_update_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Arrange: outbox 갱신이 죽어 상태를 모르는 경우. 행은 아직 pending이라 스윕이
+    # 다시 시도하므로 error가 아니라 warning이 맞다(정말 소진되면 그때 error가 뜬다).
+    outbox = _RecordingOutbox(error_on=str(_SAVE_ID))
+    _install_outbox(monkeypatch, outbox)
+    processor = FakeProcessor(
+        _multi_page_result("보험증권 계약자 홍길동"), engine=_FakeReocrEngine("")
+    )
+    s3 = _RecordingS3(delete_error=OcrError("S3 삭제 실패: uploads/x.pdf"))
+    pipeline = _gate_pipeline(
+        FakePool(existing=None),
+        FakeProducer(),
+        processor,
+        s3,
+        _RecordingCoverage(ratio=1.0),
+        settings=Settings(ocr_delete_max_attempts=1),  # 상태를 알았다면 error였을 설정
+    )
+
+    # Act
+    with capture_logs() as logs:
+        await pipeline.handle(_job())
+        await pipeline.wait_for_pending_deletes()
+
+    # Assert
+    failed = [entry for entry in logs if entry["event"] == "original_delete_failed"]
+    assert [(entry["log_level"], entry["exhausted"], entry["attempts"]) for entry in failed] == [
+        ("warning", False, None)
+    ]
+    assert "original_delete_outbox_update_failed" in [entry["event"] for entry in logs]
+
+
+async def test_sweep_is_cancelled_mid_flight_without_recording_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Arrange: 종료 중 스윕이 S3 왕복 도중 취소되는 경우. 어중간한 outbox 기록을
+    # 남기면(성공도 실패도 아닌데 기록) 행이 종결되거나 attempts만 축나 다음 기동이
+    # 재처리하지 못한다 — 아무것도 안 남기고 pending 그대로 두는 게 맞다.
+    outbox = _RecordingOutbox()
+    due = _FakeDueDeletions([_due("uploads/a.pdf", row_id="row-a")])
+    _install_outbox(monkeypatch, outbox, due)
+    gate = asyncio.Event()  # 열지 않는다 — 삭제를 S3 왕복 중 상태로 붙잡아 둔다.
+    s3 = _RecordingS3(delete_gate=gate)
+    pipeline = _sweep_pipeline(s3)
+
+    # Act
+    task = asyncio.create_task(pipeline.sweep_pending_deletes())
+    await s3.delete_started.wait()  # 실제로 S3 호출에 들어간 뒤 취소한다
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # Assert: 기록 없음 → 행은 pending으로 남아 다음 기동 스윕이 그대로 재처리한다.
+    assert outbox.successes == [] and outbox.failures == []
+    assert s3.deleted == []
+
+
+async def test_sweep_is_noop_when_no_rows_are_due(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Arrange: 대기열이 비면(정상 상태) S3를 건드리지도, 요약 로그를 남기지도 않는다.
+    outbox = _RecordingOutbox()
+    due = _FakeDueDeletions([])
+    _install_outbox(monkeypatch, outbox, due)
+    s3 = _RecordingS3()
+    pipeline = _sweep_pipeline(s3)
+
+    # Act
+    with capture_logs() as logs:
+        swept = await pipeline.sweep_pending_deletes()
+
+    # Assert
+    assert swept == 0
+    assert s3.events == []
+    assert outbox.successes == [] and outbox.failures == []
+    assert "original_delete_sweep" not in [entry["event"] for entry in logs]
 
 
 # ── fail-closed(마스킹 잔류) ─────────────────────────────────────

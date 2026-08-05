@@ -54,6 +54,13 @@ class Settings(BaseSettings):
     aws_region: str = "ap-northeast-2"
     s3_bucket: str = ""
 
+    # --- 원본 삭제 outbox (ocr_results.original_delete_* — ocr_worker 스윕) ---
+    # 마스킹 검증을 통과한 원본 삭제가 실패하면 ocr_results 행에 남겨 재시도한다.
+    ocr_delete_max_attempts: int = 5  # 소진 시 'exhausted'(종결) — S3 라이프사이클이 백스톱
+    # 스윕 주기이자 실패 후 고정 백오프 간격(초). 지수 백오프는 두지 않는다 — 삭제 실패는
+    # 부하가 아니라 권한·네트워크 등 지속성 오류가 대부분이라 간격을 늘려도 이득이 없다.
+    ocr_delete_retry_interval_seconds: float = 900.0
+
     # --- Notion (약관 코퍼스 소스 — jjg 인테그레이션, 공식 REST API) ---
     notion_token: str = ""  # 시크릿(ntn_...). SSM/.env 주입, 코드·커밋 금지
     # 데이터 출처 카탈로그(컨트롤 테이블). /v1/databases/{id}/query용 **database id**

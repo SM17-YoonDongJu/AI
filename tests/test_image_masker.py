@@ -183,8 +183,12 @@ def test_redact_pages_only_redacts_pii_pages() -> None:
     masker = ImageMasker(detect=fake_detect, redactor=fake_redactor)
     out = masker.redact_pages(images, result)
 
-    assert out == ["redacted:[0]", "img1"]  # PII 페이지만 사본, clean은 원본 그대로
+    # PII 페이지만 사본, clean은 원본 그대로
+    assert [page.image for page in out] == ["redacted:[0]", "img1"]
     assert calls == [("img0", {0}, ())]  # redactor는 PII 페이지에만 호출
+    # 검증(5.1)이 쓸 근거가 함께 나온다 — 가린 라인과 "실제로 가렸는가".
+    assert [page.line_indices for page in out] == [{0}, set()]
+    assert [page.redacted for page in out] == [True, False]
 
 
 def test_redact_pages_raises_on_count_mismatch() -> None:
@@ -214,8 +218,11 @@ def test_redact_pages_merges_grounded_boxes_even_without_line_pii() -> None:
     masker = ImageMasker(detect=lambda _t: [], redactor=fake_redactor)
     out = masker.redact_pages(images, result, grounded_boxes)
 
-    assert out == ["redacted"]
+    assert [page.image for page in out] == ["redacted"]
     assert calls == [(set(), ((10, 20, 30, 40),))]
+    # 라인 PII는 없지만 grounding 박스로 가렸으므로 "가린 페이지"로 취급된다(검증 대상).
+    assert out[0].redacted is True
+    assert out[0].extra_boxes == ((10, 20, 30, 40),)
 
 
 def test_redact_pages_raises_on_grounded_boxes_count_mismatch() -> None:

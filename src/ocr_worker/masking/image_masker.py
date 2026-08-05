@@ -21,6 +21,7 @@
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 
 from ocr_worker.masking.masker import Masker
 from ocr_worker.masking.spans import PiiLabel, Span
@@ -40,6 +41,31 @@ VLM_BBOX_MARGIN_PX = 15
 type DetectFn = Callable[[str], list[Span]]
 type GroundFn = Callable[[PageImage], Awaitable[list[tuple[PiiLabel, tuple[int, int, int, int]]]]]
 type RedactFn = Callable[[PageImage, OcrPage, set[int], list[tuple[int, int, int, int]]], PageImage]
+
+
+@dataclass(frozen=True, slots=True)
+class RedactedPage:
+    """비식별 처리한 페이지 1장 + 무엇을 가렸는지에 대한 근거(순수 데이터).
+
+    ``line_indices``는 검증(``image_verify.verify_redacted_page``)이 "가렸어야 할
+    영역"으로 그대로 받는 값이다. 검증 측이 같은 판정(검출→라인 매핑)을 다시 하지
+    않도록(검출 1회 원칙) 렌더 시점의 결과를 그대로 실어 보낸다 — 재검출은 비용도
+    비용이지만, 두 번의 판정이 갈리면 "가린 것"과 "검사하는 것"이 어긋난다.
+
+    Attributes:
+        image: 검은블럭이 적용된 사본. 가릴 것이 없던 페이지는 **원본 이미지 그대로**다.
+        line_indices: 검은블럭 대상으로 판정된 PII 라인 인덱스(원래 ``page.lines`` 기준).
+        extra_boxes: VLM grounding으로 추가로 가린 픽셀 bbox.
+    """
+
+    image: PageImage
+    line_indices: set[int]
+    extra_boxes: tuple[tuple[int, int, int, int], ...]
+
+    @property
+    def redacted(self) -> bool:
+        """실제로 가린 영역이 있는가(``False``면 ``image``는 원본 그대로)."""
+        return bool(self.line_indices or self.extra_boxes)
 
 
 def reading_order(page: OcrPage) -> list[int]:
@@ -251,10 +277,11 @@ class ImageMasker:
         images: list[PageImage],
         result: OcrResult,
         grounded_boxes: list[list[tuple[int, int, int, int]]] | None = None,
-    ) -> list[PageImage]:
-        """페이지별로 PII 라인·영역을 가린 이미지 목록을 반환한다.
+    ) -> list[RedactedPage]:
+        """페이지별로 PII 라인·영역을 가린 결과를 반환한다.
 
-        가릴 게 없는 페이지는 원본 이미지를 그대로 돌려준다(불필요한 사본 생성 회피).
+        가릴 게 없는 페이지는 원본 이미지를 그대로 돌려준다(불필요한 사본 생성 회피) —
+        이 경우 ``RedactedPage.redacted``가 ``False``다.
 
         Args:
             images: 원본 페이지 이미지(``OcrProcessor``가 렌더한 것과 동일 순서·길이).
@@ -263,7 +290,8 @@ class ImageMasker:
                 ``None``이면 라인 기반 검출만 쓴다(기존 동작).
 
         Returns:
-            페이지별 비식별 이미지 목록.
+            페이지별 ``RedactedPage``(이미지 + 가린 근거). 검증(5.1 커버리지)이
+            ``line_indices``를 필요로 해서 이미지만 돌려주지 않는다.
 
         Raises:
             ValueError: 이미지 수와 OCR 페이지 수(또는 grounded_boxes 수)가 다를 때(계약 위반).
@@ -278,13 +306,17 @@ class ImageMasker:
                 f"이미지/grounded_boxes 수 불일치: "
                 f"images={len(images)} grounded_boxes={len(extras)}"
             )
-        redacted: list[PageImage] = []
+        redacted: list[RedactedPage] = []
         for image, page, extra_boxes in zip(images, result.pages, extras, strict=True):
             order = reading_order(page)
             spans = self._detect(reading_order_text(page, order))
             indices = pii_line_indices(page, spans, order, self._labels)
-            if indices or extra_boxes:
-                redacted.append(self._redactor(image, page, indices, extra_boxes))
-            else:
-                redacted.append(image)
+            rendered = (
+                self._redactor(image, page, indices, extra_boxes)
+                if indices or extra_boxes
+                else image
+            )
+            redacted.append(
+                RedactedPage(image=rendered, line_indices=indices, extra_boxes=tuple(extra_boxes))
+            )
         return redacted
