@@ -8,13 +8,16 @@
 - ``RegexDetector`` / ``NerDetector`` : 개별 디텍터.
 - ``Span`` / ``PiiLabel``    : 탐지 결과(이미지 마스킹 B안이 bbox 매핑에 사용).
 - ``find_residual_pii`` / ``assert_no_residual`` / ``MaskingError`` : 텍스트 검증(Tier 1).
-- ``ImageMasker`` / ``pii_line_indices`` : 이미지 마스킹(줄 단위 검은블럭 비식별 사본).
+- ``ImageMasker`` / ``RedactedPage`` / ``pii_line_indices`` / ``line_local_spans`` : 이미지
+  마스킹(줄 단위 검은블럭 비식별 사본) 및 라인 단위 스팬 재사용(DB ``masked_lines``).
 - ``verify_redacted_page`` / ``VerificationResult`` : 이미지 마스킹 검증(5.1 커버리지 + 5.2 재OCR).
 """
 
 from ocr_worker.masking.image_masker import (
     ImageMasker,
+    RedactedPage,
     image_to_png_bytes,
+    line_local_spans,
     pii_line_indices,
     redact_page_image,
 )
@@ -42,6 +45,7 @@ __all__ = [
     "MaskingError",
     "NerDetector",
     "PiiLabel",
+    "RedactedPage",
     "RegexDetector",
     "Span",
     "VerificationResult",
@@ -51,6 +55,7 @@ __all__ = [
     "find_residual_pii",
     "get_masker",
     "image_to_png_bytes",
+    "line_local_spans",
     "mask",
     "measure_coverage",
     "merge_overlaps",

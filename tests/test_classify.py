@@ -55,6 +55,35 @@ def test_classifies_claim_by_keywords() -> None:
     assert result.confidence >= CONFIDENCE_THRESHOLD
 
 
+def test_classifies_hospitalization_cert_by_keywords() -> None:
+    # Arrange
+    text = "입원확인서\n입원기간 2026-01-01부터\n치료기간 안내\n퇴원 예정"
+    # Act
+    result = classify(text)
+    # Assert
+    assert result.doc_type is DocType.HOSPITALIZATION_CERT
+    assert result.confidence >= CONFIDENCE_THRESHOLD
+
+
+def test_classifies_medical_receipt_by_keywords() -> None:
+    # Arrange
+    text = "외래진료비 계산서(영수증)\n진료비계산서\n영수금액 47500원\n본인부담금 안내"
+    # Act
+    result = classify(text)
+    # Assert
+    assert result.doc_type is DocType.MEDICAL_RECEIPT
+    assert result.confidence >= CONFIDENCE_THRESHOLD
+
+
+def test_hospitalization_cert_not_confused_with_diagnosis() -> None:
+    # Arrange — "병명"은 진단서 키워드와도 겹치지만 입원확인서 고유 단서가 더 강함
+    text = "입원확인서\n환자의 병명 골절\n입원기간 2026-01-01부터"
+    # Act
+    result = classify(text)
+    # Assert
+    assert result.doc_type is DocType.HOSPITALIZATION_CERT
+
+
 # ── 공백 불규칙성 흡수 ──────────────────────────────────────────
 
 

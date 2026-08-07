@@ -254,6 +254,15 @@ class OcrProcessor:
         self._fetch = fetch or get_object
         self._render = render or render_to_images
 
+    @property
+    def engine(self) -> OcrEngine:
+        """이 프로세서가 쓰는 OCR 엔진.
+
+        이미지 마스킹 검증(#18 5.2 재OCR 잔류 검사)이 **같은 엔진 인스턴스**를 재사용해
+        surya 모델을 두 번 로드하지 않게 하려고 노출한다(모델 로드는 수 GB·수십 초).
+        """
+        return self._engine
+
     async def process(self, s3_key: str, content_type: str) -> OcrResult:
         """원본을 OCR해 라인 구조를 보존한 ``OcrResult``를 반환한다.
 

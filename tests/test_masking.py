@@ -17,6 +17,7 @@ from ocr_worker.masking import (
     mask,
     merge_overlaps,
 )
+from ocr_worker.masking.patterns import CARD_RE
 
 # ── 정규식 디텍터: 정형 PII를 가린다 ─────────────────────────────
 
@@ -78,6 +79,102 @@ def test_masks_policy_number() -> None:
     assert "[증권번호]" in masked
     assert "A12345678" not in masked
     assert "한화생명" in masked  # 보험사명은 유지(화이트리스트)
+
+
+def test_masks_amex_card_number() -> None:
+    # 15자리(4-6-5) Amex 형식도 카드번호로 가린다
+    masked = mask("카드 3412-345678-12345 결제")
+    assert "[카드번호]" in masked
+    assert "345678" not in masked
+
+
+def test_card_regex_does_not_span_newlines() -> None:
+    # 실제 카드번호는 한 줄에 인쇄된다 — 서로 다른 줄에 흩어진 숫자 조각을
+    # 카드번호로 오인하지 않아야 한다(과마스킹 방지).
+    assert CARD_RE.search("1234\n5678\n9012\n3456") is None
+    assert CARD_RE.search("1234-5678-9012-3456") is not None  # 한 줄이면 정상 매칭
+
+
+def test_masks_patient_name_by_label_even_if_uncommon() -> None:
+    # 실측(E2E): NER이 "이샘플"처럼 흔치 않은 합성 이름을 놓치는 사례가 있었다 —
+    # "환자 성명" 라벨 뒤 이름은 NER 성공 여부와 무관하게 정규식으로도 잡아야 한다.
+    masked = mask("환자 성명: 이샘플")
+    assert "[이름]" in masked
+    assert "이샘플" not in masked
+
+
+def test_masks_person_name_in_markdown_table_row() -> None:
+    # VLM 하이브리드 경로의 원문은 "| 라벨 | 값 |" 마크다운 표 형태다 — 라벨과 값
+    # 사이의 파이프(|)도 구분자로 흡수해야 한다.
+    masked = mask("| 피보험자 | 홍길동 |\n| 계약자 | 김철수 |")
+    assert "[이름]" in masked
+    assert "홍길동" not in masked
+    assert "김철수" not in masked
+
+
+def test_masks_person_name_with_bold_markdown_label() -> None:
+    # 실측(E2E): VLM이 라벨을 "**환자 성명**"처럼 마크다운 볼드로 감싼 원문에서
+    # 별표(*)를 구분자로 흡수 못해 매칭이 끊긴 사례를 확인했다.
+    masked = mask("| **환자 성명** | 이샘플 |")
+    assert "[이름]" in masked
+
+
+def test_masks_staff_name_skipping_department_word() -> None:
+    # 실측(E2E): "발급담당자: 원무팀 최테스트"처럼 라벨과 이름 사이에 부서명이
+    # 끼면, 부서명("원무팀")을 이름으로 오인하거나 실제 이름("최테스트")을
+    # 놓치는 문제가 있었다 — 팀/과/부/실로 끝나는 부서명은 건너뛰고 잡는다.
+    # 부서명 자체는 PII가 아니므로 그대로 남아 있어야 한다.
+    masked = mask("발급담당자: 원무팀 최테스트")
+    assert "[이름]" in masked
+    assert "최테스트" not in masked
+    assert "원무팀" in masked
+
+
+def test_masks_staff_name_without_department_word() -> None:
+    # 부서명 없이 라벨 바로 뒤 이름이 오는 형태도 계속 잡혀야 한다.
+    masked = mask("담당자: 최테스트")
+    assert "[이름]" in masked
+    assert "최테스트" not in masked
+    assert "이샘플" not in masked
+
+
+def test_staff_department_without_name_is_not_masked() -> None:
+    # 코드리뷰 지적: 부서명 그룹이 옵셔널이라, 이름 없이 부서명으로 끝나면
+    # 옵셔널 그룹을 건너뛰고 부서명 자체가 이름 그룹으로 오탐될 수 있었다.
+    masked = mask("담당자: 원무팀")
+    assert "[이름]" not in masked
+    assert "원무팀" in masked
+
+
+def test_masks_beneficiary_name() -> None:
+    masked = mask("예금주 최테스트 계좌로 입금")
+    assert "[이름]" in masked
+    assert "최테스트" not in masked
+
+
+def test_masks_ward_room_number() -> None:
+    masked = mask("병실번호 302호로 배정되었습니다")
+    assert "[병실번호]" in masked
+    assert "302" not in masked
+
+
+def test_masks_approval_number() -> None:
+    masked = mask("현금영수증 승인번호 123456789 발급")
+    assert "[승인번호]" in masked
+    assert "123456789" not in masked
+
+
+def test_masks_patient_id() -> None:
+    masked = mask("환자등록번호 P-260715-031 확인")
+    assert "[환자등록번호]" in masked
+    assert "P-260715-031" not in masked
+
+
+def test_business_registration_number_not_masked_as_patient_id() -> None:
+    # "사업자등록번호"는 단독 "등록번호" 앵커를 제외했으므로 환자등록번호로 오탐되지 않음
+    masked = mask("사업자등록번호 123-45-67890")
+    assert "[환자등록번호]" not in masked
+    assert "[사업자등록번호]" in masked
 
 
 def test_masks_doctor_name_after_keyword() -> None:
@@ -165,6 +262,16 @@ def test_assert_no_residual_does_not_gate_account_only() -> None:
     # 계좌는 추적 전용(_TRACK_ONLY) — 잔류해도 하드 실패시키지 않는다.
     # (이 숫자열은 RRN/카드 패턴엔 안 걸려 ACCOUNT로만 잡힘)
     assert_no_residual("계좌번호 110-1234-567890")  # 예외 없음
+
+
+def test_card_residual_does_not_span_newlines() -> None:
+    # 실측(노이즈 많은 실사진 OCR): 서로 무관한 짧은 숫자 조각이 여러 줄에 걸쳐
+    # 우연히 14~15자리를 채우면, 개행까지 구분자로 허용하던 옛 패턴은 이를
+    # 카드번호로 오탐해 정상 문서를 MaskingError로 fail-closed 격리시켰다.
+    text = "71\n31\n2 16\n21029144"
+    leaks = find_residual_pii(text)
+    assert not any(s.label is PiiLabel.CARD for s in leaks)
+    assert_no_residual(text)  # 예외 없음 — 카드번호 오탐으로 막히지 않는다
 
 
 # ── 디텍터 직접 호출(이미지 마스킹 B안 스팬 공유) ───────────────

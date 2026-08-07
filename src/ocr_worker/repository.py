@@ -12,32 +12,52 @@ OCR·분류·추출·마스킹의 산출물을 ``ocr_results``(contracts.md §3)
   좌표·confidence는 PII가 아니라 원형 보존한다(이미지 마스킹 좌표 재사용).
 - **jsonb**: dict/list는 ``json.dumps`` 문자열로 넘기고 SQL에서 ``::jsonb`` 캐스트한다
   (asyncpg 기본 코덱은 dict→jsonb 자동 변환을 하지 않는다).
+- **원본 삭제 outbox**: 마스킹 검증을 통과해 지워야 할 원본 S3 키와 그 시도 상태를
+  같은 행(``original_delete_*``)에 담는다. 저장과 같은 트랜잭션이라 삭제 전에 crash가
+  나도 ``pending`` 행이 남아 워커 스윕(``pipeline.sweep_pending_deletes``)이 이어받는다.
 """
 
 import json
 import uuid
-from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import asyncpg
 
 from core.contracts import DocType
 from core.logging import get_logger
+from ocr_worker.masking.image_masker import (
+    DetectFn,
+    line_local_spans,
+    reading_order,
+    reading_order_text,
+)
+from ocr_worker.masking.spans import apply_mask
 from ocr_worker.ocr import OcrResult
 
 logger = get_logger(__name__)
 
 # 진입부 멱등 단락(#15)용 조회 — 이미 처리된 job_id면 무거운 OCR을 건너뛰고
-# 기존 id·doc_type으로 ReportJob만 재발행한다.
-_SELECT_BY_JOB_SQL = "SELECT id, doc_type FROM ocr_results WHERE job_id = $1"
+# 기존 id·doc_type·ocr_quality로 ReportJob만 재발행한다.
+_SELECT_BY_JOB_SQL = "SELECT id, doc_type, ocr_quality FROM ocr_results WHERE job_id = $1"
 
 # 여러 문 없이 단일 업서트 — job_id 충돌 시 내용 갱신 + 기존 id 반환(RETURNING이
 # INSERT/UPDATE 어느 경로든 행을 돌려주도록 DO UPDATE를 쓴다). created_at·id는 불변.
+# original_s3_key·original_delete_status는 삭제 outbox의 시작점이다 — 저장과 같은
+# 문(=같은 트랜잭션)에서 'pending'을 남겨야 삭제 전에 crash가 나도 스윕이 이어받는다.
+#
+# original_delete_next_attempt_at은 **NULL(즉시 due)이 아니라 한 주기 뒤**로 채운다:
+# 저장 직후 호출자가 띄우는 즉시 삭제 task가 아직 S3 왕복 중인데 그 사이 스윕 사이클이
+# 돌면 같은 in-flight 키를 중복 집행해 attempts 예산을 두 배로 태운다(실측). 첫 시도
+# 창은 즉시 task가 독점하고, 그게 실패하거나 crash로 사라지면 한 주기 뒤 스윕이
+# 인수한다 — crash 복구 근거(행이 pending으로 남음)는 그대로다.
+# attempts는 INSERT 목록에도 충돌 갱신에도 없다(기본값 0 · 재소비가 리셋하지 않음).
 _UPSERT_SQL = """
 INSERT INTO ocr_results (
     job_id, doc_type, doc_type_confidence, ocr_confidence,
-    masked_text, masked_lines, entities, masked_image_s3_keys
-) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8::jsonb)
+    masked_text, masked_lines, entities, masked_image_s3_keys, ocr_quality,
+    original_s3_key, original_delete_status, original_delete_next_attempt_at
+) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8::jsonb, $9, $10, $11,
+    CASE WHEN $11 = 'pending' THEN now() + make_interval(secs => $12) END)
 ON CONFLICT (job_id) DO UPDATE SET
     doc_type = EXCLUDED.doc_type,
     doc_type_confidence = EXCLUDED.doc_type_confidence,
@@ -45,8 +65,57 @@ ON CONFLICT (job_id) DO UPDATE SET
     masked_text = EXCLUDED.masked_text,
     masked_lines = EXCLUDED.masked_lines,
     entities = EXCLUDED.entities,
-    masked_image_s3_keys = EXCLUDED.masked_image_s3_keys
+    masked_image_s3_keys = EXCLUDED.masked_image_s3_keys,
+    ocr_quality = EXCLUDED.ocr_quality,
+    original_s3_key = EXCLUDED.original_s3_key,
+    original_delete_status = EXCLUDED.original_delete_status,
+    original_delete_next_attempt_at = EXCLUDED.original_delete_next_attempt_at
 RETURNING id
+"""
+
+# 삭제 성공(종결). 종결 상태에는 다음 시도 시각이 의미 없으므로 함께 비운다.
+_MARK_DELETE_SUCCESS_SQL = """
+UPDATE ocr_results
+SET original_delete_status = 'deleted',
+    original_delete_next_attempt_at = NULL
+WHERE id = $1
+"""
+
+# 삭제 실패: attempts++ 후 상한 도달이면 'exhausted'(종결), 아니면 'pending'을 유지하고
+# 다음 시도 시각을 뒤로 민다. 시각은 **SQL의 now() 기준**으로 계산한다 — 앱 서버와 DB의
+# 시계가 어긋나면 스윕이 영영 안 집거나 즉시 재시도하는 편향이 생긴다.
+# 단일 UPDATE라 읽기-수정-쓰기 경합(동시 실패 두 건이 같은 attempts를 읽는 것)이 없다.
+# RETURNING으로 **갱신 후 실제 상태**를 돌려준다 — 호출측이 attempts를 미리 계산해
+# 'exhausted' 여부를 추정하면 조회~UPDATE 사이의 갱신을 놓쳐 로그와 DB가 어긋난다.
+_MARK_DELETE_FAILURE_SQL = """
+UPDATE ocr_results
+SET original_delete_attempts = original_delete_attempts + 1,
+    original_delete_status = CASE
+        WHEN original_delete_attempts + 1 >= $2 THEN 'exhausted'
+        ELSE 'pending'
+    END,
+    original_delete_next_attempt_at = CASE
+        WHEN original_delete_attempts + 1 >= $2 THEN NULL
+        ELSE now() + make_interval(secs => $3)
+    END
+WHERE id = $1
+RETURNING original_delete_status, original_delete_attempts
+"""
+
+# 스윕 대상 조회 — 부분 인덱스(ocr_results_pending_delete_idx)를 그대로 탄다.
+# NULLS FIRST: 최초 pending(아직 한 번도 실패하지 않은 행)을 가장 먼저 집는다.
+# FOR UPDATE SKIP LOCKED는 여러 워커가 같은 행을 동시에 집는 창을 줄이기 위한 것이고,
+# 완전한 배타 보장은 아니다(트랜잭션이 SELECT 직후 끝나 잠금이 풀린다). 중복 집행이
+# 나도 S3 DeleteObject가 멱등이라 무해하다 — 긴 트랜잭션으로 S3 왕복을 감싸는 대가가
+# 더 크다고 보고 짧은 조회를 택했다.
+_FETCH_DUE_DELETIONS_SQL = """
+SELECT id, original_s3_key, original_delete_attempts
+FROM ocr_results
+WHERE original_delete_status = 'pending'
+  AND (original_delete_next_attempt_at IS NULL OR original_delete_next_attempt_at <= now())
+ORDER BY original_delete_next_attempt_at NULLS FIRST
+LIMIT $1
+FOR UPDATE SKIP LOCKED
 """
 
 
@@ -64,6 +133,14 @@ class OcrResultRecord:
             (텍스트는 마스킹본, 좌표·신뢰도는 원형 — 이미지 마스킹 좌표 재사용).
         entities: 비-PII 추출 엔티티(jsonb).
         masked_image_s3_keys: 검은블럭 비식별 이미지 사본의 페이지별 S3 키.
+        ocr_quality: 자동 품질 판정("ok" | "needs_reupload"). ``ReportJob.ocr_quality``로
+            패스스루된다.
+        original_s3_key: 원본 파일의 S3 키(``OcrJob.s3_key``). 삭제 outbox의 대상 —
+            스윕이 재시도할 때 이 값으로 ``DeleteObject``를 부른다. PII가 아닌 내부
+            식별자(파일명은 UUID로 치환됨).
+        original_delete_eligible: 이미지 마스킹 검증(5.1+5.2)을 전 페이지가 통과해
+            원본을 지워도 되는가. ``True``면 ``original_delete_status='pending'``으로,
+            ``False``면 ``'not_eligible'``(스윕 제외)로 저장된다.
     """
 
     job_id: str
@@ -74,28 +151,79 @@ class OcrResultRecord:
     masked_lines: list[dict[str, object]] = field(default_factory=list)
     entities: dict[str, object] = field(default_factory=dict)
     masked_image_s3_keys: list[str] = field(default_factory=list)
+    ocr_quality: str = "ok"
+    original_s3_key: str = ""
+    original_delete_eligible: bool = False
 
 
-def build_masked_lines(result: OcrResult, mask: Callable[[str], str]) -> list[dict[str, object]]:
+@dataclass(frozen=True, slots=True)
+class DeleteRetryState:
+    """실패 기록 **후** outbox 행의 실제 상태(``record_delete_failure`` 반환).
+
+    로그 레벨(운영 개입 신호 여부)을 이 값으로 정한다 — 앱에서 attempts를 미리 세지
+    않는다. 즉시 삭제 경로는 애초에 attempts를 모르고, 스윕 경로는 조회 시점 값이
+    stale일 수 있어(그 사이 다른 주체가 증가) 둘 다 DB 판정을 그대로 따르는 게 맞다.
+
+    Attributes:
+        status: 갱신 후 ``original_delete_status``(``pending`` | ``exhausted``).
+        attempts: 갱신 후 누적 시도 횟수.
+    """
+
+    status: str
+    attempts: int
+
+    @property
+    def exhausted(self) -> bool:
+        """시도 상한을 소진해 종결됐는가(= 자동 재시도가 더는 없다)."""
+        return self.status == "exhausted"
+
+
+@dataclass(frozen=True, slots=True)
+class PendingDeletion:
+    """스윕이 재시도할 원본 삭제 1건(``ocr_results``의 outbox 행).
+
+    Attributes:
+        id: ``ocr_results.id``(성공/실패 기록 시 다시 쓰는 키).
+        original_s3_key: 지워야 할 원본 S3 키.
+        original_delete_attempts: 조회 시점까지 실패한 횟수(관측용 스냅샷).
+            **``exhausted`` 판정에 쓰지 말 것** — 조회~UPDATE 사이에 즉시 삭제 task나
+            다른 워커가 증가시켰을 수 있어 stale이다. 상한 도달 여부는
+            ``record_delete_failure``가 돌려주는 ``DeleteRetryState``를 쓴다.
+    """
+
+    id: str
+    original_s3_key: str
+    original_delete_attempts: int
+
+
+def build_masked_lines(result: OcrResult, detect: DetectFn) -> list[dict[str, object]]:
     """OCR 라인 좌표를 보존하되 텍스트만 마스킹해 ``masked_lines`` 구조를 만든다.
 
-    라인별로 독립 마스킹한다 — 좌표·confidence는 PII가 아니라 원형으로 남기고,
-    텍스트는 반드시 마스킹본으로 저장한다(§13). 이미지 마스킹 트랙은 이 좌표를
-    재사용해 검은블럭 위치를 잡는다.
+    라인을 완전히 독립적으로 재검출하면 라벨과 값이 다른 라인으로 쪼개진 PII(예:
+    "환자의 성명" 라인과 실제 이름 라인이 분리)를 놓친다 — 값만 있는 라인은 라벨
+    컨텍스트가 없어 앵커 정규식이 매칭되지 않을 수 있다(실측 확인). 그래서 페이지
+    단위(리딩오더 정렬)로 한 번만 탐지하고, 그 스팬을 라인별 로컬 오프셋으로 잘라
+    (``line_local_spans``) **재검출 없이 그대로** 치환(``apply_mask``)한다 — "어느
+    라인이 PII인가" 판정과 "그 라인의 어느 구간을 지울까"가 같은 스팬에서 나오므로
+    이미지 마스킹(``ImageMasker.redact_pages``)과도 항상 같은 기준을 공유한다.
 
     Args:
         result: 문서 전체 OCR 결과(페이지·라인 좌표 보유).
-        mask: 텍스트 → 마스킹 텍스트 함수(예: ``Masker.mask``).
+        detect: 텍스트 → PII 스팬 함수(예: ``Masker.detect``). 페이지 단위 탐지에 쓴다.
 
     Returns:
         ``[{masked_text, bbox, polygon, confidence}, ...]`` (jsonb 직렬화 가능).
     """
     lines: list[dict[str, object]] = []
     for page in result.pages:
-        for line in page.lines:
+        order = reading_order(page)
+        spans = detect(reading_order_text(page, order))
+        local_spans = line_local_spans(page, spans, order)
+        for index, line in enumerate(page.lines):
+            text = apply_mask(line.text, local_spans[index]) if index in local_spans else line.text
             lines.append(
                 {
-                    "masked_text": mask(line.text),
+                    "masked_text": text,
                     "bbox": list(line.bbox),
                     "polygon": [list(point) for point in line.polygon],
                     "confidence": line.confidence,
@@ -104,11 +232,11 @@ def build_masked_lines(result: OcrResult, mask: Callable[[str], str]) -> list[di
     return lines
 
 
-async def find_ocr_result(pool: asyncpg.Pool, job_id: str) -> tuple[str, DocType] | None:
-    """``job_id``로 이미 저장된 결과의 ``(id, doc_type)``을 찾는다(없으면 None).
+async def find_ocr_result(pool: asyncpg.Pool, job_id: str) -> tuple[str, DocType, str] | None:
+    """``job_id``로 이미 저장된 결과의 ``(id, doc_type, ocr_quality)``를 찾는다(없으면 None).
 
     파이프라인(#15)의 진입부 멱등 단락에 쓴다 — at-least-once 재소비로 같은 작업이
-    다시 들어오면, 이미 한 행이 있으므로 OCR·마스킹을 반복하지 않고 이 id·doc_type으로
+    다시 들어오면, 이미 한 행이 있으므로 OCR·마스킹을 반복하지 않고 이 값들로
     ``ReportJob``만 재발행한다(발행 후 커밋 규약상 crash 시 재발행이 안전).
 
     Args:
@@ -116,20 +244,27 @@ async def find_ocr_result(pool: asyncpg.Pool, job_id: str) -> tuple[str, DocType
         job_id: OCR 작업 식별자(UUID 문자열, 멱등 키).
 
     Returns:
-        ``(ocr_results.id, doc_type)`` 튜플 또는 미존재 시 ``None``.
+        ``(ocr_results.id, doc_type, ocr_quality)`` 튜플 또는 미존재 시 ``None``.
     """
     row = await pool.fetchrow(_SELECT_BY_JOB_SQL, uuid.UUID(job_id))
     if row is None:
         return None
-    return str(row["id"]), DocType(row["doc_type"])
+    return str(row["id"]), DocType(row["doc_type"]), row["ocr_quality"]
 
 
-async def save_ocr_result(pool: asyncpg.Pool, record: OcrResultRecord) -> str:
+async def save_ocr_result(
+    pool: asyncpg.Pool, record: OcrResultRecord, *, delete_retry_interval_seconds: float
+) -> str:
     """``ocr_results``에 업서트하고 생성/기존 ``id``를 반환한다(job_id 멱등).
 
     Args:
         pool: asyncpg 연결 풀(core.db).
         record: 저장할 행 값.
+        delete_retry_interval_seconds: 삭제 outbox의 첫 스윕 인수 시점을 미루는 간격(초).
+            호출자가 저장 직후 띄우는 즉시 삭제 task와 스윕이 같은 키를 중복 집행하지
+            않도록 ``original_delete_next_attempt_at``을 이만큼 뒤로 잡는다(설정값
+            ``ocr_delete_retry_interval_seconds``를 그대로 넘긴다 — 이 값은 행마다
+            달라지는 데이터가 아니라 정책이라 ``OcrResultRecord``에 담지 않는다).
 
     Returns:
         ``ocr_results.id``(UUID 문자열) — ``ReportJob.ocr_result_id``로 사용.
@@ -144,6 +279,12 @@ async def save_ocr_result(pool: asyncpg.Pool, record: OcrResultRecord) -> str:
         json.dumps(record.masked_lines, ensure_ascii=False),
         json.dumps(record.entities, ensure_ascii=False),
         json.dumps(record.masked_image_s3_keys, ensure_ascii=False),
+        record.ocr_quality,
+        record.original_s3_key,
+        # 검증 통과분만 스윕 대상('pending')으로 남긴다 — 'not_eligible'은 스윕이 절대
+        # 집지 않으므로, 검증 실패 원본이 나중에 조용히 지워지는 일이 없다.
+        "pending" if record.original_delete_eligible else "not_eligible",
+        delete_retry_interval_seconds,
     )
     if row is None:  # RETURNING은 항상 한 행 → 방어적 계약 검증
         raise RuntimeError(f"ocr_results 업서트가 id를 반환하지 않았습니다: job_id={record.job_id}")
@@ -155,3 +296,73 @@ async def save_ocr_result(pool: asyncpg.Pool, record: OcrResultRecord) -> str:
         doc_type=str(record.doc_type),
     )
     return result_id
+
+
+async def record_delete_success(pool: asyncpg.Pool, ocr_result_id: str) -> None:
+    """원본 삭제 성공을 outbox에 기록한다(``original_delete_status='deleted'``, 종결).
+
+    S3 ``DeleteObject``는 멱등이라, 즉시 삭제와 스윕이 같은 키를 겹쳐 지워도 둘 다
+    성공으로 기록될 수 있다 — 같은 종결 상태를 두 번 쓰는 것이라 무해하다.
+
+    Args:
+        pool: asyncpg 연결 풀(core.db).
+        ocr_result_id: 대상 ``ocr_results.id``(UUID 문자열).
+    """
+    await pool.execute(_MARK_DELETE_SUCCESS_SQL, uuid.UUID(ocr_result_id))
+
+
+async def record_delete_failure(
+    pool: asyncpg.Pool, ocr_result_id: str, max_attempts: int, retry_interval_seconds: float
+) -> DeleteRetryState | None:
+    """원본 삭제 실패를 outbox에 기록하고 **갱신 후 상태**를 돌려준다(attempts++).
+
+    상한 미도달이면 ``pending``을 유지하고 다음 시도 시각을 ``now() +
+    retry_interval_seconds``로 민다(고정 백오프 — 스윕 주기와 같은 값). 상한에
+    도달하면 ``exhausted``로 종결하고 스윕 대상에서 빠진다 — 이후 남은 원본은 S3
+    라이프사이클 정책이 정리한다(운영 알림 대상).
+
+    Args:
+        pool: asyncpg 연결 풀(core.db).
+        ocr_result_id: 대상 ``ocr_results.id``(UUID 문자열).
+        max_attempts: 총 시도 상한(증가 후 값이 이 값 이상이면 ``exhausted``).
+        retry_interval_seconds: 다음 시도까지의 간격(초).
+
+    Returns:
+        갱신 후 상태. 대상 행이 없으면(있을 수 없지만 방어적으로) ``None``.
+    """
+    row = await pool.fetchrow(
+        _MARK_DELETE_FAILURE_SQL,
+        uuid.UUID(ocr_result_id),
+        max_attempts,
+        retry_interval_seconds,
+    )
+    if row is None:
+        return None
+    return DeleteRetryState(
+        status=row["original_delete_status"], attempts=row["original_delete_attempts"]
+    )
+
+
+async def fetch_due_deletions(pool: asyncpg.Pool, limit: int) -> list[PendingDeletion]:
+    """재시도할 때가 된 원본 삭제 건을 최대 ``limit``개 가져온다.
+
+    ``not_eligible``(검증 실패로 애초에 삭제 대상이 아닌 행)과 종결 상태
+    (``deleted``·``exhausted``)는 조회되지 않는다. ``pending`` 행은 항상
+    ``original_s3_key``가 채워져 있다(``save_ocr_result``가 둘을 한 문에서 쓴다).
+
+    Args:
+        pool: asyncpg 연결 풀(core.db).
+        limit: 한 배치 상한.
+
+    Returns:
+        시도 대상 목록(가장 오래 기다린 순 — 미시도 행 우선).
+    """
+    rows = await pool.fetch(_FETCH_DUE_DELETIONS_SQL, limit)
+    return [
+        PendingDeletion(
+            id=str(row["id"]),
+            original_s3_key=row["original_s3_key"],
+            original_delete_attempts=row["original_delete_attempts"],
+        )
+        for row in rows
+    ]

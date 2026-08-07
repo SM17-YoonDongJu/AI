@@ -23,6 +23,9 @@ class PiiLabel(StrEnum):
     DRIVER = "운전면허번호"
     MEDICAL_LICENSE = "면허번호"  # 의사 면허번호
     POLICY_NUMBER = "증권번호"  # 보험 증권/증서번호
+    WARD_ROOM = "병실번호"
+    APPROVAL_NUMBER = "승인번호"  # 현금영수증/카드 승인번호
+    PATIENT_ID = "환자등록번호"  # 원무접수번호·환자번호·접수번호·차트번호 통칭
     ADDRESS = "주소"
     NAME = "이름"
 

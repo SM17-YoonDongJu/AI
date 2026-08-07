@@ -61,6 +61,9 @@ dev = [
     "pytest>=8.2",
     "pytest-asyncio>=0.23",
     "pytest-cov>=5.0",
+    # test_vlm_client.py가 PIL.Image로 테스트 이미지를 만든다. surya 등 무거운 나머지
+    # ocr extra(torch 포함)와 달리 pillow 자체는 가벼워 CI dev 동기화에 넣어도 무리 없다.
+    "pillow>=10.0",
 ]
 
 [tool.uv]

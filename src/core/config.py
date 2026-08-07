@@ -54,6 +54,13 @@ class Settings(BaseSettings):
     aws_region: str = "ap-northeast-2"
     s3_bucket: str = ""
 
+    # --- 원본 삭제 outbox (ocr_results.original_delete_* — ocr_worker 스윕) ---
+    # 마스킹 검증을 통과한 원본 삭제가 실패하면 ocr_results 행에 남겨 재시도한다.
+    ocr_delete_max_attempts: int = 5  # 소진 시 'exhausted'(종결) — S3 라이프사이클이 백스톱
+    # 스윕 주기이자 실패 후 고정 백오프 간격(초). 지수 백오프는 두지 않는다 — 삭제 실패는
+    # 부하가 아니라 권한·네트워크 등 지속성 오류가 대부분이라 간격을 늘려도 이득이 없다.
+    ocr_delete_retry_interval_seconds: float = 900.0
+
     # --- Notion (약관 코퍼스 소스 — jjg 인테그레이션, 공식 REST API) ---
     notion_token: str = ""  # 시크릿(ntn_...). SSM/.env 주입, 코드·커밋 금지
     # 데이터 출처 카탈로그(컨트롤 테이블). /v1/databases/{id}/query용 **database id**
@@ -98,6 +105,21 @@ class Settings(BaseSettings):
     embedding_model: str = ""  # 예: qwen3:embedding (1024d)
     embedding_dim: int = DEFAULT_EMBEDDING_DIM
     ai_timeout_seconds: float = 60.0  # 추론 HTTP 요청 타임아웃
+
+    # --- VLM(Vision) 서빙 — Ollama 네이티브 /api/generate(OpenAI 호환 아님) ---
+    # 다중 항목 표 문서(지급결과서·청구서·입원확인서·진료비영수증)에서 surya 라인
+    # 순서가 표 구조를 못 살릴 때 보완하는 하이브리드 경로(ocr_worker.vlm_client) 전용.
+    vlm_base_url: str = "http://localhost:11434"  # ai_base_url과 별도(엔드포인트 형태 다름)
+    # 표 전사(텍스트만, 좌표 없음) — 팀 합의 모델. 실측: qwen3-vl:8b-instruct보다 텍스트
+    # 정확도·속도(~11초 vs ~15초) 모두 좋음.
+    vlm_model: str = "qwen3.6:35b-a3b"
+    # 이미지 마스킹 보강용 PII 위치 grounding(좌표 출력) 전용 — vlm_model과 별도 모델.
+    # 실측: qwen3.6:35b-a3b는 vision capability는 있지만 grounding 좌표가 실제 텍스트
+    # 위치에서 벗어남(이름 박스가 이름 글자를 완전히 빗나감) — qwen3-vl:8b-instruct는
+    # 같은 문서에서 정확했다. 좌표 정밀도가 안전(과소 마스킹 방지)에 직결돼 텍스트
+    # 전사보다 훨씬 보수적으로 골라야 하므로, 검증된 모델을 별도로 고정한다.
+    vlm_grounding_model: str = "qwen3-vl:8b-instruct"
+    vlm_timeout_seconds: float = 60.0  # 실측 평균 15초·최대 34초 — 여유 두고 60초
 
 
 @lru_cache

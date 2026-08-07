@@ -23,8 +23,11 @@ class MaskingError(Exception):
 _RESIDUAL_PATTERNS: tuple[tuple[re.Pattern[str], PiiLabel], ...] = (
     # 주민/외국인등록번호: 구분자에 공백·점 허용
     (re.compile(r"(?<!\d)\d{6}[-.\s]?\d{7}(?!\d)"), PiiLabel.RRN),
-    # 16자리 카드(구분자 관대)
-    (re.compile(r"(?<!\d)(?:\d[-.\s]?){15}\d(?!\d)"), PiiLabel.CARD),
+    # 16자리·15자리(Amex) 카드(구분자 관대하되 개행은 제외 — 실측: 노이즈 많은
+    # 실사진 OCR에서 서로 무관한 짧은 숫자 조각들이 여러 줄에 걸쳐 우연히 14~15자리를
+    # 채워 카드번호로 오탐, 잔류 없는 문서가 MaskingError로 fail-closed 격리되는
+    # 사례를 실제로 확인했다. 카드번호는 한 줄에 인쇄되므로 개행 구분자는 배제한다)
+    (re.compile(r"(?<!\d)(?:\d[-. \t]?){14,15}\d(?!\d)"), PiiLabel.CARD),
     # 이메일
     (re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"), PiiLabel.EMAIL),
     # 휴대폰(고민감은 아니나 누락 추적용)
@@ -38,6 +41,23 @@ _RESIDUAL_PATTERNS: tuple[tuple[re.Pattern[str], PiiLabel], ...] = (
             re.IGNORECASE,
         ),
         PiiLabel.ACCOUNT,
+    ),
+    # 병실번호·승인번호·환자등록번호(신규) — 앵커 기반이라 ACCOUNT와 같은 이유로
+    # 메트릭 추적만 한다(HIGH_SENSITIVITY 미포함 → assert_no_residual 하드게이트 대상 아님).
+    (
+        re.compile(r"(?:병실\s*번호|병실|병동|입원실|호실)[^\d\n]{0,10}\d{1,4}\s*호?"),
+        PiiLabel.WARD_ROOM,
+    ),
+    (
+        re.compile(r"(?:현금영수증\s*)?승인\s*번호[^\d\n]{0,15}\d{6,10}"),
+        PiiLabel.APPROVAL_NUMBER,
+    ),
+    (
+        re.compile(
+            r"(?:원무\s*접수\s*번호|환자\s*등록\s*번호|환자\s*번호|접수\s*번호|차트\s*번호)"
+            r"[^\d\n]{0,15}[A-Za-z0-9-]{4,15}"
+        ),
+        PiiLabel.PATIENT_ID,
     ),
 )
 

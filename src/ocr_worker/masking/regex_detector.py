@@ -12,6 +12,9 @@ from ocr_worker.masking.patterns import (
     ACCOUNT_LOOKAHEAD,
     ACCOUNT_NUMBER_RE,
     ADDRESS_RE,
+    APPROVAL_NUMBER_KEYWORD_RE,
+    APPROVAL_NUMBER_LOOKAHEAD,
+    APPROVAL_NUMBER_VALUE_RE,
     BIZ_RE,
     CARD_RE,
     DOCTOR_NAME_COLON_RE,
@@ -23,12 +26,20 @@ from ocr_worker.masking.patterns import (
     MEDICAL_LICENSE_LOOKAHEAD,
     MEDICAL_LICENSE_VALUE_RE,
     PASSPORT_RE,
+    PATIENT_ID_KEYWORD_RE,
+    PATIENT_ID_LOOKAHEAD,
+    PATIENT_ID_VALUE_RE,
+    PERSON_LABEL_NAME_RE,
     PHONE_RE,
     POLICY_NUMBER_KEYWORD_RE,
     POLICY_NUMBER_LOOKAHEAD,
     POLICY_NUMBER_VALUE_RE,
     RRN_RE,
     SIGNATURE_NAME_RE,
+    STAFF_NAME_RE,
+    WARD_ROOM_KEYWORD_RE,
+    WARD_ROOM_LOOKAHEAD,
+    WARD_ROOM_VALUE_RE,
     is_non_name,
 )
 from ocr_worker.masking.spans import PiiLabel, Span
@@ -85,6 +96,33 @@ class RegexDetector:
                 POLICY_NUMBER_LOOKAHEAD,
             )
         )
+        spans.extend(
+            self._detect_anchored(
+                text,
+                WARD_ROOM_KEYWORD_RE,
+                WARD_ROOM_VALUE_RE,
+                PiiLabel.WARD_ROOM,
+                WARD_ROOM_LOOKAHEAD,
+            )
+        )
+        spans.extend(
+            self._detect_anchored(
+                text,
+                APPROVAL_NUMBER_KEYWORD_RE,
+                APPROVAL_NUMBER_VALUE_RE,
+                PiiLabel.APPROVAL_NUMBER,
+                APPROVAL_NUMBER_LOOKAHEAD,
+            )
+        )
+        spans.extend(
+            self._detect_anchored(
+                text,
+                PATIENT_ID_KEYWORD_RE,
+                PATIENT_ID_VALUE_RE,
+                PiiLabel.PATIENT_ID,
+                PATIENT_ID_LOOKAHEAD,
+            )
+        )
         for pattern, label in _SIMPLE_PATTERNS:
             spans.extend(
                 Span(m.start(), m.end(), label, source="regex") for m in pattern.finditer(text)
@@ -136,13 +174,21 @@ class RegexDetector:
 
     @staticmethod
     def _detect_doctor_names(text: str) -> list[Span]:
-        """의사명·서명란 이름. 임상어/직함(소견 등)은 ``is_non_name``으로 제외한다.
+        """의사명·서명란·환자/계약자 등 라벨 뒤 이름. 임상어/직함은 ``is_non_name``으로 제외.
 
         서명·도장 이미지는 B안(검은박스) 담당이고, 여기서는 텍스트에 노출된 이름만
-        ``[이름]``으로 가린다(NER 미사용 시의 보완 경로).
+        ``[이름]``으로 가린다. NER이 흔치 않은 합성 이름을 놓치는 사례가 실측으로
+        확인돼(§PERSON_LABEL_NAME_RE), 라벨 앵커 정규식을 NER과 별개 안전망으로 둔다
+        (NER 사용 여부와 무관하게 항상 적용).
         """
         spans: list[Span] = []
-        for pattern in (DOCTOR_NAME_RE, DOCTOR_NAME_COLON_RE, SIGNATURE_NAME_RE):
+        for pattern in (
+            DOCTOR_NAME_RE,
+            DOCTOR_NAME_COLON_RE,
+            SIGNATURE_NAME_RE,
+            PERSON_LABEL_NAME_RE,
+            STAFF_NAME_RE,
+        ):
             for match in pattern.finditer(text):
                 name = match.group(1)
                 if is_non_name(name):

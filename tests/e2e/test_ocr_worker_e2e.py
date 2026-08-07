@@ -33,7 +33,7 @@ from core.contracts import DocType, OcrJob, ReportJob
 from core.kafka.consumer import KafkaConsumer
 from core.kafka.producer import KafkaProducer
 from ocr_worker.ocr import OcrLine, OcrPage, OcrResult
-from ocr_worker.pipeline import OcrPipeline, _derive_report_id
+from ocr_worker.pipeline import ImageTrackResult, OcrPipeline, _derive_report_id
 
 # 그룹 조인·오프셋 리셋 여유를 둔 상한(실 브로커 왕복 포함).
 _WAIT_TIMEOUT_S = 30.0
@@ -55,9 +55,15 @@ class FakeProcessor:
         return self._result, [object()]  # 이미지 내용은 페이크 이미지 트랙이 무시
 
 
-async def _fake_image_pipeline(job: OcrJob, result: OcrResult, images: list[object]) -> list[str]:
-    """S3 업로드 없이 페이지별 마스킹 이미지 키만 돌려주는 이미지 트랙 대역."""
-    return [f"masked/{job.job_id}/page-0.png"]
+async def _fake_image_pipeline(
+    job: OcrJob, result: OcrResult, images: list[object]
+) -> ImageTrackResult:
+    """S3 업로드 없이 페이지별 마스킹 이미지 키만 돌려주는 이미지 트랙 대역.
+
+    ``delete_original=False`` — 이 테스트에는 S3가 없어 원본 삭제 게이트를 태울 대상도,
+    검증할 사본도 없다(게이트 자체는 test_pipeline의 전용 섹션이 덮는다).
+    """
+    return ImageTrackResult(keys=[f"masked/{job.job_id}/page-0.png"], delete_original=False)
 
 
 # ── 헬퍼 ─────────────────────────────────────────────────────────
