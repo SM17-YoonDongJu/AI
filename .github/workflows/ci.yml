@@ -40,7 +40,9 @@ jobs:
           enable-cache: true
 
       - name: Sync deps (dev)
-        run: uv sync --dev
+        # report extra(langgraph·langchain-core, 경량): report_worker 그래프 테스트가 import한다.
+        # ocr/embeddings extra는 GPU·torch 의존이라 CI에 넣지 않는다.
+        run: uv sync --dev --extra report
 
       - name: Ruff lint
         run: uv run ruff check src tests

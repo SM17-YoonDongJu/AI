@@ -34,6 +34,11 @@ async def handle_job(job: ReportJob) -> None:
     """단일 report-job 처리. 성공 시 조용히 반환(→커밋), 하드 실패 시 raise(→재시도/DLQ)."""
     bind_context(report_id=job.report_id, job_id=job.job_id)
     try:
+        if job.ocr_quality == "needs_reupload":
+            # OCR 품질 미달 신호 — 리포트를 생성하지 않는다(계약: contracts.ReportJob.ocr_quality,
+            # 사용자 재업로드 안내는 게이트웨이 몫). 재시도해도 결과가 같으므로 조용히 반환해 커밋.
+            logger.info("report skipped: ocr needs_reupload", report_id=job.report_id)
+            return
         state = {
             "report_id": job.report_id,
             "ocr_result_id": job.ocr_result_id,
