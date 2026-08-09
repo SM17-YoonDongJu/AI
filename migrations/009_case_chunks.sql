@@ -1,7 +1,7 @@
--- 003_case_chunks.sql
+-- 009_case_chunks.sql
 -- CASE_CHUNKS (판례·금감원 분쟁조정례 청크, namespace=case).
 -- namespace는 물리 컬럼이 아니라 소스 테이블로 부여하는 파생값(case_chunks -> case).
--- 선행: 001_extensions.sql (vector·pg_trgm 확장).
+-- 선행: 007_extensions.sql (vector·pg_trgm 확장).
 --
 -- 정본(canonical): tempVectorDB/init/03_case_chunks.sql 과 동일 스키마.
 --   적재기 tempVectorDB/load_cases.py 와 src/rag/search.py(_NS_COLS["case"])가 이 스키마를 쓴다.

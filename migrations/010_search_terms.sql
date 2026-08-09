@@ -1,8 +1,8 @@
--- 004_search_terms.sql
+-- 010_search_terms.sql
 -- search_terms (RAG 인프라) — 보험 도메인 정규 용어 사전.
 -- 입력 쿼리를 trigram 유사도(similarity(input, term) > 0.4)로 조회해 오타·약어·구어체를
 -- 정규 용어로 치환한다(04 trigram 오타 보정 단계).
--- 선행: 001_extensions.sql (pg_trgm 확장).
+-- 선행: 007_extensions.sql (pg_trgm 확장).
 
 CREATE TABLE IF NOT EXISTS search_terms (
     term       text PRIMARY KEY,   -- 정규 용어

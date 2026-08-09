@@ -1,7 +1,7 @@
--- 002_policy_chunks.sql
+-- 008_policy_chunks.sql
 -- POLICY_CHUNKS (약관, namespace=terms) — 신체 관련 보험 약관 청크.
 -- namespace는 물리 컬럼이 아니라 소스 테이블로 부여하는 파생값(policy_chunks -> terms).
--- 선행: 001_extensions.sql (vector·pg_trgm 확장).
+-- 선행: 007_extensions.sql (vector·pg_trgm 확장).
 --
 -- 정본(canonical): tempVectorDB/init/01_schema.sql 의 policy_chunks 와 동일 스키마.
 --   embedding 은 halfvec(1024)(qwen3:embedding / BGE-M3 폴백, float16), HNSW 는 halfvec_cosine_ops.

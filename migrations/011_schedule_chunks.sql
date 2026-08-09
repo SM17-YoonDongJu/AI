@@ -1,7 +1,7 @@
--- 005_schedule_chunks.sql
+-- 011_schedule_chunks.sql
 -- SCHEDULE_CHUNKS (후유장해분류표 — 금감원 시행세칙 별표, namespace=level).
 -- namespace는 물리 컬럼이 아니라 소스 테이블로 부여하는 파생값(schedule_chunks -> level).
--- 선행: 001_extensions.sql (vector·pg_trgm 확장).
+-- 선행: 007_extensions.sql (vector·pg_trgm 확장).
 --
 -- 정본(canonical): tempVectorDB/init/04_schedule_chunks.sql 과 동일 스키마.
 --   적재기 tempVectorDB/load_schedule.py 와 src/rag/search.py(_NS_COLS["level"])가 이 스키마를 쓴다.

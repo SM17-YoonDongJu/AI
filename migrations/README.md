@@ -7,23 +7,27 @@ Hybrid RAG(04)용 PostgreSQL 스키마. **마이그레이션 프레임워크 없
 
 | 순서 | 파일 | 내용 |
 |------|------|------|
-| 001 | `001_extensions.sql` | `vector`(pgvector), `pg_trgm` 확장 |
-| 002 | `002_policy_chunks.sql` | `policy_chunks`(약관, namespace=terms) + HNSW(halfvec)·tsvector·필터 인덱스 |
-| 003 | `003_case_chunks.sql` | `case_chunks`(판례·금감원 분쟁조정례, namespace=case) + HNSW(halfvec)·tsvector·메타·태그 인덱스 |
-| 004 | `004_search_terms.sql` | `search_terms`(정규 용어 사전) + trigram GIN |
-| 005 | `005_schedule_chunks.sql` | `schedule_chunks`(후유장해분류표, namespace=level) + HNSW(halfvec)·tsvector·버전(applies_from,applies_to)·body_part 인덱스 |
+| 007 | `007_extensions.sql` | `vector`(pgvector), `pg_trgm` 확장 |
+| 008 | `008_policy_chunks.sql` | `policy_chunks`(약관, namespace=terms) + HNSW(halfvec)·tsvector·필터 인덱스 |
+| 009 | `009_case_chunks.sql` | `case_chunks`(판례·금감원 분쟁조정례, namespace=case) + HNSW(halfvec)·tsvector·메타·태그 인덱스 |
+| 010 | `010_search_terms.sql` | `search_terms`(정규 용어 사전) + trigram GIN |
+| 011 | `011_schedule_chunks.sql` | `schedule_chunks`(후유장해분류표, namespace=level) + HNSW(halfvec)·tsvector·버전(applies_from,applies_to)·body_part 인덱스 |
+
+> 번호가 007부터인 이유: dev 브랜치의 000~006(OCR·corpus 계열 마이그레이션)과 파일 번호가
+> 겹치지 않게 하기 위함. `007_extensions.sql`은 dev의 `000_extensions.sql`과 내용이 겹치지만
+> 멱등(IF NOT EXISTS)이라 중복 적용해도 안전하다.
 
 `namespace`는 물리 컬럼이 아니라 검색한 소스 테이블로 부여하는 파생값이다
 (`policy_chunks` -> `terms`, `case_chunks` -> `case`).
 
 ## 정본(canonical) 관계
 
-`002`/`003`은 **실DB 초기화 스크립트 `tempVectorDB/init/`(01_schema.sql·03_case_chunks.sql)를
+`008`/`009`는 **실DB 초기화 스크립트 `tempVectorDB/init/`(01_schema.sql·03_case_chunks.sql)를
 정본으로 삼아 동일 스키마**를 재현한다. 적재기(`tempVectorDB/load_cases.py`)와 검색기
 (`src/rag/search.py`)가 이 스키마에 맞춰 있으므로, 두 소스는 항상 일치해야 한다.
 
 - `embedding`은 두 테이블 모두 `halfvec(1024)`이고 HNSW는 `halfvec_cosine_ops`를 쓴다.
-- `003`의 구버전 스키마(`case_number`/`block_type` enum/`court_level` 등)는 폐기됐다.
+- `009`의 구버전 스키마(`case_number`/`block_type` enum/`court_level` 등)는 폐기됐다.
   구버전 테이블이 이미 있는 DB는 `case_chunks`(및 `case_outcome`·`case_block_type` enum)를
   `DROP` 후 재적용해야 한다 — 파일 상단 주석 참조.
 
