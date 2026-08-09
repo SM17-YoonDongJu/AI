@@ -12,7 +12,7 @@
 --   유효기간을 표현한다. applies_to IS NULL 이면 현행판. search()의 contract_date 필터가
 --   applies_from <= contract_date AND (applies_to IS NULL OR contract_date < applies_to) 로 매칭.
 
-CREATE TABLE IF NOT EXISTS schedule_chunks (
+CREATE TABLE IF NOT EXISTS corpus.schedule_chunks (
     chunk_id        TEXT PRIMARY KEY,
     content         TEXT        NOT NULL,   -- 임베딩 원문
     content_tokens  TEXT,                   -- Kiwi 형태소 (공백 구분) → tsvector 전문검색
@@ -42,22 +42,32 @@ CREATE TABLE IF NOT EXISTS schedule_chunks (
 
 -- 벡터 검색 (ANN, cosine) — HNSW, halfvec 전용 연산자 클래스.
 CREATE INDEX IF NOT EXISTS idx_schedule_hnsw
-    ON schedule_chunks USING hnsw (embedding halfvec_cosine_ops)
+    ON corpus.schedule_chunks USING hnsw (embedding halfvec_cosine_ops)
     WITH (m = 16, ef_construction = 64);
 
 -- 키워드 검색 — tsvector 전문검색 (GIN, 함수식). 앱단 토큰 → content_tokens → 'simple' tsvector.
 CREATE INDEX IF NOT EXISTS idx_schedule_fts
-    ON schedule_chunks
+    ON corpus.schedule_chunks
     USING gin (to_tsvector('simple', coalesce(content_tokens, '')));
 
 -- 버전(적용기간) 필터 — 계약 체결일이 속하는 개정판 조회.
 CREATE INDEX IF NOT EXISTS idx_schedule_version
-    ON schedule_chunks (applies_from, applies_to);
+    ON corpus.schedule_chunks (applies_from, applies_to);
 
 -- 신체부위 필터.
 CREATE INDEX IF NOT EXISTS idx_schedule_body_part
-    ON schedule_chunks (body_part);
+    ON corpus.schedule_chunks (body_part);
 
 -- doc_hash 중복 방지 조회.
 CREATE INDEX IF NOT EXISTS idx_schedule_doc_hash
-    ON schedule_chunks (doc_hash);
+    ON corpus.schedule_chunks (doc_hash);
+
+-- report_worker·chatbot이 ai_owner로 RAG 검색 시 이 테이블을 읽어야 한다(스키마 분리,
+-- deploy/schema_split.sql 참고). role이 없는 로컬 PG에서는 조용히 건너뛴다.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ai_owner') THEN
+        EXECUTE 'GRANT SELECT ON corpus.schedule_chunks TO ai_owner';
+    END IF;
+END
+$$;

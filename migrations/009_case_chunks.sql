@@ -16,7 +16,7 @@
 --       DROP TYPE  IF EXISTS case_outcome;
 --       DROP TYPE  IF EXISTS case_block_type;
 
-CREATE TABLE IF NOT EXISTS case_chunks (
+CREATE TABLE IF NOT EXISTS corpus.case_chunks (
     chunk_id        TEXT PRIMARY KEY,
     content         TEXT        NOT NULL,   -- 임베딩 원문
     content_tokens  TEXT,                   -- Kiwi 형태소 (공백 구분) → tsvector 전문검색
@@ -48,22 +48,32 @@ CREATE TABLE IF NOT EXISTS case_chunks (
 
 -- 벡터 검색 (ANN, cosine) — HNSW, halfvec 전용 연산자 클래스.
 CREATE INDEX IF NOT EXISTS idx_case_hnsw
-    ON case_chunks USING hnsw (embedding halfvec_cosine_ops)
+    ON corpus.case_chunks USING hnsw (embedding halfvec_cosine_ops)
     WITH (m = 16, ef_construction = 64);
 
 -- 키워드 검색 — tsvector 전문검색 (GIN, 함수식). 앱단 토큰 → content_tokens → 'simple' tsvector.
 CREATE INDEX IF NOT EXISTS idx_case_fts
-    ON case_chunks
+    ON corpus.case_chunks
     USING gin (to_tsvector('simple', coalesce(content_tokens, '')));
 
 -- 메타 필터 (출처·사고유형·결정일).
 CREATE INDEX IF NOT EXISTS idx_case_meta
-    ON case_chunks (source_type, accident_type, decision_date);
+    ON corpus.case_chunks (source_type, accident_type, decision_date);
 
 -- 쟁점 태그 검색.
 CREATE INDEX IF NOT EXISTS idx_case_tags
-    ON case_chunks USING gin (tags);
+    ON corpus.case_chunks USING gin (tags);
 
 -- doc_hash 중복 방지 조회.
 CREATE INDEX IF NOT EXISTS idx_case_doc_hash
-    ON case_chunks (doc_hash);
+    ON corpus.case_chunks (doc_hash);
+
+-- report_worker·chatbot이 ai_owner로 RAG 검색 시 이 테이블을 읽어야 한다(스키마 분리,
+-- deploy/schema_split.sql 참고). role이 없는 로컬 PG에서는 조용히 건너뛴다.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ai_owner') THEN
+        EXECUTE 'GRANT SELECT ON corpus.case_chunks TO ai_owner';
+    END IF;
+END
+$$;
