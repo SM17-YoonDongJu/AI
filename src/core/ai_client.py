@@ -1,7 +1,7 @@
 """OpenAI 호환 추론 클라이언트.
 
 base_url·모델명·인증키는 config에서 주입(하드코딩 금지). 챗과 임베딩은 서로 다른 노드에
-있을 수 있어(EXAONE vs qwen3:embedding) 엔드포인트를 분리한다. 모든 호출은 async-first이며
+있을 수 있어(Qwen3 LLM vs qwen3-embedding) 엔드포인트를 분리한다. 모든 호출은 async-first이며
 블로킹을 유발하지 않는다(httpx.AsyncClient).
 """
 

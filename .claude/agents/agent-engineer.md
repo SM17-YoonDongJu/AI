@@ -18,7 +18,7 @@ RAG·가드레일·ai_client를 **조립**해 최종 사용자 가치를 만드�
 ### `src/chatbot/` (로직 + FastAPI 진입점 `app.py`) — 챗봇 (12번)
 - FastAPI가 ALB(/ws/chat)를 통해 **WebSocket 직접 수락**, on-connect JWT(RS256) 검증
 - Redis로 다중 Pod 세션 상태·멀티턴 컨텍스트 공유 (24h 만료)
-- 처리: 입력 가드레일 → RAG 검색 → ai_client(EXAONE) **완성 응답 생성** → 출력 가드레일
+- 처리: 입력 가드레일 → RAG 검색 → ai_client(Qwen3 MoE) **완성 응답 생성** → 출력 가드레일
 - **비스트리밍**: 완성된 응답을 `message`로 1회 전달(citations 포함). 토큰 스트리밍·`stream`/`done` 신호 없음
 - 대화 이력 PG 저장(90일), 세션 생성·종료 REST
 

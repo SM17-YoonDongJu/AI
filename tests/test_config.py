@@ -24,14 +24,14 @@ def test_model_names_default_empty_to_force_injection() -> None:
 
 def test_env_overrides_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     # Arrange
-    monkeypatch.setenv("LLM_MODEL", "exaone-test")
+    monkeypatch.setenv("LLM_MODEL", "qwen-test")
     monkeypatch.setenv("EMBEDDING_DIM", "512")
 
     # Act
     cfg = Settings()
 
     # Assert
-    assert cfg.llm_model == "exaone-test"
+    assert cfg.llm_model == "qwen-test"
     assert cfg.embedding_dim == 512
 
 
