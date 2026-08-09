@@ -173,4 +173,4 @@ docker image prune -f
 - `.github/workflows/ci.yml` — 파이프라인 정의
 - `.github/actions/discord-notify/` — 알림 액션
 - `deploy/docker-compose.ocr.yml`, `deploy/.env.ocr.example` — GPU EC2 배포 정본
-- `migrations/*.sql` — DB 스키마(확장·테이블)
+- `migrations/ai/*.sql`, `migrations/corpus/*.sql` — DB 스키마(확장·테이블, role별 소유 스키마로 분리 — `migrations/README.md` 참고)

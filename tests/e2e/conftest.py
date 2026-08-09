@@ -28,8 +28,10 @@ E2E_KAFKA = os.getenv("E2E_KAFKA", "localhost:9092")
 E2E_DATABASE_URL = os.getenv(
     "E2E_DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/ai_engine"
 )
-# 마이그레이션 SQL 위치(리포지토리 루트 기준). __main__ 과 동일 디렉터리를 쓴다.
-_MIGRATIONS_DIR = "migrations"
+# 마이그레이션 SQL 위치(리포지토리 루트 기준). ai_owner/corpus_owner 전용 서브디렉터리로
+# 분리돼 있다(#48~#52) — e2e는 단일 superuser(postgres)로 접속하므로 소유권 문제 없이
+# 둘 다 순서대로 적용한다.
+_MIGRATIONS_DIRS = ("migrations/ai", "migrations/corpus")
 
 
 def _tcp_open(host: str, port: int, timeout: float = 1.0) -> bool:
@@ -113,7 +115,8 @@ async def e2e_pool(e2e_settings: Settings) -> AsyncIterator[asyncpg.Pool]:
         await bootstrap.close()
 
     pool = await create_pool(e2e_settings)
-    await run_migrations(pool, _MIGRATIONS_DIR)
+    for migrations_dir in _MIGRATIONS_DIRS:
+        await run_migrations(pool, migrations_dir)
     try:
         yield pool
     finally:
