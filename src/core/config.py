@@ -15,6 +15,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # 임베딩 차원은 계약상 고정값(qwen3:embedding 1024d, BGE-M3 폴백도 1024d).
 DEFAULT_EMBEDDING_DIM = 1024
 
+# CD 스모크: shared(core) 변경으로 3개 서비스 배포 경로 검증(값·동작 무변경). 재트리거 4.
+
 
 class Settings(BaseSettings):
     """전 워커가 공유하는 환경설정. env 변수명은 필드명과 동일(대소문자 무시)."""
@@ -52,17 +54,72 @@ class Settings(BaseSettings):
     aws_region: str = "ap-northeast-2"
     s3_bucket: str = ""
 
+    # --- 원본 삭제 outbox (ocr_results.original_delete_* — ocr_worker 스윕) ---
+    # 마스킹 검증을 통과한 원본 삭제가 실패하면 ocr_results 행에 남겨 재시도한다.
+    ocr_delete_max_attempts: int = 5  # 소진 시 'exhausted'(종결) — S3 라이프사이클이 백스톱
+    # 스윕 주기이자 실패 후 고정 백오프 간격(초). 지수 백오프는 두지 않는다 — 삭제 실패는
+    # 부하가 아니라 권한·네트워크 등 지속성 오류가 대부분이라 간격을 늘려도 이득이 없다.
+    ocr_delete_retry_interval_seconds: float = 900.0
+
+    # --- Notion (약관 코퍼스 소스 — jjg 인테그레이션, 공식 REST API) ---
+    notion_token: str = ""  # 시크릿(ntn_...). SSM/.env 주입, 코드·커밋 금지
+    # 데이터 출처 카탈로그(컨트롤 테이블). /v1/databases/{id}/query용 **database id**
+    # (collection/data source id 아님 — 그건 relation·view 참조용).
+    notion_catalog_database_id: str = "e6fa0ba5efb946c6934c195774e9b6e7"
+    # terms(약관) 파일 DB(카탈로그 `출처` relation 대상)의 database id.
+    notion_corpus_database_id: str = "e2bde980f10741d8bcf35f2d60709171"
+    notion_api_version: str = "2022-06-28"  # Notion-Version 헤더 고정
+    notion_sync_interval_seconds: int = 3600  # 카탈로그→PG 주기 동기화 간격
+    notion_rate_limit_rps: float = 3.0  # Notion API 평균 레이트리밋 상한
+
+    # --- Corpus S3 스테이징 (Notion 첨부 → S3, 청킹/임베딩은 범위 밖) ---
+    corpus_categories: str = "terms"  # MVP 필터. 확장 시 "terms,precedent,medical,legal"
+    s3_corpus_prefix: str = "corpus/"  # 키 = corpus/{category}/{sha256}.pdf (OCR 키공간과 분리)
+    s3_corpus_sse: str = "AES256"  # SSE-S3(공개 약관·비-PII)
+    corpus_poll_interval_seconds: float = 5.0  # 우선순위 큐 폴링 간격
+    corpus_max_concurrent_uploads: int = 4  # 동시 업로드 수
+    # 대용량 스트리밍 임시(처리 후 즉시 삭제). env로 재정의 가능한 기본값이라 S108 무시.
+    corpus_download_tmp_dir: str = "/tmp"  # noqa: S108
+    corpus_max_attempts: int = 5  # 문서 처리 재시도 상한(초과 시 status='failed')
+    corpus_stale_reclaim_seconds: int = 900  # in_progress 좀비 회수 TTL(초)
+    corpus_full_reconcile_every_cycles: int = 24  # N 사이클마다 full 동기화(삭제 반영)
+
+    # --- 수요도 우선순위 (가중치·상수만 env; 상품종류 룩업표는 priority 모듈) ---
+    corpus_w_demand: float = 0.6  # 수요도(상품종류) 가중
+    corpus_w_urgency: float = 0.4  # 긴급도(시행일 신선도) 가중
+    corpus_demand_halflife_days: float = 7.0  # 수요 부스트 반감기(일)
+    corpus_demand_boost_cap: float = 40.0  # 수요 부스트 상한
+
     # --- PII 마스킹 ---
     use_ner: bool = False  # NER 디텍터 활성 여부(false면 정규식만)
+    # NER 모델(로컬 실행 — 외부 API로 PII 전송 금지). 이름(PS)만 사용.
+    ner_model: str = "Leo97/KoELECTRA-small-v3-modu-ner"
+    # NER 확률 임계값. 마스킹은 recall 우선이라 낮게; 과잉 마스킹 시 상향(노션 §2).
+    ner_score_threshold: float = 0.5
 
     # --- AI 서빙 (OpenAI 호환: Ollama/vLLM/TEI) — 모델 미정, env 주입 ---
     ai_base_url: str = "http://localhost:11434/v1"  # 챗 추론 엔드포인트
     ai_api_key: str = "not-needed"  # OpenAI 호환 인증(로컬은 미사용)
-    llm_model: str = ""  # 예: qwen3:35b-a3b (Qwen3 MoE — EXAONE은 라이선스상 상업 사용 불가)
+    llm_model: str = ""  # 예: qwen3.6:35b-a3b (Qwen3 MoE — EXAONE은 라이선스상 상업 사용 불가)
     embedding_base_url: str = "http://localhost:11434/v1"  # 임베딩 엔드포인트(별도 노드 가능)
     embedding_model: str = ""  # 예: qwen3:embedding (1024d)
     embedding_dim: int = DEFAULT_EMBEDDING_DIM
     ai_timeout_seconds: float = 60.0  # 추론 HTTP 요청 타임아웃
+
+    # --- VLM(Vision) 서빙 — Ollama 네이티브 /api/generate(OpenAI 호환 아님) ---
+    # 다중 항목 표 문서(지급결과서·청구서·입원확인서·진료비영수증)에서 surya 라인
+    # 순서가 표 구조를 못 살릴 때 보완하는 하이브리드 경로(ocr_worker.vlm_client) 전용.
+    vlm_base_url: str = "http://localhost:11434"  # ai_base_url과 별도(엔드포인트 형태 다름)
+    # 표 전사(텍스트만, 좌표 없음) — 팀 합의 모델. 실측: qwen3-vl:8b-instruct보다 텍스트
+    # 정확도·속도(~11초 vs ~15초) 모두 좋음.
+    vlm_model: str = "qwen3.6:35b-a3b"
+    # 이미지 마스킹 보강용 PII 위치 grounding(좌표 출력) 전용 — vlm_model과 별도 모델.
+    # 실측: qwen3.6:35b-a3b는 vision capability는 있지만 grounding 좌표가 실제 텍스트
+    # 위치에서 벗어남(이름 박스가 이름 글자를 완전히 빗나감) — qwen3-vl:8b-instruct는
+    # 같은 문서에서 정확했다. 좌표 정밀도가 안전(과소 마스킹 방지)에 직결돼 텍스트
+    # 전사보다 훨씬 보수적으로 골라야 하므로, 검증된 모델을 별도로 고정한다.
+    vlm_grounding_model: str = "qwen3-vl:8b-instruct"
+    vlm_timeout_seconds: float = 60.0  # 실측 평균 15초·최대 34초 — 여유 두고 60초
 
 
 @lru_cache

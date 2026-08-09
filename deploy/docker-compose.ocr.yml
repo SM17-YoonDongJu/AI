@@ -1,0 +1,100 @@
+# GPU EC2(AI subnet) 배포용 compose — 단일 진실원. 서버에서 수동 편집 금지, PR로 수정.
+# 사용: docker compose -f docker-compose.ocr.yml --env-file .env.ocr up -d
+# CD는 ocr-worker만 bounce: ... up -d --no-deps ocr-worker
+# 인프라(ollama)는 최초 1회 full up 후 restart 정책으로 상주 + 모델 pull 1회 필요.
+#
+# 전제: 호스트에 NVIDIA 드라이버 + nvidia-container-toolkit 설치됨(Deep Learning AMI 권장).
+name: brbs-ocr
+
+services:
+  # 로컬 LLM/임베딩 서빙. backend EC2의 report/chatbot이 GPU_PRIVATE_IP:11434로 호출.
+  ollama:
+    image: ollama/ollama:latest
+    container_name: brbs-ollama
+    restart: unless-stopped
+    ports:
+      # backend EC2가 호출 → private IP 바인딩(무인증이므로 SG로만 sg-backend 허용). 0.0.0.0 금지.
+      - "${GPU_PRIVATE_IP}:11434:11434"
+    volumes:
+      - ollama-models:/root/.ollama   # gemma3:12b(~7GB)+bge-m3(~2GB) 캐시. 최초 pull 필요.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+    networks: [ocr-net]
+
+  # OCR Worker(surya, in-process PyTorch). Kafka ocr-job-queue 소비 → 결과 저장 → 리포트 이벤트 발행.
+  ocr-worker:
+    image: ${ECR_REGISTRY}/soma/ocr:${OCR_TAG:-dev}
+    container_name: brbs-ocr-worker
+    restart: unless-stopped
+    environment:
+      ENV: ${ENV}
+      LOG_LEVEL: ${LOG_LEVEL}
+      DATABASE_URL: ${DATABASE_URL}                       # RDS 직접
+      # RDS는 SSL 연결만 허용(pg_hba). 비우면 core.db가 SSL을 꺼(평문) "no encryption"으로 거부됨.
+      RDS_CA_PATH: ${RDS_CA_PATH}                          # 컨테이너 내부 CA 경로(아래 볼륨과 일치)
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS}  # backend EC2: 10.0.x.x:9094
+      KAFKA_SECURITY_PROTOCOL: ${KAFKA_SECURITY_PROTOCOL}
+      KAFKA_OCR_JOB_TOPIC: ${KAFKA_OCR_JOB_TOPIC}
+      KAFKA_REPORT_JOB_TOPIC: ${KAFKA_REPORT_JOB_TOPIC}
+      EMBEDDING_BASE_URL: http://ollama:11434/v1          # 같은 박스 내부
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL}
+      EMBEDDING_DIM: ${EMBEDDING_DIM}
+      # 하이브리드 표 문서 보조 경로(ocr_worker.vlm_client). Ollama 네이티브
+      # /api/generate라 EMBEDDING_BASE_URL과 달리 /v1 접미사 없음. 모델은 최초
+      # 1회 `docker exec brbs-ollama ollama pull <모델>` 필요.
+      VLM_BASE_URL: http://ollama:11434
+      # 표 전사(텍스트만) — 팀 합의 모델. 실측: 텍스트 정확도·속도 모두 8B보다 좋음.
+      VLM_MODEL: ${VLM_MODEL:-qwen3.6:35b-a3b}
+      # 이미지 마스킹 보강용 PII 위치 grounding(좌표) 전용 — 실측: 표 전사엔 더 좋은
+      # 위 모델도 grounding 좌표는 실제 위치를 벗어남(과소 마스킹 위험) — 검증된
+      # 모델을 별도 고정한다. VLM_MODEL과 다른 값을 쓰려면 이 변수를 바꾼다.
+      VLM_GROUNDING_MODEL: ${VLM_GROUNDING_MODEL:-qwen3-vl:8b-instruct}
+      VLM_TIMEOUT_SECONDS: ${VLM_TIMEOUT_SECONDS:-60}
+      # 이름(NAME) 마스킹은 정규식 문맥 앵커(의사명·서명란)만으로는 "환자의 성명: OOO"
+      # 같은 일반 라벨-값 형태를 못 잡는다 — 실측(E2E) 확인. NER이 유일한 방어선이라
+      # 기본 활성화한다(CPU 추론, 모델은 최초 detect 시 lazy 다운로드).
+      USE_NER: ${USE_NER:-true}
+      AWS_REGION: ${AWS_REGION}
+      S3_BUCKET: ${S3_BUCKET}
+      TZ: Asia/Seoul
+    volumes:
+      # RDS CA 번들(호스트에 배치, git 미커밋)을 읽기전용 마운트. RDS_CA_PATH가 이 경로를 가리킨다.
+      # 준비: curl -o /opt/ocr/certs/rds-global-bundle.pem \
+      #        https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
+      - /opt/ocr/certs/rds-global-bundle.pem:/etc/ssl/rds/global-bundle.pem:ro
+    depends_on:
+      ollama:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+    networks: [ocr-net]
+
+volumes:
+  ollama-models:
+
+networks:
+  ocr-net:
+    driver: bridge
+

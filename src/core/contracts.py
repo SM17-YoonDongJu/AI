@@ -51,6 +51,8 @@ class DocType(StrEnum):
     POLICY = "policy"  # 보험증권
     PAYOUT_NOTICE = "payout_notice"  # 지급결과안내문
     CLAIM = "claim"  # 청구서
+    HOSPITALIZATION_CERT = "hospitalization_cert"  # 입퇴원확인서
+    MEDICAL_RECEIPT = "medical_receipt"  # 진료비계산서·영수증
     OTHER = "other"  # 기타
 
 
@@ -60,9 +62,14 @@ class DocType(StrEnum):
 
 
 class OcrJob(BaseModel):
-    """Spring → `ocr-job-queue` → `ocr_worker`. 파일 업로드 시 발행되는 OCR 작업.
+    """Spring → `ocr-job-queue` → `ocr_worker`. 문서 1건마다 발행되는 OCR 작업.
 
     토픽 `ocr-job-queue`, 파티션 키 `job_id`, at-least-once + `job_id` 멱등 처리.
+
+    소유권(2026-07-10, 발행측 `OcrJob.java` 정본): Spring이 `reports`·`report_attachments`
+    shell 행을 먼저 생성하고, 워커는 OCR·AI 결과로 그 행을 UPDATE(생성 아님)한다 →
+    `report_id`·`attachment_id`가 그 참조 키다. 한 청구의 문서를 1건씩 발행하므로
+    `doc_index`/`doc_total`로 워커가 리포트 생성(fan-in) 시점을 판별한다.
     """
 
     job_id: str  # OCR 작업 식별자(UUID). 멱등 키
@@ -71,6 +78,10 @@ class OcrJob(BaseModel):
     user_ref: str  # 사용자 참조(내부 식별자, PII 아님)
     doc_type_hint: str | None = None  # 업로드 시 사용자가 고른 문서 유형 힌트
     claim_id: str | None = None  # USER_CLAIMS.id 참조(옵셔널) — report_worker가 조회
+    report_id: str  # REPORTS.id(UUID) — 결과 UPDATE 대상(Spring이 shell 생성)
+    attachment_id: str  # REPORT_ATTACHMENTS.id(UUID) — 결과 UPDATE 대상
+    doc_index: int | None = None  # 청구 내 문서 순번(1-based)
+    doc_total: int | None = None  # 청구 총 문서 수 — 워커의 fan-in(리포트 생성) 판별용
     uploaded_at: datetime  # 업로드 시각(UTC, ISO-8601)
 
 
@@ -87,6 +98,9 @@ class ReportJob(BaseModel):
     user_ref: str  # 사용자 참조
     claim_id: str | None = None  # USER_CLAIMS.id 패스스루(옵셔널)
     created_at: datetime  # 발행 시각(UTC, ISO-8601)
+    # ocr_worker의 자동 품질 판정(저신뢰도 + 이름/도메인 정보 미검출). needs_reupload면
+    # report_worker가 리포트 생성을 건너뛰어야 한다는 신호 — 실제 사용자 알림은 게이트웨이 몫.
+    ocr_quality: Literal["ok", "needs_reupload"] = "ok"
 
 
 # --------------------------------------------------------------------------- #

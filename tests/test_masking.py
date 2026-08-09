@@ -1,0 +1,300 @@
+"""PII 마스킹(#18) 단위 테스트 — 정규식 레이어는 완전히 결정적(노션 §3).
+
+NER 레이어는 transformers/torch(ner extra)가 필요하므로 미설치 환경에서는
+스킵한다. 정규식·병합·검증은 표준 라이브러리만으로 항상 검증한다.
+"""
+
+import pytest
+
+from ocr_worker.masking import (
+    MaskingError,
+    PiiLabel,
+    RegexDetector,
+    Span,
+    apply_mask,
+    assert_no_residual,
+    find_residual_pii,
+    mask,
+    merge_overlaps,
+)
+from ocr_worker.masking.patterns import CARD_RE
+
+# ── 정규식 디텍터: 정형 PII를 가린다 ─────────────────────────────
+
+
+def test_masks_resident_registration_number() -> None:
+    text = "환자 주민등록번호 901010-1234567 입니다"
+    assert mask(text) == "환자 주민등록번호 [주민등록번호] 입니다"
+
+
+def test_foreign_registration_number_gets_distinct_label() -> None:
+    # 7번째 자리 5 → 외국인등록번호
+    assert mask("등록번호 901010-5234567") == "등록번호 [외국인등록번호]"
+
+
+def test_masks_phone_email_card() -> None:
+    masked = mask("연락처 010-1234-5678, 이메일 hong@example.com, 카드 1234-5678-9012-3456")
+    assert "[전화번호]" in masked
+    assert "[이메일]" in masked
+    assert "[카드번호]" in masked
+    assert "@example.com" not in masked
+
+
+def test_masks_account_only_with_context_keyword() -> None:
+    # 키워드(계좌)가 있으면 가린다
+    assert "[계좌번호]" in mask("입금 계좌 110-234-567890 으로")
+
+
+def test_amount_is_not_masked_as_account() -> None:
+    # 금액(콤마)·문맥 키워드 없는 숫자는 계좌로 오인하지 않는다(화이트리스트 보호)
+    assert mask("보험금 1,200,000원 지급") == "보험금 1,200,000원 지급"
+
+
+def test_address_is_masked() -> None:
+    masked = mask("주소 서울특별시 강남구 테헤란로 123 입니다")
+    assert "[주소]" in masked
+    assert "테헤란로" not in masked
+
+
+def test_hospital_name_is_not_masked() -> None:
+    # "서울아산병원"의 "서울"이 주소로 트리거되면 안 됨(화이트리스트 핵심)
+    text = "진단병원: 서울아산병원, 진단명: 급성 기관지염 (J20.9)"
+    assert mask(text) == text
+
+
+def test_clinical_whitelist_preserved() -> None:
+    # 진단명·KCD코드·입원기간·금액은 그대로 유지
+    text = "입원일자 2024-01-05 퇴원일자 2024-01-20, KCD S82.1, 수술명 골절정복술"
+    assert mask(text) == text
+
+
+def test_masks_medical_license_number() -> None:
+    masked = mask("발급 의사 면허번호: 제45678호")
+    assert "[면허번호]" in masked
+    assert "45678" not in masked
+
+
+def test_masks_policy_number() -> None:
+    masked = mask("증권번호: A12345678-01 / 보험사: 한화생명")
+    assert "[증권번호]" in masked
+    assert "A12345678" not in masked
+    assert "한화생명" in masked  # 보험사명은 유지(화이트리스트)
+
+
+def test_masks_amex_card_number() -> None:
+    # 15자리(4-6-5) Amex 형식도 카드번호로 가린다
+    masked = mask("카드 3412-345678-12345 결제")
+    assert "[카드번호]" in masked
+    assert "345678" not in masked
+
+
+def test_card_regex_does_not_span_newlines() -> None:
+    # 실제 카드번호는 한 줄에 인쇄된다 — 서로 다른 줄에 흩어진 숫자 조각을
+    # 카드번호로 오인하지 않아야 한다(과마스킹 방지).
+    assert CARD_RE.search("1234\n5678\n9012\n3456") is None
+    assert CARD_RE.search("1234-5678-9012-3456") is not None  # 한 줄이면 정상 매칭
+
+
+def test_masks_patient_name_by_label_even_if_uncommon() -> None:
+    # 실측(E2E): NER이 "이샘플"처럼 흔치 않은 합성 이름을 놓치는 사례가 있었다 —
+    # "환자 성명" 라벨 뒤 이름은 NER 성공 여부와 무관하게 정규식으로도 잡아야 한다.
+    masked = mask("환자 성명: 이샘플")
+    assert "[이름]" in masked
+    assert "이샘플" not in masked
+
+
+def test_masks_person_name_in_markdown_table_row() -> None:
+    # VLM 하이브리드 경로의 원문은 "| 라벨 | 값 |" 마크다운 표 형태다 — 라벨과 값
+    # 사이의 파이프(|)도 구분자로 흡수해야 한다.
+    masked = mask("| 피보험자 | 홍길동 |\n| 계약자 | 김철수 |")
+    assert "[이름]" in masked
+    assert "홍길동" not in masked
+    assert "김철수" not in masked
+
+
+def test_masks_person_name_with_bold_markdown_label() -> None:
+    # 실측(E2E): VLM이 라벨을 "**환자 성명**"처럼 마크다운 볼드로 감싼 원문에서
+    # 별표(*)를 구분자로 흡수 못해 매칭이 끊긴 사례를 확인했다.
+    masked = mask("| **환자 성명** | 이샘플 |")
+    assert "[이름]" in masked
+
+
+def test_masks_staff_name_skipping_department_word() -> None:
+    # 실측(E2E): "발급담당자: 원무팀 최테스트"처럼 라벨과 이름 사이에 부서명이
+    # 끼면, 부서명("원무팀")을 이름으로 오인하거나 실제 이름("최테스트")을
+    # 놓치는 문제가 있었다 — 팀/과/부/실로 끝나는 부서명은 건너뛰고 잡는다.
+    # 부서명 자체는 PII가 아니므로 그대로 남아 있어야 한다.
+    masked = mask("발급담당자: 원무팀 최테스트")
+    assert "[이름]" in masked
+    assert "최테스트" not in masked
+    assert "원무팀" in masked
+
+
+def test_masks_staff_name_without_department_word() -> None:
+    # 부서명 없이 라벨 바로 뒤 이름이 오는 형태도 계속 잡혀야 한다.
+    masked = mask("담당자: 최테스트")
+    assert "[이름]" in masked
+    assert "최테스트" not in masked
+    assert "이샘플" not in masked
+
+
+def test_staff_department_without_name_is_not_masked() -> None:
+    # 코드리뷰 지적: 부서명 그룹이 옵셔널이라, 이름 없이 부서명으로 끝나면
+    # 옵셔널 그룹을 건너뛰고 부서명 자체가 이름 그룹으로 오탐될 수 있었다.
+    masked = mask("담당자: 원무팀")
+    assert "[이름]" not in masked
+    assert "원무팀" in masked
+
+
+def test_masks_beneficiary_name() -> None:
+    masked = mask("예금주 최테스트 계좌로 입금")
+    assert "[이름]" in masked
+    assert "최테스트" not in masked
+
+
+def test_masks_ward_room_number() -> None:
+    masked = mask("병실번호 302호로 배정되었습니다")
+    assert "[병실번호]" in masked
+    assert "302" not in masked
+
+
+def test_masks_approval_number() -> None:
+    masked = mask("현금영수증 승인번호 123456789 발급")
+    assert "[승인번호]" in masked
+    assert "123456789" not in masked
+
+
+def test_masks_patient_id() -> None:
+    masked = mask("환자등록번호 P-260715-031 확인")
+    assert "[환자등록번호]" in masked
+    assert "P-260715-031" not in masked
+
+
+def test_business_registration_number_not_masked_as_patient_id() -> None:
+    # "사업자등록번호"는 단독 "등록번호" 앵커를 제외했으므로 환자등록번호로 오탐되지 않음
+    masked = mask("사업자등록번호 123-45-67890")
+    assert "[환자등록번호]" not in masked
+    assert "[사업자등록번호]" in masked
+
+
+def test_masks_doctor_name_after_keyword() -> None:
+    assert mask("작성 의사: 김철수") == "작성 의사: [이름]"
+
+
+def test_license_field_label_not_masked_as_name() -> None:
+    # '의사 면허번호'의 '면허번호'(필드 라벨)가 이름으로 오인되면 안 됨
+    masked = mask("발급 의사 면허번호: 제45678호")
+    assert "[이름]" not in masked
+    assert "[면허번호]" in masked
+
+
+def test_masks_signature_line_name() -> None:
+    assert mask("주치의 이영희 (서명)") == "주치의 [이름] (서명)"
+
+
+def test_doctor_opinion_not_masked() -> None:
+    # '의사소견'은 화이트리스트(유지) — 이름 룰에 오인되면 안 됨
+    text = "의사소견: 6주간 안정 가료를 요함"
+    assert mask(text) == text
+
+
+# ── 병합·치환 로직 ──────────────────────────────────────────────
+
+
+def test_merge_overlaps_widens_and_dedupes() -> None:
+    spans = [
+        Span(0, 5, PiiLabel.NAME, source="ner"),
+        Span(3, 10, PiiLabel.ADDRESS, source="regex"),  # 더 길다 → 대표 라벨
+    ]
+    merged = merge_overlaps(spans)
+    assert len(merged) == 1
+    assert merged[0].start == 0
+    assert merged[0].end == 10
+    assert merged[0].label is PiiLabel.ADDRESS
+
+
+def test_adjacent_spans_not_merged() -> None:
+    # 맞닿은(겹치지 않은) 서로 다른 PII는 각각 치환
+    text = "홍길동010"
+    spans = [
+        Span(0, 3, PiiLabel.NAME, source="ner"),
+        Span(3, 6, PiiLabel.PHONE, source="regex"),
+    ]
+    assert apply_mask(text, spans) == "[이름][전화번호]"
+
+
+def test_apply_mask_is_index_safe_back_to_front() -> None:
+    # 토큰 길이가 원문과 달라도 인덱스가 밀리지 않아야 함
+    text = "a 901010-1234567 b hong@x.com c"
+    out = mask(text)
+    assert out == "a [주민등록번호] b [이메일] c"
+
+
+def test_no_pii_returns_unchanged() -> None:
+    text = "진단명 급성 기관지염, 치료기간 2주"
+    assert mask(text) == text
+
+
+# ── 검증 (Tier 1 잔류 스캔) ─────────────────────────────────────
+
+
+def test_find_residual_detects_unmasked_rrn() -> None:
+    leaks = find_residual_pii("주민번호 901010-1234567 누락")
+    assert any(s.label is PiiLabel.RRN for s in leaks)
+
+
+def test_assert_no_residual_passes_on_masked_text() -> None:
+    assert_no_residual(mask("주민등록번호 901010-1234567"))  # 예외 없음
+
+
+def test_assert_no_residual_raises_on_leak() -> None:
+    with pytest.raises(MaskingError):
+        assert_no_residual("계좌 미마스킹 901010-1234567")
+
+
+def test_find_residual_detects_account_in_context() -> None:
+    # 문맥 앵커(계좌번호) 뒤 숫자 묶음을 잔류로 추적한다
+    leaks = find_residual_pii("계좌번호 110-1234-567890 누락")
+    assert any(s.label is PiiLabel.ACCOUNT for s in leaks)
+
+
+def test_assert_no_residual_does_not_gate_account_only() -> None:
+    # 계좌는 추적 전용(_TRACK_ONLY) — 잔류해도 하드 실패시키지 않는다.
+    # (이 숫자열은 RRN/카드 패턴엔 안 걸려 ACCOUNT로만 잡힘)
+    assert_no_residual("계좌번호 110-1234-567890")  # 예외 없음
+
+
+def test_card_residual_does_not_span_newlines() -> None:
+    # 실측(노이즈 많은 실사진 OCR): 서로 무관한 짧은 숫자 조각이 여러 줄에 걸쳐
+    # 우연히 14~15자리를 채우면, 개행까지 구분자로 허용하던 옛 패턴은 이를
+    # 카드번호로 오탐해 정상 문서를 MaskingError로 fail-closed 격리시켰다.
+    text = "71\n31\n2 16\n21029144"
+    leaks = find_residual_pii(text)
+    assert not any(s.label is PiiLabel.CARD for s in leaks)
+    assert_no_residual(text)  # 예외 없음 — 카드번호 오탐으로 막히지 않는다
+
+
+# ── 디텍터 직접 호출(이미지 마스킹 B안 스팬 공유) ───────────────
+
+
+def test_regex_detector_returns_spans_with_offsets() -> None:
+    spans = RegexDetector().detect("주민 901010-1234567")
+    assert len(spans) == 1
+    span = spans[0]
+    assert span.label is PiiLabel.RRN
+    assert span.source == "regex"
+    # 스팬 좌표가 원문 PII를 정확히 가리킴(bbox 매핑 전제)
+    assert "901010" in "주민 901010-1234567"[span.start : span.end]
+
+
+# ── NER (옵션, ner extra 설치 시에만) ───────────────────────────
+
+
+def test_ner_detector_masks_name_when_available() -> None:
+    transformers = pytest.importorskip("transformers")  # noqa: F841
+    from ocr_worker.masking import Masker
+
+    masker = Masker(use_ner=True)
+    masked = masker.mask("환자 성명: 홍길동")
+    # 이름이 가려졌는지(모델 다운로드 필요 — 통합 환경에서만 의미)
+    assert "[이름]" in masked or "홍길동" not in masked

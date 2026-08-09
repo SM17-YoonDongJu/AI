@@ -26,7 +26,9 @@
 ---
 
 ## 1. `OcrJob`
-**Spring → `ocr-job-queue` → `ocr_worker`.** 파일 업로드 시 발행되는 OCR 작업.
+**Spring → `ocr-job-queue` → `ocr_worker`.** 문서 1건마다 발행되는 OCR 작업.
+
+**소유권(2026-07-10 변경, 발행측 `OcrJob.java` 정본):** Spring이 `reports`·`report_attachments` shell 행을 먼저 생성하고, 워커는 OCR·AI 결과로 그 행을 **UPDATE(생성 아님)** 한다. `report_id`·`attachment_id`가 그 UPDATE 대상 참조 키다. 한 청구의 문서를 **1건씩** 발행하므로 `doc_index`/`doc_total`로 워커가 리포트 생성(**fan-in**) 시점을 판별한다.
 
 | 필드 | 타입 | 필수 | 설명 |
 |---|---|---|---|
@@ -35,7 +37,11 @@
 | `content_type` | string | ✓ | `application/pdf` `image/jpeg` `image/png` `image/tiff` |
 | `user_ref` | string | ✓ | 사용자 참조(내부 식별자, PII 아님) |
 | `doc_type_hint` | string \| null | – | 업로드 시 사용자가 고른 문서 유형 힌트 |
-| `claim_id` | string(UUID) \| null | – | `USER_CLAIMS.id` 참조. `report_worker`가 조회에 사용 |
+| `claim_id` | string(UUID) \| null | – | `USER_CLAIMS.id` 참조(옵셔널). `ocr_worker`는 가공 없이 `ReportJob`으로 패스스루만 |
+| `report_id` | string(UUID) | ✓ | `REPORTS.id` 참조 — 결과 UPDATE 대상(Spring이 shell 생성) |
+| `attachment_id` | string(UUID) | ✓ | `REPORT_ATTACHMENTS.id` 참조 — 결과 UPDATE 대상 |
+| `doc_index` | int \| null | – | 청구 내 문서 순번(1-based) |
+| `doc_total` | int \| null | – | 청구 총 문서 수 — 워커의 fan-in(리포트 생성) 판별용 |
 | `uploaded_at` | string(ISO-8601) | ✓ | 업로드 시각(UTC) |
 
 ```json
@@ -43,13 +49,18 @@
   "job_id": "8f1c2d3e-...-a1",
   "s3_key": "uploads/8f1c2d3e.pdf",
   "content_type": "application/pdf",
-  "user_ref": "u_4821",
-  "doc_type_hint": null,
-  "claim_id": null,
-  "uploaded_at": "2026-06-17T05:30:00Z"
+  "user_ref": "3f0e...-uid",
+  "doc_type_hint": "diagnosis",
+  "claim_id": "c1a1...-cl",
+  "report_id": "r2b2...-rp",
+  "attachment_id": "a3c3...-at",
+  "doc_index": 1,
+  "doc_total": 3,
+  "uploaded_at": "2026-07-10T09:21:16.123Z"
 }
 ```
 - **토픽**: `ocr-job-queue` · **파티션 키**: `job_id` · **처리**: at-least-once, `job_id` 기준 멱등 처리.
+- **본 변경 범위(#33)**: 계약(필드) 추가·검증에 한정한다. 워커가 `report_id`를 자체 파생하는 현행 로직(`pipeline._derive_report_id`)을 `job.report_id` 패스스루로 바꾸고 fan-in으로 `ReportJob` 발행을 게이팅하는 작업, §2 `ReportJob` 의미 정정은 **후속(fan-in 설계 결정 필요)** 으로 분리한다.
 
 ---
 
@@ -63,10 +74,13 @@
 | `job_id` | string(UUID) | ✓ | 원 OCR 작업 추적용 |
 | `doc_type` | string | ✓ | 분류된 문서 유형(아래 enum) |
 | `user_ref` | string | ✓ | 사용자 참조 |
-| `claim_id` | string(UUID) \| null | – | `USER_CLAIMS.id` 패스스루(OcrJob에서 전달) |
+| `claim_id` | string(UUID) \| null | – | `USER_CLAIMS.id` 패스스루(옵셔널). `report_worker`가 DB에서 직접 조회 |
 | `created_at` | string(ISO-8601) | ✓ | 발행 시각(UTC) |
+| `ocr_quality` | string | ✓ | `ocr_worker`의 자동 품질 판정(아래 enum). 기본값 `"ok"` |
 
-`doc_type` enum: `diagnosis`(진단서) · `policy`(보험증권) · `payout_notice`(지급결과안내문) · `claim`(청구서) · `other`(기타)
+`doc_type` enum: `diagnosis`(진단서) · `policy`(보험증권) · `payout_notice`(지급결과안내문) · `claim`(청구서) · `hospitalization_cert`(입퇴원확인서) · `medical_receipt`(진료비계산서·영수증) · `other`(기타)
+
+`ocr_quality` enum: `ok`(정상) · `needs_reupload`(재확인 필요 — surya 신뢰도가 낮은데 이름·도메인 정보가 하나도 검출되지 않은 저품질 문서). **이 신호를 실제로 소비해 리포트 생성을 건너뛰고 사용자에게 재업로드를 알리는 것은 `report_worker` + 게이트웨이 몫** — `ocr_worker`는 판정만 하고 값만 실어 발행한다(이번 범위는 여기까지).
 
 > 토픽명은 `core.contracts`에 상수로 공유된다: `OCR_JOB_TOPIC = "ocr-job-queue"`, `REPORT_JOB_TOPIC = "report-job"`.
 
@@ -78,7 +92,8 @@
   "doc_type": "diagnosis",
   "user_ref": "u_4821",
   "claim_id": null,
-  "created_at": "2026-06-17T05:31:10Z"
+  "created_at": "2026-06-17T05:31:10Z",
+  "ocr_quality": "ok"
 }
 ```
 - **토픽**: `report-job` · **파티션 키**: `report_id` · 멱등 처리.
@@ -86,27 +101,69 @@
 ---
 
 ## 3. `ocr_results` (DB 교차 계약)
-`ocr_worker`가 **쓰고**, `report_worker`가 `ocr_result_id`로 **읽는다.** 마스킹된 텍스트만 보관(원문·PII 금지).
+`ocr_worker`가 **쓰고**, `report_worker`가 `ocr_result_id`로 **읽는다.** 마스킹된 텍스트·라인좌표·비식별 이미지 참조만 보관(원문·평문 PII 금지).
 
 | 컬럼 | 타입 | 설명 |
 |---|---|---|
 | `id` | uuid PK | `ReportJob.ocr_result_id`로 참조됨 |
 | `job_id` | uuid | OCR 작업 |
 | `doc_type` | text | 분류 결과(`doc_type` enum) |
-| `masked_text` | text | **PII 마스킹된** OCR 텍스트 (downstream 입력) |
-| `entities` | jsonb | 추출 엔티티(아래) |
+| `doc_type_confidence` | real | 분류 신뢰도(0~1) |
+| `ocr_confidence` | real | OCR 라인 평균 신뢰도(0~1) — 저신뢰 QA 플래깅 |
+| `masked_text` | text | **PII 마스킹된** OCR 텍스트 (downstream 입력). 표 문서 4종(`payout_notice`·`claim`·`hospitalization_cert`·`medical_receipt`)은 하이브리드 VLM이 성공하면 마크다운 표 문법(`\|`·`---`)을 포함할 수 있음(실패 시 surya 평문 폴백) — LLM은 마크다운을 문제없이 소화하므로 `report_worker` 측 별도 분기는 불필요 |
+| `masked_lines` | jsonb | 라인 단위 `[{masked_text, bbox, polygon, confidence}]` — bbox/polygon/conf 보존, **텍스트는 마스킹본**(이미지 마스킹 좌표 재사용). **항상 surya 기반**(VLM은 좌표를 반환하지 않음). 좌표 기반 리딩오더 정렬(시각적 위→아래·좌→우) 후 페이지 단위로 PII를 검출해, 라벨과 값이 서로 다른 라인으로 쪼개진 경우도 페이지 컨텍스트로 잡는다 — 이미지 검은블록 마스킹(`ImageMasker.redact_pages`)과 **동일 판정 로직을 공유**해 두 트랙 간 불일치가 없다. **치환도 페이지 스팬 재사용(2026-08-04)**: 이전엔 "이 라인이 PII인가"는 페이지 단위로 판정하고 실제 치환은 라인 텍스트만 떼어 `mask()`를 다시 돌렸는데, 값만 있는 라인은 라벨 컨텍스트가 없어 재검출이 실패해 원문이 그대로 남는 경로가 있었다(실측 확인) — 이제 페이지에서 검출한 스팬을 라인별 로컬 오프셋으로 잘라(`line_local_spans`) 재검출 없이 그대로 치환(`apply_mask`)한다. 잔여 한계: 라벨-값 사이에 매우 긴 문단이 끼어 앵커 정규식의 lookahead 범위를 넘는 극단적 경우는 여전히 놓칠 수 있음(후속 과제). **VLM grounding으로 보강(2026-08-04)**: 이전엔 surya가 PII를 완전히 다른 문자로 오독하면(예: 실제 이름을 숫자열로 오독) 이미지 마스킹이 그 라인을 PII로 판정 못 하고 그대로 노출했다 — VLM은 좌표를 안 준다고 알고 있었으나, **정규화(0~1000) 좌표로 PII 위치를 직접 물으면** 실제로 정확한 bbox를 준다는 걸 실측으로 확인했다(같은 모델도 픽셀 좌표로 물으면 엉뚱한 영역을 가리킴 — 좌표계 표현 방식이 정확도를 좌우함). `ocr_confidence < 0.90`일 때만 `ImageMasker.ground_pages`가 VLM에 별도로 PII 위치를 물어 기존 라인 기반 검은블록에 **추가**한다(대체 아님 — grounding이 틀려도 최악의 경우 과잉 마스킹일 뿐 기존 안전성보다 후퇴하지 않음). **모델 분리(2026-08-04)**: `VLM_MODEL`(표 전사)과 `VLM_GROUNDING_MODEL`(좌표)은 서로 다른 모델을 쓴다 — 팀 합의 모델(`qwen3.6:35b-a3b`)이 표 전사는 더 정확·빠르지만(실측) grounding 좌표는 실제 텍스트 위치를 벗어나는 걸 실측으로 확인해, 좌표는 검증된 `qwen3-vl:8b-instruct`로 고정했다. 라벨도 모델이 프롬프트 지시 대신 문서 자체 캡션("환자 성명")을 쓰는 사례가 있어 부분 문자열 매칭(`_LABEL_ALIASES`)으로 흡수한다(실측: 엄격 매칭이던 첫 배포에서 이름이 하나도 안 가려지는 회귀를 발견·수정). 잔여 한계: grounding 좌표는 surya bbox보다 픽셀 정밀도가 낮아 여백을 더 크게 잡았고(`VLM_BBOX_MARGIN_PX=15`), 문서당 VLM 호출이 1회(~3초) 추가된다 |
+| `entities` | jsonb | 추출 엔티티(아래). `table_markdown`(string\|null, optional)은 표 문서 4종에서만 등장 — VLM 전사 후 마스킹 완료 상태. **소비 구분(2026-08-04)**: `icd`(`DIAGNOSIS`)·`admission_days`/`surgery`(`HOSPITALIZATION_CERT`)는 `report_worker`(#11)의 지급액 산정 로직이 실제로 참조하는 필드명이다. `insurer`/`product`(`POLICY`)·`payout_amount`(`PAYOUT_NOTICE`·`CLAIM`)·`diagnosis_name`(`DIAGNOSIS`, 코드 없을 때 한글 병명 폴백)은 `report_worker`가 소비하지 않고 `ocr_worker` 내부 `ocr_quality`(재확인 필요) 판정에만 쓰인다 — report_worker는 이 값들 대신 `user_insurances`/`user_claims` 테이블을 직접 조회한다. **알려진 한계(실측 확인, 2026-08-04)**: `payout_amount`는 다중 항목 표에서 문맥 키워드에 가장 먼저 부합하는 금액 하나만 뽑는 구조라, "합계"·최종 지급 예정액이 아닌 개별 항목 금액을 뽑거나 — 최악의 경우 **부지급(거절)된 항목의 청구금액**을 뽑을 수 있다(어느 쪽이든 report_worker가 안 쓰므로 리포트 정확도엔 영향 없음). 참고용으로만 쓰고 절대 단정하지 말 것 |
+| `masked_image_s3_keys` | jsonb | 검은블럭 비식별 이미지 사본 S3 키(페이지별 리스트) |
+| `ocr_quality` | text | 자동 품질 판정(`ok` \| `needs_reupload`). `ReportJob.ocr_quality`로 패스스루됨 |
 | `created_at` | timestamptz | |
 
 `entities` 예시(문서 유형별 일부):
 ```json
 {
-  "diagnosis_name": "S82.1",        // KCD 코드
-  "insurer": "○○생명",
-  "product": "무배당 ...",
-  "payout_amount": null              // 단정 금지 — 추출값은 참고용
+  "diagnosis_name": "S82.1",        // KCD 코드 있으면 코드, 없으면 라벨 뒤 한글 병명 폴백(실측: 코드 없는 문서가 더 흔함) — quality 판정용
+  "icd": "S82.1",                    // 코드 없으면 폴백 없이 null — report_worker 소비 필드
+  "insurer": "○○생명",               // quality 판정용, report_worker 비소비
+  "product": "무배당 ...",           // quality 판정용, report_worker 비소비
+  "payout_amount": null,             // 단정 금지 — 참고용, report_worker 비소비
+  "admission_days": 5,               // HOSPITALIZATION_CERT — report_worker 소비 필드(참고값)
+  "surgery": true                    // HOSPITALIZATION_CERT — '수술명' 라벨 없으면 null(알 수 없음)
 }
 ```
-- **보존**: 리포트 확정 전까지만. **손해사정사 서명 완료 이벤트** 시 즉시 삭제(개인정보 최소보존).
+
+`masked_lines` 예시(텍스트는 마스킹본, 좌표·confidence는 원형 — 좌표/신뢰도는 PII 아님):
+```json
+[
+  {"masked_text": "보험계약자 ***", "bbox": [72,140,520,168],
+   "polygon": [[72,140],[520,140],[520,168],[72,168]], "confidence": 0.99}
+]
+```
+
+`masked_image_s3_keys` 예시(비식별 사본 — 원본 키와 분리):
+```json
+["masked/<job_id>/page-0.png", "masked/<job_id>/page-1.png"]
+```
+
+- **이미지 마스킹 트랙(손해사정사 비식별 열람용)**: 디텍터 검출 1회 → 텍스트 마스킹 + 이미지 마스킹 2갈래. 줄 단위 검은블럭으로 렌더한 **비식별 이미지 사본은 S3**, `ocr_results`엔 **키만** 적재. **원본 이미지는 삭제 금지** — KMS·IAM·Lifecycle 자동삭제로 잠금보관(법적 보존·분쟁·재처리).
+- **PII 안전**: 좌표·confidence는 PII가 아니라 보존하나, `masked_lines`의 텍스트는 **마스킹본만**. 원문/평문 PII는 `ocr_results`·로그·타 토픽에 절대 금지.
+- **보존**: 리포트 확정 전까지만. **손해사정사 서명 완료 이벤트** 시 즉시 삭제(개인정보 최소보존). 비식별 이미지 사본도 동일 트리거로 삭제.
+
+> **2026-06-30 (additive):** `doc_type_confidence`·`ocr_confidence`·`masked_lines`·`masked_image_s3_keys` 추가(이미지 마스킹 트랙 도입, #13 범위 확장). `masked_text`·`entities`는 불변 → `report_worker` 측 **비파괴**. 신규 컬럼은 `ocr_worker`만 기록, 비식별 이미지 소비(손해사정사 UI)는 `ocr_result_id`로 조회.
+>
+> **2026-08-02 (additive):** `doc_type` enum에 `hospitalization_cert`(입퇴원확인서)·`medical_receipt`(진료비계산서·영수증) 추가(CHECK 제약은 `migrations/003_ocr_results_doctype_expand.sql`로 확장). 이 2종 + 기존 `payout_notice`·`claim`은 다중 항목 표 문서라 하이브리드 VLM 경로(§3 하단 참고)가 `masked_text`/`entities.table_markdown`에 관여할 수 있다.
+>
+> **2026-08-02 (additive):** `ocr_results.ocr_quality`·`ReportJob.ocr_quality` 추가(CHECK 제약은 `migrations/004_ocr_results_quality.sql`). surya 신뢰도가 낮은데(<0.90) 문서 전체에서 이름·도메인 정보가 하나도 검출되지 않으면 `needs_reupload`로 표시된다. 이와 별개로, 표 문서 4종 한정이던 하이브리드 VLM 트리거를 신뢰도 조건(<0.90)으로 확대해 문서 유형 무관하게 저품질 문서에도 VLM 보완을 시도하며, VLM 결과는 surya 원문과의 토큰 중복률 기반 groundedness 체크를 통과해야만 채택된다(환각 방지, 실패 시 surya 폴백). `masked_lines`도 이미지 마스킹 트랙과 판정 로직을 공유하도록 갱신(위 표 참고). `doc_type`·`masked_text`·`entities` 등 기존 필드는 불변 → `report_worker` 측 비파괴. **`ocr_quality` 신호를 소비해 리포트 생성 여부를 결정하고 사용자에게 재업로드를 안내하는 것은 `report_worker` + 게이트웨이 범위** — 이번 변경은 `ocr_worker`의 판정·발행까지만 다룬다.
+>
+> **2026-08-03 (additive):** 하이브리드 VLM 경로가 다중 페이지 문서에서 페이지별로 독립 채택되도록 수정. 이전엔 1페이지 VLM 성공만으로 `masked_text` 전체가 그 페이지 결과로 교체돼 2페이지 이후 내용이 유실되는 결함이 있었다 — 이제 페이지마다 VLM 성공/실패가 갈리고, 실패한 페이지는 그 페이지의 surya 결과로 개별 폴백한다. `entities.table_markdown`도 채택된 페이지만 구분자(`\n\n---\n\n`)로 이어붙인다(타입은 여전히 `string`, 계약 형태 불변).
+>
+> **2026-08-04 (additive, 실측 기반):** 실제 문서(진단서·보험증권·지급결과통보서·입퇴원확인서·진료비영수증 × 3화질)로 E2E 재검증 중 발견한 것들을 반영. (1) NER이 흔치 않은 합성 이름(예: "이샘플")을 화질과 무관하게 놓치는 사례를 확인해, "환자 성명"·"피보험자"·"계약자"·"예금주" 등 라벨 뒤 이름을 잡는 정규식 안전망(`PERSON_LABEL_NAME_RE`)을 NER과 별개로 추가 — 마크다운 표 형태(`\| 라벨 \| 값 \|`)의 VLM 원문에서도 동작한다. (2) `entities` 병합 우선순위를 반전 — surya가 이미 값을 찾았어도 VLM이 채택되면 VLM 쪽 값을 우선한다(VLM은 이미 groundedness 검증을 통과했고 애초에 surya 신뢰도가 낮아 호출된 것이므로 더 신뢰할 근거가 있음 — surya가 금액을 다른 문서 필드로 오독해 엉뚱한 값을 채운 사례가 실측으로 확인됨). (3) VLM 프롬프트에 "표뿐 아니라 상단 라벨-값 블록도 빠짐없이 포함" 지시를 추가(완전성 편차 완화 시도). `payout_amount` 다중 항목 한계와 이미지 마스킹의 OCR 파괴형 유출 한계는 위 표에 각각 명시 — 이번 라운드에서 코드로 고치지 않고 known limitation으로만 기록.
+>
+> **2026-08-04 (additive):** `report_worker`(#11, 미머지) 코드 리뷰 결과 `entities.icd`/`entities.admission_days`/`entities.surgery`를 참조하고 있으나 `ocr_worker`가 그 키를 만든 적이 없어(항상 미스매치) 실질적으로 죽은 경로였음을 확인. `DocType.DIAGNOSIS`에 `icd`(KCD 코드, 없으면 null — `diagnosis_name`과 달리 한글 병명 폴백 없음), `DocType.HOSPITALIZATION_CERT`에 `admission_days`(입원~퇴원 일수, 직접 표기·날짜쌍 계산 순으로 시도)·`surgery`(수술명 라벨 존재·값 기반 불리언, 라벨 자체가 없으면 null) 추가로 계약 정렬. 기존 `diagnosis_name`/`insurer`/`product`/`payout_amount`는 report_worker가 소비하지 않는 것으로 확인돼(user_insurances/user_claims 테이블에서 별도 조회) 스키마 변경 없이 `ocr_quality` 판정 전용으로 남긴다 — doc_type별로 "report_worker 소비 필드"와 "quality 판정 전용 필드"가 분리된 상태(위 표·예시에 구분 명시).
+>
+> **2026-08-04 (fix):** `masked_lines` 생성 로직(`build_masked_lines`)이 "이 라인이 PII인가" 판정(페이지 단위)과 "실제 치환"(라인 단위 재검출)에 서로 다른 탐지를 쓰던 불일치를 수정. 라벨과 값이 다른 줄로 쪼개진 경우, 값만 있는 라인은 라벨 컨텍스트 없이 재검출하면 정규식 앵커가 안 걸려 원문이 그대로 남을 수 있었다 — 코드리뷰로 지적됨, 실제 테스트가 이 케이스를 놓치고 있었음도 같이 확인(재검출 없이도 우연히 통과하는 페이크로 짜여 있었음). 이제 페이지에서 검출한 스팬을 `line_local_spans`로 라인별 로컬 오프셋으로 잘라 재검출 없이 `apply_mask`로 직접 치환한다 — `build_masked_lines`의 `mask` 매개변수 제거(더 이상 필요 없음), `detect`만 받음(브레이킹, 내부 함수라 `ocr_worker.pipeline` 호출부만 갱신하면 됨).
+>
+> **2026-08-04 (additive, 실측 기반):** 이미지 마스킹의 "VLM은 좌표를 안 준다"는 가정을 재검증 — `qwen3-vl:8b-instruct`에 PII 위치를 정규화(0~1000) 좌표로 직접 물으면(픽셀 좌표로 물으면 실패, 반드시 정규화 좌표) 실제로 정확한 bbox를 준다는 걸 실사진 10건 + surya 오독 재현 케이스(이름→"828")로 확인했다. `vlm_client.ground_pii()` 신설(정규화 응답을 픽셀로 변환, 실패 시 예외 없이 빈 리스트), `ImageMasker.ground_pages()`(신뢰도 게이팅, `_LOW_CONFIDENCE_THRESHOLD` 재사용)·`redact_pages(grounded_boxes=...)`(라인 기반 검은블록에 추가, 대체 아님) 신설. `masked_image_s3_keys` 이미지 트랙에만 적용 — `masked_text`/`masked_lines`(DB 텍스트)는 이 변경과 무관(불변).
+>
+> **2026-08-04 (fix):** 바로 위 `table_markdown` 제외 수정(2026-08-04 additive, `entities` 행)이 `MEDICAL_RECEIPT`에 회귀를 만들었음을 확인·수정. `MEDICAL_RECEIPT`는 `extract()`가 애초에 doc_type 고유 필드를 정의하지 않는 유형(항목별 데이터는 전부 `table_markdown`에만 담김)이라, `table_markdown`을 일괄 제외하면 확인할 필드 자체가 없어 신뢰도가 낮을 때 이름 유무·VLM 성공 여부와 무관하게 **항상** `needs_reupload`가 됐다. `_missing_domain_info(doc_type, entities)`로 시그니처를 바꿔, `MEDICAL_RECEIPT`(`_TABLE_MARKDOWN_ONLY_DOC_TYPES`)는 `table_markdown` 유무를 그대로 신호로 쓰고 나머지 doc_type은 기존대로 엄격히(테이블마크다운 제외) 판정한다.
 
 ---
 

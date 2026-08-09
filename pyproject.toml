@@ -17,13 +17,22 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# OCR Worker (GPU 노드). paddlepaddle-gpu는 Linux+CUDA 전용 —
-# 로컬(mac/CPU)에선 'paddlepaddle'로 바꾸거나 ocr extra 설치를 생략
+# OCR Worker (GPU 노드). surya-ocr는 PyTorch 기반 전용 OCR 엔진.
+# 0.17.x는 FoundationPredictor로 in-process(워커 내 라이브러리 로드) 실행 —
+# 0.18+는 별도 추론 서버(vllm/llama.cpp)가 필요하므로 in-process 세대로 고정한다.
+# (로컬 CPU/Windows 개발 환경엔 미설치 — 엔진/렌더/S3는 lazy import로 격리한다.)
 ocr = [
-    "paddleocr>=2.7",
-    "paddlepaddle-gpu>=2.6",
-    #"paddlepaddle=3.3.1"
-    "pymupdf>=1.24",
+    "surya-ocr>=0.17,<0.18",
+    "requests>=2.31",  # surya.common.s3가 import하지만 surya-ocr 자체 의존성 선언 누락
+    "transformers>=4.56.1,<5.0",  # transformers 5.x는 SuryaDecoderConfig.pad_token_id 깨짐(datalab-to/surya#484)
+    "pymupdf>=1.24",   # PDF → 페이지 이미지 렌더
+    "pillow>=10.0",    # surya 입력(PIL.Image)
+    "boto3>=1.34",     # S3 GetObject(원본 다운로드)
+]
+# 약관 코퍼스 S3 스테이징 워커(GPU 불필요·경량). Notion 첨부 → S3.
+# base(httpx·asyncpg·pydantic·structlog) + boto3만. torch/surya 없음.
+corpus = [
+    "boto3>=1.34",   # S3 PutObject/HeadObject
 ]
 # LangGraph 멀티에이전트 리포트 생성
 report = [
@@ -53,6 +62,9 @@ dev = [
     "pytest>=8.2",
     "pytest-asyncio>=0.23",
     "pytest-cov>=5.0",
+    # test_vlm_client.py가 PIL.Image로 테스트 이미지를 만든다. surya 등 무거운 나머지
+    # ocr extra(torch 포함)와 달리 pillow 자체는 가벼워 CI dev 동기화에 넣어도 무리 없다.
+    "pillow>=10.0",
 ]
 
 [tool.uv]
@@ -68,7 +80,8 @@ src = ["src", "tests"]
 select = ["E", "F", "I", "UP", "B", "ASYNC", "S", "SIM", "RUF"]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["S101"]  # 테스트에서 assert 허용
+# 테스트: assert(S101)·가짜 시크릿(S106)·임시파일 접근(ASYNC230/240) 허용
+"tests/**" = ["S101", "S106", "ASYNC230", "ASYNC240"]
 # 이관된 실험 리포트 그래프(P2). 프롬프트·주석 위주 장문(E501/RUF003), 자립 RAG의
 # 즉시-await 클로저(B023)·내부상수 SQL(S608)은 안전 — 정밀 정리는 후속 리라이트에서.
 "src/report_worker/nodes/agents.py" = ["E501", "RUF001", "RUF002", "RUF003", "SIM117"]
@@ -86,3 +99,19 @@ python_version = "3.12"
 strict = true
 plugins = ["pydantic.mypy"]
 mypy_path = "src"
+
+# 선택 의존성(extra)은 dev 환경에 미설치 → stub 없음. lazy import라 런타임엔 무관.
+[[tool.mypy.overrides]]
+module = [
+    "transformers",
+    "transformers.*",
+    "surya.*",
+    "fitz",
+    "boto3",
+    "botocore.*",
+    "PIL.*",
+    "asyncpg",
+    "aiokafka",
+    "aiokafka.*",
+]
+ignore_missing_imports = true

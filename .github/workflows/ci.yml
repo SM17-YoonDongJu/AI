@@ -1,0 +1,66 @@
+# CI — lint(ruff)+테스트(pytest). dev/main PR에서 직접 실행되고,
+# deploy.yml(push)에서 workflow_call로 재사용돼 "테스트 통과 후에만 배포"를 게이팅한다.
+# 배포 로직은 deploy.yml로 분리했다(Actions 사이드바 tab을 CI/Deploy로 나누기 위함).
+name: CI
+
+on:
+  pull_request:
+    branches: [dev, main]
+  # deploy.yml이 `uses: ./.github/workflows/ci.yml`로 호출한다. secrets: inherit로 웹훅 전달.
+  workflow_call:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ai_engine
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres -d ai_engine"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 3s --health-retries 10
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/ai_engine
+      REDIS_URL: redis://localhost:6379/0
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Sync deps (dev)
+        run: uv sync --dev
+
+      - name: Ruff lint
+        run: uv run ruff check src tests
+
+      - name: Pytest
+        run: uv run pytest -q
+
+      - name: Notify failure
+        if: failure()
+        uses: ./.github/actions/discord-notify
+        with:
+          webhook_url: ${{ secrets.DISCORD_WEBHOOK_CI_FAILURES }}
+          status: failure
+          service: ci
+
+      # push(=deploy.yml 경유 호출)일 때만 성공 알림. PR 직접 실행에선 조용히 통과.
+      - name: Notify success
+        if: success() && github.event_name == 'push'
+        uses: ./.github/actions/discord-notify
+        with:
+          webhook_url: ${{ secrets.DISCORD_WEBHOOK_CI_BUILDS }}
+          status: success
+          service: ci

@@ -1,12 +1,12 @@
 # ocr_worker — OCR 워커 (02)
 
-`ocr-job-queue` Kafka 메시지를 소비해 문서를 OCR·분류·마스킹하는 워커. **PaddleOCR을 인프로세스로 실행하므로 GPU 노드에 배포**한다(Ollama/vLLM 노드와 co-location 가능).
+`ocr-job-queue` Kafka 메시지를 소비해 문서를 OCR·분류·마스킹하는 워커. **surya-ocr(PyTorch)를 인프로세스로 실행하므로 GPU 노드에 배포**한다(Ollama/vLLM 노드와 co-location 가능).
 
 ## 처리 흐름
 
 1. `ocr-job-queue` 소비 (`OcrJob`)
 2. S3에서 파일 읽기 (GetObject)
-3. **PaddleOCR**(로컬 GPU, 한국어, 표·인감·서명 레이아웃) 텍스트 추출
+3. **surya-ocr**(전용 OCR 엔진, 로컬 GPU, 한국어) — 라인 단위 `(text, bbox, polygon, confidence)` 추출
 4. 문서 유형 분류 → 엔티티 추출(진단명 KCD·보험사·상품·지급금액)
 5. **PII 마스킹**(정규식+NER) — 마스킹 텍스트만 downstream으로
 6. `ocr_results` 저장 → `report-job` 발행
@@ -18,7 +18,7 @@
 
 ## 의존 / 배포
 
-- `core.kafka`·`core.db` · S3 · PaddleOCR(`.[ocr]` extra, **paddlepaddle-gpu**)
+- `core.kafka`·`core.db` · S3 · surya-ocr(`.[ocr]` extra, **PyTorch/CUDA**)
 - 배포: `src/ocr_worker/Dockerfile` (CUDA 베이스) → **GPU 노드**
 - PII 마스킹 규칙은 `guardrail` 입력단과 정렬
 

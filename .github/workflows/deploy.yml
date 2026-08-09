@@ -1,0 +1,194 @@
+# Deploy — dev push(=병합) 시 테스트 통과 후 변경된 서비스만 ECR 빌드→push→SSM 배포.
+# 테스트는 ci.yml을 workflow_call로 재사용해 게이팅한다(needs: test). 워크플로 간 needs는
+# 불가하므로 "재사용 호출"로 잇는다. push 직접 트리거라 workflow_run의 기본브랜치 제약도 없다.
+#
+# prod(main) 배포는 인프라(PROD_* vars·.env.prod·:prod 태그 compose)가 준비되면 추가한다.
+# 그때: on.push.branches에 main 추가 + tag/target을 github.ref_name으로 분기.
+name: Deploy
+
+on:
+  push:
+    branches: [dev]
+
+jobs:
+  # 1) 테스트 게이트 — ci.yml 재사용. 실패하면 아래 잡들은 시작되지 않는다.
+  test:
+    uses: ./.github/workflows/ci.yml
+    secrets: inherit
+
+  # 2) 변경 감지 — 빌드할 서비스 목록(JSON matrix)을 만든다.
+  #    공용 코드(core/pyproject/uv.lock) 변경 시 3개 전부 재빌드.
+  changes:
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          # 현재 브랜치의 "이 push 이전 커밋"과 비교한다(dev push↔dev, main push↔main).
+          # base 미지정 시 기본 브랜치(main)와 비교돼 dev의 거의 모든 파일이 변경으로 잡힌다.
+          base: ${{ github.ref_name }}
+          filters: |
+            shared: ['pyproject.toml','uv.lock','src/core/**']
+            ocr: ['src/ocr_worker/**']
+            corpus: ['src/corpus_worker/**','migrations/**']
+            report: ['src/report_worker/**','src/rag/**','src/guardrail/**']
+            chatbot: ['src/chatbot/**','src/rag/**','src/guardrail/**']
+      - id: set
+        shell: bash
+        run: |
+          shared='${{ steps.filter.outputs.shared }}'
+          items=()
+          add() { items+=("$1"); }
+          # entry: service|dockerfile|repo|tag|target|svc|compose_src
+          # 서비스별 전용 저장소(soma/ocr·soma/report·soma/chatbot)에 :dev 태그로 push한다.
+          # target=ocr: GPU EC2 / target=backend: backend EC2 (둘 다 이 리포가 SSM 직접 배포).
+          # compose_src: 배포 시 호스트에 기록할 "레포 내" compose. OCR compose는 우리 소유라 코드 기반.
+          #   backend EC2 compose는 backend 레포와 공유 → 덮지 않음(compose_src 비움).
+          [ "$shared" = "true" ] || [ "${{ steps.filter.outputs.ocr }}" = "true" ]     && add '{"service":"ocr","dockerfile":"src/ocr_worker/Dockerfile","repo":"soma/ocr","tag":"dev","target":"ocr","svc":"ocr-worker","compose_src":"deploy/docker-compose.ocr.yml"}'
+          [ "$shared" = "true" ] || [ "${{ steps.filter.outputs.corpus }}" = "true" ]  && add '{"service":"corpus","dockerfile":"src/corpus_worker/Dockerfile","repo":"soma/corpus","tag":"dev","target":"corpus","svc":"corpus-worker","compose_src":"deploy/docker-compose.corpus.yml"}'
+          [ "$shared" = "true" ] || [ "${{ steps.filter.outputs.report }}" = "true" ]  && add '{"service":"report","dockerfile":"src/report_worker/Dockerfile","repo":"soma/report","tag":"dev","target":"backend","svc":"report","compose_src":""}'
+          [ "$shared" = "true" ] || [ "${{ steps.filter.outputs.chatbot }}" = "true" ] && add '{"service":"chatbot","dockerfile":"src/chatbot/Dockerfile","repo":"soma/chatbot","tag":"dev","target":"backend","svc":"chatbot","compose_src":""}'
+          json=$(IFS=,; echo "[${items[*]}]")
+          echo "matrix={\"include\":$json}" >> "$GITHUB_OUTPUT"
+          echo "will build: $json"
+
+  # 3) 빌드→push→SSM 배포 (서비스별 병렬). 변경분 존재 시에만.
+  deploy:
+    needs: changes
+    if: ${{ needs.changes.outputs.matrix != '{"include":[]}' }}
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # OIDC
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.changes.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute short sha
+        id: v
+        shell: bash
+        run: echo "sha7=$(echo ${{ github.sha }} | cut -c1-7)" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build & push (${{ matrix.service }})
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: true
+          # :dev = 가변(latest, compose가 pull) / :<sha7> = 불변(커밋별, 감사·롤백용).
+          tags: |
+            ${{ secrets.AWS_ECR_REGISTRY }}/${{ matrix.repo }}:${{ matrix.tag }}
+            ${{ secrets.AWS_ECR_REGISTRY }}/${{ matrix.repo }}:${{ steps.v.outputs.sha7 }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+      # 대상 EC2/compose 경로를 target에 따라 결정. ocr=GPU EC2 / corpus=경량 EC2(brbs-etl) / backend=범용 EC2, 모두 SSM 직접 배포.
+      - name: Resolve deploy target
+        id: t
+        shell: bash
+        run: |
+          if [ "${{ matrix.target }}" = "ocr" ]; then
+            echo "instance=${{ vars.OCR_EC2_INSTANCE_ID }}" >> "$GITHUB_OUTPUT"
+            echo "compose=/opt/ocr/docker-compose.ocr.yml" >> "$GITHUB_OUTPUT"
+            echo "envfile=/opt/ocr/.env.ocr" >> "$GITHUB_OUTPUT"
+          elif [ "${{ matrix.target }}" = "corpus" ]; then
+            # GPU·Kafka·ollama 불필요한 경량 워커라 OCR과 분리된 EC2(brbs-etl)에 둔다.
+            echo "instance=${{ vars.CORPUS_EC2_INSTANCE_ID }}" >> "$GITHUB_OUTPUT"
+            echo "compose=/opt/corpus/docker-compose.corpus.yml" >> "$GITHUB_OUTPUT"
+            echo "envfile=/opt/corpus/.env.corpus" >> "$GITHUB_OUTPUT"
+          else
+            echo "instance=${{ vars.BACKEND_EC2_INSTANCE_ID }}" >> "$GITHUB_OUTPUT"
+            echo "compose=/home/ubuntu/backend/docker-compose.yml" >> "$GITHUB_OUTPUT"
+            echo "envfile=/home/ubuntu/backend/.env.dev" >> "$GITHUB_OUTPUT"
+          fi
+
+      # 레포의 compose를 base64로 인코딩(있을 때만). SSM으로 호스트 파일을 이 내용으로 덮는다.
+      # compose_src가 빈 서비스(backend EC2 공유 compose)는 건너뛴다 → 호스트 파일 그대로 사용.
+      - name: Encode compose from repo
+        id: cmp
+        shell: bash
+        run: |
+          src="${{ matrix.compose_src }}"
+          if [ -n "$src" ] && [ -f "$src" ]; then
+            echo "b64=$(base64 -w0 "$src")" >> "$GITHUB_OUTPUT"
+          else
+            echo "b64=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Deploy via SSM (${{ matrix.svc }})
+        shell: bash
+        run: |
+          CMD=$(cat <<EOF
+          set -e
+          cd \$(dirname ${{ steps.t.outputs.compose }})
+          # compose를 레포 기준으로 갱신(base64 전달분이 있을 때만). 서버 수동편집 대신 코드가 진실원.
+          if [ -n "${{ steps.cmp.outputs.b64 }}" ]; then
+            echo "${{ steps.cmp.outputs.b64 }}" | base64 -d > ${{ steps.t.outputs.compose }}
+          fi
+          aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | docker login --username AWS --password-stdin ${{ secrets.AWS_ECR_REGISTRY }}
+          docker compose -f ${{ steps.t.outputs.compose }} --env-file ${{ steps.t.outputs.envfile }} pull ${{ matrix.svc }}
+          docker compose -f ${{ steps.t.outputs.compose }} --env-file ${{ steps.t.outputs.envfile }} up -d --no-deps ${{ matrix.svc }}
+          docker image prune -f
+          EOF
+          )
+          # 스크립트 전체를 base64로 감싸 전달한다. compose 기록 블록의 따옴표·콤마가 base64 안으로
+          # 들어가므로, --parameters(shorthand/JSON) 파싱이 특수문자로 깨지지 않는다.
+          B64=$(printf '%s' "$CMD" | base64 -w0)
+          printf '{"commands":["echo %s | base64 -d | bash"]}' "$B64" > /tmp/ssm-params.json
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "${{ steps.t.outputs.instance }}" \
+            --document-name "AWS-RunShellScript" \
+            --comment "deploy ${{ matrix.svc }} ${{ github.sha }}" \
+            --parameters file:///tmp/ssm-params.json \
+            --query "Command.CommandId" --output text)
+          echo "SSM CommandId=$CMD_ID"
+          # 기본 waiter(약 100초)는 큰 이미지(OCR=torch/surya) pull 도중 InProgress로 끝나
+          # 배포가 진행 중인데도 실패로 처리됐다 → 최대 12분까지 상태를 직접 폴링한다.
+          INSTANCE="${{ steps.t.outputs.instance }}"
+          STATUS=Pending
+          for i in $(seq 1 72); do
+            STATUS=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE" --query Status --output text 2>/dev/null || echo Pending)
+            case "$STATUS" in
+              Success | Failed | Cancelled | TimedOut) break ;;
+            esac
+            echo "SSM $STATUS ... ($i/72)"
+            sleep 10
+          done
+          echo "SSM Status=$STATUS"
+          if [ "$STATUS" != "Success" ]; then
+            # 호스트에서 왜 실패했는지 드러낸다(compose·이미지·env 문제 진단).
+            echo "----- SSM StandardError (host) -----"
+            aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE" --query StandardErrorContent --output text 2>/dev/null | tail -50
+            echo "----- SSM StandardOutput (host, tail) -----"
+            aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE" --query StandardOutputContent --output text 2>/dev/null | tail -30
+            exit 1
+          fi
+
+      - name: Notify deploy result
+        if: always()
+        uses: ./.github/actions/discord-notify
+        with:
+          webhook_url: ${{ job.status == 'success' && secrets.DISCORD_WEBHOOK_DEPLOYMENT || secrets.DISCORD_WEBHOOK_CI_FAILURES }}
+          status: ${{ job.status }}
+          service: ${{ matrix.service }}
+          image_tag: ${{ matrix.repo }}:${{ matrix.tag }}

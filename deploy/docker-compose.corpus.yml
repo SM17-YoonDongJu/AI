@@ -1,0 +1,40 @@
+# 약관 코퍼스 S3 스테이징 워커 배포용 compose — 단일 진실원. 서버에서 수동 편집 금지, PR로 수정.
+# 사용: docker compose -f docker-compose.corpus.yml --env-file .env.corpus up -d
+# CD는 corpus-worker만 bounce: ... up -d --no-deps corpus-worker
+#
+# OCR과 달리 GPU·ollama·Kafka 불필요(경량). RDS·S3·Notion 아웃바운드만 필요하다.
+# 코드 변경이 드물어 재배포는 src/corpus_worker/** 또는 공용 core 변경 시에만 일어난다.
+name: brbs-corpus
+
+services:
+  corpus-worker:
+    image: ${ECR_REGISTRY}/soma/corpus:${CORPUS_TAG:-dev}
+    container_name: brbs-corpus-worker
+    restart: unless-stopped
+    environment:
+      ENV: ${ENV}
+      LOG_LEVEL: ${LOG_LEVEL}
+      SERVICE_NAME: corpus-worker
+      DATABASE_URL: ${DATABASE_URL} # RDS 직접(OCR과 동일 DB)
+      # RDS는 SSL 연결만 허용(pg_hba). 비우면 core.db가 SSL을 꺼(평문) 거부됨. 아래 볼륨과 일치.
+      RDS_CA_PATH: ${RDS_CA_PATH}
+      AWS_REGION: ${AWS_REGION}
+      S3_BUCKET: ${S3_BUCKET} # OCR과 같은 버킷 재사용 가능(corpus/ prefix로 분리)
+      NOTION_TOKEN: ${NOTION_TOKEN} # jjg 인테그레이션 시크릿(읽기 전용)
+      # 문서 변경이 드물면 느슨히(기본 6h). 증분 동기화라 부담은 적다.
+      NOTION_SYNC_INTERVAL_SECONDS: ${NOTION_SYNC_INTERVAL_SECONDS:-21600}
+      CORPUS_CATEGORIES: ${CORPUS_CATEGORIES:-terms}
+      TZ: Asia/Seoul
+    volumes:
+      # RDS CA 번들(호스트에 배치, git 미커밋)을 읽기전용 마운트. RDS_CA_PATH가 이 경로를 가리킨다.
+      # 준비: mkdir -p /opt/corpus/certs && curl -o /opt/corpus/certs/rds-global-bundle.pem \
+      #        https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
+      - /opt/corpus/certs/rds-global-bundle.pem:/etc/ssl/rds/global-bundle.pem:ro
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+    networks: [corpus-net]
+
+networks:
+  corpus-net:
+    driver: bridge
