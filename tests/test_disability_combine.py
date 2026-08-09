@@ -47,3 +47,47 @@ def test_empty_items() -> None:
     r = combine_disability_rate([])
     assert r["combined_rate"] == 0.0
     assert r["rule_notes"] == ["산입 항목 없음"]
+
+
+def test_left_right_paired_regions_sum() -> None:
+    # 총칙 2항: 좌·우의 팔은 각각 다른 신체부위 → 합산 (과소산정 회귀 방지)
+    r = combine_disability_rate(
+        [
+            {"body_region": "팔", "laterality": "left", "rate": 30},
+            {"body_region": "팔", "laterality": "right", "rate": 30},
+        ]
+    )
+    assert r["combined_rate"] == 60.0
+
+
+def test_same_side_paired_region_absorbs_max() -> None:
+    # 같은 쪽 팔의 여러 장해는 여전히 최고값만
+    r = combine_disability_rate(
+        [
+            {"body_region": "팔", "laterality": "left", "rate": 10},
+            {"body_region": "팔", "laterality": "left", "rate": 30},
+        ]
+    )
+    assert r["combined_rate"] == 30.0
+
+
+def test_unknown_laterality_stays_conservative() -> None:
+    # 좌우 미상(none)은 같은 부위로 취급 — 근거 없이 합산해 과대산정하지 않는다
+    r = combine_disability_rate(
+        [
+            {"body_region": "팔", "laterality": "none", "rate": 30},
+            {"body_region": "팔", "rate": 20},
+        ]
+    )
+    assert r["combined_rate"] == 30.0
+
+
+def test_laterality_ignored_for_unpaired_region() -> None:
+    # 척추는 좌우 구분 부위가 아니므로 laterality가 있어도 같은 부위
+    r = combine_disability_rate(
+        [
+            {"body_region": "척추", "laterality": "left", "rate": 20},
+            {"body_region": "척추", "laterality": "right", "rate": 30},
+        ]
+    )
+    assert r["combined_rate"] == 30.0

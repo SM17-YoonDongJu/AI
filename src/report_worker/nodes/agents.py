@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import functools
 import json
+import re
 import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -385,6 +386,18 @@ def _select_schedule(ranked: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sched
 
 
+def _verify_rate_quote(quote: str, rate_f: float, sched_norm: str) -> bool:
+    """결정론 백스톱: 인용 구절이 원문에 실재하고, 그 구절 안에 지급률 숫자가 있어야 인정.
+
+    공백 무시 비교로 원문의 개행·정렬 차이를 흡수한다. 지급률은 소수를 보존한다 —
+    int로 뭉개면 12.5%가 "12"가 되어 원문 전체의 "제12조"·"12개월" 따위에 오매칭된다.
+    """
+    quote_norm = re.sub(r"\s+", "", quote)
+    if not quote_norm or quote_norm not in sched_norm:
+        return False
+    return f"{rate_f:g}" in quote_norm
+
+
 async def _extract_schedule_items(
     dx_name: str, icd: str, sched: list[dict[str, Any]], fallback_citations: list[str]
 ) -> dict[str, Any]:
@@ -396,6 +409,7 @@ async def _extract_schedule_items(
         {"items": list, "notes": list[str], "confidence": str, "citations": list[str]}.
     """
     sched_text = "\n".join((c.get("text") or "") for c in sched)
+    sched_norm = re.sub(r"\s+", "", sched_text)
     ctx = "\n---\n".join(f"{c['source_ref']}\n{(c.get('text') or '')[:800]}" for c in sched[:6])
     raw = await ai_client.chat_json(
         [
@@ -411,7 +425,9 @@ async def _extract_schedule_items(
                 "content": (
                     f"[사고/진단]\n{dx_name} / ICD {icd}\n\n[약관 장해분류표 원문]\n{ctx}\n\n"
                     "JSON 키: items(배열, 각 원소 = injury(str), "
-                    "body_region(눈·귀·코·씹기말하기·척추·체간골·팔·다리·손가락·발가락·흉복부장기·신경계정신 중 하나), "
+                    "body_region(눈·귀·코·씹기말하기·외모·척추·체간골·팔·다리·손가락·발가락·흉복부장기·신경계정신 중 하나), "
+                    'laterality("left"|"right"|"none" — 좌·우가 구분되는 부위(눈·귀·팔·다리·손가락·발가락)만 '
+                    '원문·진단에서 확인된 쪽을 적고, 그 외 부위이거나 미상이면 "none"), '
                     "category_label(원문 항목 텍스트 그대로 복사), rate(number 지급률 %), "
                     "rate_quote(rate 숫자가 등장한 원문 구절 그대로 복사), temporary(bool 한시장해), "
                     "temporary_years(number 또는 null), citation(위 원문 source_ref 중 하나)), "
@@ -435,15 +451,18 @@ async def _extract_schedule_items(
         except (TypeError, ValueError):
             continue
         quote = str(it.get("rate_quote") or "")
-        # 결정론 백스톱: 지급률 숫자가 인용 원문에 실제로 존재해야 인정
-        verified = bool(quote) and (str(int(rate_f)) in sched_text)
+        verified = _verify_rate_quote(quote, rate_f, sched_norm)
         injury = str(it.get("injury") or "")
         if not verified:
             notes.append(f"미검증 지급률 제외: {injury} {rate_f}%")
+        laterality = str(it.get("laterality") or "none").strip().lower()
+        if laterality not in ("left", "right"):
+            laterality = "none"
         items.append(
             {
                 "injury": injury,
                 "body_region": str(it.get("body_region") or "기타"),
+                "laterality": laterality,
                 "category_label": str(it.get("category_label") or ""),
                 "rate": rate_f,
                 "rate_quote": quote,
