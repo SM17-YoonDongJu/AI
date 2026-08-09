@@ -13,9 +13,16 @@ def test_embedding_dim_default_is_contract_value() -> None:
     assert cfg.embedding_dim == DEFAULT_EMBEDDING_DIM == 1024
 
 
-def test_model_names_default_empty_to_force_injection() -> None:
-    # Arrange / Act
-    cfg = Settings()
+def test_model_names_default_empty_to_force_injection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Arrange: 로컬 .env·프로세스 env 격리 — "기본값이 비어 있다"는 코드 기본값 검증이므로
+    # 개발자 로컬의 LLM_MODEL 값이 새어 들면 CI에선 통과하고 로컬에선 상시 실패한다.
+    monkeypatch.delenv("LLM_MODEL", raising=False)
+    monkeypatch.delenv("EMBEDDING_MODEL", raising=False)
+
+    # Act
+    cfg = Settings(_env_file=None)
 
     # Assert: 모델 미정 → env 주입 강제(하드코딩 금지)
     assert cfg.llm_model == ""
