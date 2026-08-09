@@ -11,10 +11,25 @@ CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
 -- ai/corpus 스키마 선행 보장 — 이 폴더의 마이그레이션이 001부터 스키마를 명시(ai./corpus.)
--- 하므로, 신규 환경(로컬 PG 등)에서 스키마 자체가 없으면 바로 실패한다. 이미 스키마 분리가
--- 끝난 dev/RDS/prod에서는 IF NOT EXISTS라 조용히 스킵된다.
-CREATE SCHEMA IF NOT EXISTS ai;
-CREATE SCHEMA IF NOT EXISTS corpus;
+-- 하므로, 신규 환경(로컬 PG 등)에서 스키마 자체가 없으면 바로 실패한다.
+-- 주의: `CREATE SCHEMA IF NOT EXISTS`는 스키마가 이미 있어도 CREATE 권한을 먼저 검사한다
+-- (IF NOT EXISTS가 권한 체크까지 건너뛰어주진 않는다) — dev/RDS에서 ai_owner/corpus_owner는
+-- DATABASE에 CREATE 권한이 없어 스키마가 이미 있는데도 permission denied로 워커 기동이
+-- 통째로 막혔다(실측, #48 배포 직후). pg_namespace로 존재를 먼저 확인해 이미 있으면
+-- CREATE 문 자체를 실행하지 않는다 — 이미 스키마 분리가 끝난 환경(dev/RDS/prod)은 여기서
+-- 끝나고, 스키마가 정말 없는 신규 환경(로컬 PG 등, 보통 superuser로 접속)만 CREATE를 탄다.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'ai') THEN
+        CREATE SCHEMA ai;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'corpus') THEN
+        CREATE SCHEMA corpus;
+    END IF;
+EXCEPTION WHEN insufficient_privilege THEN
+    RAISE NOTICE 'ai/corpus 스키마 생성 건너뜀(권한 부족 — 이미 존재하거나 별도 관리): %', SQLERRM;
+END
+$$;
 
 -- pgaudit — 쿼리 감사(민감 컬럼 READ/WRITE 로그, CloudWatch Logs 연동). RDS 파라미터
 -- 그룹에서 shared_preload_libraries에 pgaudit을 넣고 재부팅한 뒤에만 성공한다 — 그
