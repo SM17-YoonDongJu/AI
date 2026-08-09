@@ -8,14 +8,23 @@ Hybrid RAG(04)용 PostgreSQL 스키마. **마이그레이션 프레임워크 없
 | 순서 | 파일 | 내용 |
 |------|------|------|
 | 007 | `007_extensions.sql` | `vector`(pgvector), `pg_trgm` 확장 |
-| 008 | `008_policy_chunks.sql` | `policy_chunks`(약관, namespace=terms) + HNSW(halfvec)·tsvector·필터 인덱스 |
-| 009 | `009_case_chunks.sql` | `case_chunks`(판례·금감원 분쟁조정례, namespace=case) + HNSW(halfvec)·tsvector·메타·태그 인덱스 |
-| 010 | `010_search_terms.sql` | `search_terms`(정규 용어 사전) + trigram GIN |
-| 011 | `011_schedule_chunks.sql` | `schedule_chunks`(후유장해분류표, namespace=level) + HNSW(halfvec)·tsvector·버전(applies_from,applies_to)·body_part 인덱스 |
+| 008 | `008_policy_chunks.sql` | `corpus.policy_chunks`(약관, namespace=terms) + HNSW(halfvec)·tsvector·필터 인덱스 |
+| 009 | `009_case_chunks.sql` | `corpus.case_chunks`(판례·금감원 분쟁조정례, namespace=case) + HNSW(halfvec)·tsvector·메타·태그 인덱스 |
+| 010 | `010_search_terms.sql` | `corpus.search_terms`(정규 용어 사전) + trigram GIN |
+| 011 | `011_schedule_chunks.sql` | `corpus.schedule_chunks`(후유장해분류표, namespace=level) + HNSW(halfvec)·tsvector·버전(applies_from,applies_to)·body_part 인덱스 |
+| 012 | `012_report_drafts.sql` | `ai.report_drafts`(리포트 초안, report_worker 출력) |
 
 > 번호가 007부터인 이유: dev 브랜치의 000~006(OCR·corpus 계열 마이그레이션)과 파일 번호가
 > 겹치지 않게 하기 위함. `007_extensions.sql`은 dev의 `000_extensions.sql`과 내용이 겹치지만
 > 멱등(IF NOT EXISTS)이라 중복 적용해도 안전하다.
+>
+> **스키마 명시(2026-08-08 수정):** dev에 배포 후 `ai`/`corpus` 스키마 분리 작업과 충돌하는
+> 게 발견됐다 — 이 폴더의 마이그레이션은 워커(ocr_worker·corpus_worker 등) 여러 개가 각자
+> `run_migrations()`로 **폴더 전체**를 실행하는 구조라, 스키마 미지정 `CREATE TABLE`은 실행한
+> 워커의 role(search_path)에 따라 제각각 다른 스키마에 중복 생성됐다(실측: `ai`·`corpus` 양쪽에
+> 동일 8개 테이블이 생김). 그래서 `001`~`002`(+ ALTER인 `003`~`006`)는 `ai.`, `008`~`012`는
+> `corpus.`/`ai.`로 전부 스키마를 명시했다 — 이제 어느 role이 실행해도 항상 같은 스키마에만
+> 생긴다. `007_report_drafts.sql`은 이 재배치 과정에서 파일이 유실됐던 걸 `012`로 복구한 것이다.
 
 `namespace`는 물리 컬럼이 아니라 검색한 소스 테이블로 부여하는 파생값이다
 (`policy_chunks` -> `terms`, `case_chunks` -> `case`).

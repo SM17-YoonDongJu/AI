@@ -7,7 +7,7 @@
 --   embedding 은 halfvec(1024)(qwen3:embedding / BGE-M3 폴백, float16), HNSW 는 halfvec_cosine_ops.
 --   키워드 검색은 content_tokens 함수식 GIN 인덱스(src/rag/search.py 의 쿼리식과 일치).
 
-CREATE TABLE IF NOT EXISTS policy_chunks (
+CREATE TABLE IF NOT EXISTS corpus.policy_chunks (
     chunk_id        TEXT PRIMARY KEY,
     content         TEXT        NOT NULL,   -- 임베딩 원문
     content_tokens  TEXT,                   -- Kiwi 형태소 결과 (공백 구분) → tsvector 전문검색
@@ -42,22 +42,32 @@ CREATE TABLE IF NOT EXISTS policy_chunks (
 
 -- 벡터 검색 (ANN, cosine) — HNSW, halfvec 전용 연산자 클래스.
 CREATE INDEX IF NOT EXISTS idx_policy_hnsw
-    ON policy_chunks USING hnsw (embedding halfvec_cosine_ops)
+    ON corpus.policy_chunks USING hnsw (embedding halfvec_cosine_ops)
     WITH (m = 16, ef_construction = 64);
 
 -- 키워드 검색 — tsvector 전문검색 (GIN, 함수식). 앱단 토큰 → content_tokens → 'simple' tsvector.
 CREATE INDEX IF NOT EXISTS idx_policy_fts
-    ON policy_chunks
+    ON corpus.policy_chunks
     USING gin (to_tsvector('simple', coalesce(content_tokens, '')));
 
 -- 메타 필터 (보험사·청크타입·시행일).
 CREATE INDEX IF NOT EXISTS idx_policy_meta
-    ON policy_chunks (insurer, chunk_type, effective_date);
+    ON corpus.policy_chunks (insurer, chunk_type, effective_date);
 
 -- doc_hash 중복 방지 조회.
 CREATE INDEX IF NOT EXISTS idx_policy_doc_hash
-    ON policy_chunks (doc_hash);
+    ON corpus.policy_chunks (doc_hash);
 
 -- 표 row 청크 조회.
 CREATE INDEX IF NOT EXISTS idx_policy_table_id
-    ON policy_chunks (table_id);
+    ON corpus.policy_chunks (table_id);
+
+-- report_worker·chatbot이 ai_owner로 RAG 검색 시 이 테이블을 읽어야 한다(스키마 분리,
+-- deploy/schema_split.sql 참고). role이 없는 로컬 PG에서는 조용히 건너뛴다.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ai_owner') THEN
+        EXECUTE 'GRANT SELECT ON corpus.policy_chunks TO ai_owner';
+    END IF;
+END
+$$;

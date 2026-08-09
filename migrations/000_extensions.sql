@@ -10,6 +10,12 @@ CREATE EXTENSION IF NOT EXISTS vector;
 -- 같은 이유로 인덱스(002_corpus_catalog.sql)보다 먼저 존재해야 CREATE INDEX가 성공한다.
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
+-- ai/corpus 스키마 선행 보장 — 이 폴더의 마이그레이션이 001부터 스키마를 명시(ai./corpus.)
+-- 하므로, 신규 환경(로컬 PG 등)에서 스키마 자체가 없으면 바로 실패한다. 이미 스키마 분리가
+-- 끝난 dev/RDS/prod에서는 IF NOT EXISTS라 조용히 스킵된다.
+CREATE SCHEMA IF NOT EXISTS ai;
+CREATE SCHEMA IF NOT EXISTS corpus;
+
 -- pgaudit — 쿼리 감사(민감 컬럼 READ/WRITE 로그, CloudWatch Logs 연동). RDS 파라미터
 -- 그룹에서 shared_preload_libraries에 pgaudit을 넣고 재부팅한 뒤에만 성공한다 — 그
 -- 전에 이 마이그레이션이 먼저 돌면(예: 로컬 PG, 또는 재부팅 전 RDS) 여기서 실패해

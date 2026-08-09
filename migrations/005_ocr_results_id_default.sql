@@ -7,4 +7,4 @@
 -- (조용히 DLQ로 빠짐 — 이슈: OCR 파이프라인이 dev에서 한 건도 저장되지 않던 근본 원인).
 -- ALTER COLUMN ... SET DEFAULT는 이미 같은 기본값이어도 안전하게 반복 적용된다.
 
-ALTER TABLE ocr_results ALTER COLUMN id SET DEFAULT gen_random_uuid();
+ALTER TABLE ai.ocr_results ALTER COLUMN id SET DEFAULT gen_random_uuid();
