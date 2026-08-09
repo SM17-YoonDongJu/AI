@@ -100,7 +100,7 @@ class Settings(BaseSettings):
     # --- AI 서빙 (OpenAI 호환: Ollama/vLLM/TEI) — 모델 미정, env 주입 ---
     ai_base_url: str = "http://localhost:11434/v1"  # 챗 추론 엔드포인트
     ai_api_key: str = "not-needed"  # OpenAI 호환 인증(로컬은 미사용)
-    llm_model: str = ""  # 예: EXAONE 계열
+    llm_model: str = ""  # 예: qwen3.6:35b-a3b (Qwen3 MoE — EXAONE은 라이선스상 상업 사용 불가)
     embedding_base_url: str = "http://localhost:11434/v1"  # 임베딩 엔드포인트(별도 노드 가능)
     embedding_model: str = ""  # 예: qwen3:embedding (1024d)
     embedding_dim: int = DEFAULT_EMBEDDING_DIM

@@ -14,7 +14,7 @@ model: opus
 - `src/core/config.py` — pydantic-settings 기반 설정
 - `src/core/kafka/` — aiokafka consumer/producer 래퍼 (재시도·오프셋 커밋·역직렬화)
 - `src/core/db.py` — asyncpg 풀 lifecycle
-- `src/core/ai_client.py` — Ollama 클라이언트 (qwen3:embedding 1024d / EXAONE), BGE-M3 폴백
+- `src/core/ai_client.py` — Ollama 클라이언트 (qwen3-embedding 1024d / Qwen3 MoE LLM), BGE-M3 폴백
 - `src/core/contracts.py` — **Kafka 토픽 + WebSocket 메시지 pydantic 스키마 (Spring과의 계약)**
 - `src/core/logging.py` — 구조적 로깅, PII 금지
 - `docker-compose.dev.yml` — Kafka·PG+pgvector·Ollama·Redis

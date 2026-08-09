@@ -1,6 +1,6 @@
 ---
 name: langgraph-agent-build
-description: LLM 소비 컴포넌트를 구현할 때 사용. LangGraph 멀티에이전트 리포트 생성(05번, Kafka 워커)과 챗봇(12번, FastAPI WebSocket 직결·비스트리밍)을 다룬다. RAG·가드레일 공용 모듈과 ai_client(Ollama EXAONE)를 조립한다. LangGraph 그래프·멀티에이전트·리포트 생성·챗봇 WebSocket·세션 작업 시 사용.
+description: LLM 소비 컴포넌트를 구현할 때 사용. LangGraph 멀티에이전트 리포트 생성(05번, Kafka 워커)과 챗봇(12번, FastAPI WebSocket 직결·비스트리밍)을 다룬다. RAG·가드레일 공용 모듈과 ai_client(Ollama Qwen3 MoE)를 조립한다. LangGraph 그래프·멀티에이전트·리포트 생성·챗봇 WebSocket·세션 작업 시 사용.
 ---
 
 # LangGraph / Agent Build
@@ -12,7 +12,7 @@ RAG·가드레일·ai_client를 **조립**해 사용자 가치를 만드는 두 
 
 - 진입: `report-job` Kafka 소비(`kafka-worker-patterns` 따름).
 - 파이프라인: **입력 가드레일 → LangGraph 멀티에이전트 생성(생성 가드레일 적용) → 출력 가드레일(LLM Judge 포함)**.
-- LLM은 `ai_client`(EXAONE, 별도 GPU 노드).
+- LLM은 `ai_client`(Qwen3 MoE, 별도 GPU 노드). EXAONE은 라이선스(상업 사용 금지)로 제외.
 - 결과: AI 리포트 초안 JSONB로 **영구 보존**(손해사정사 검수 근거).
 - **노션 05번이 미작성** — 그래프 노드 구성(에이전트 역할·엣지·상태)을 먼저 `_workspace/`에 설계해 확인받고 구현한다. 추측으로 구현하지 않는다.
 
@@ -26,7 +26,7 @@ LangGraph 원칙:
 
 - ALB(/ws/chat)를 통해 FastAPI가 **WebSocket 직접 수락**. on-connect **JWT(RS256) 스테이트리스 검증**. 동일 session_id 중복 연결 시 기존 해제.
 - **Redis**로 다중 Pod 세션 상태·멀티턴 컨텍스트(이전 N턴 요약) 공유, 24h 만료.
-- 처리 순서: 입력 가드레일 → RAG 검색(멀티턴 컨텍스트 구성) → `ai_client`(EXAONE) **완성 응답 생성** → 출력 가드레일.
+- 처리 순서: 입력 가드레일 → RAG 검색(멀티턴 컨텍스트 구성) → `ai_client`(Qwen3 MoE) **완성 응답 생성** → 출력 가드레일.
 - **비스트리밍**: 완성 응답을 `ChatServerMessage(type="message", citations=...)`로 **1회 전달**. 토큰 청크·`stream`/`done` 신호를 만들지 않는다.
 - 세션 생성·종료는 REST, 대화 이력 PG 저장(90일, 윈도우 초과 시 오래된 턴 요약·압축).
 
