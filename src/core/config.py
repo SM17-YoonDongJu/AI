@@ -15,11 +15,11 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # 임베딩 차원은 계약상 고정값(qwen3:embedding 1024d, BGE-M3 폴백도 1024d).
 DEFAULT_EMBEDDING_DIM = 1024
 
-# CD 스모크: shared(core) 변경으로 3개 서비스 배포 경로 검증(값·동작 무변경). 재트리거 5.
-# #48(마이그레이션 스키마 명시)이 ocr 필터엔 안 걸려서(migrations/**가 ocr 필터에 없음)
-# ocr_worker가 자동 재배포되지 않았다 — migrations/가 Dockerfile COPY로 이미지에 박히므로
-# 재빌드 없인 옛 마이그레이션(스키마 미지정)이 그대로 남아 재기동 시 ai 스키마에 중복 테이블을
-# 다시 만든다. 이 커밋으로 ocr(+report·chatbot도 같이) 강제 재배포.
+# CD 스모크: shared(core) 변경으로 3개 서비스 배포 경로 검증(값·동작 무변경). 재트리거 6.
+# migrations/만 건드리는 변경은 ocr 필터(src/ocr_worker/**)엔 안 걸린다 — migrations/가
+# Dockerfile COPY로 이미지에 박히므로 재빌드 없인 옛 마이그레이션이 그대로 남는다.
+# 이번엔 CREATE SCHEMA IF NOT EXISTS 권한 에러 핫픽스(같은 커밋)를 ocr_worker에도
+# 반영하려고 재트리거.
 
 
 class Settings(BaseSettings):
