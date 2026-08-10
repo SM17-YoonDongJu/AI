@@ -22,7 +22,8 @@ COPY pyproject.toml uv.lock* ./
 RUN uv sync --no-dev --extra corpus
 
 COPY src ./src
-# __main__이 기동 시 run_migrations("migrations")로 자가 마이그레이션한다 → 이미지에 필수.
+# __main__이 기동 시 run_migrations("migrations/corpus")로 자가 마이그레이션한다(corpus_owner
+# 전용 서브디렉터리 — ai/는 안 씀, #48~#52) → 이미지에 필수. 트리 전체를 COPY해도 무해하다.
 # (누락 시 files=[]로 아무 것도 적용 안 돼 corpus_file 부재 → UndefinedTableError 크래시 루프)
 COPY migrations ./migrations
 

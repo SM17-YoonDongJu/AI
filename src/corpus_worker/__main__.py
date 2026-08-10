@@ -39,8 +39,10 @@ from corpus_worker.sync import run_sync_cycle
 
 logger = get_logger(__name__)
 
-# 마이그레이션 SQL 디렉터리(OCR 워커와 동일 — 스키마 드리프트 차단).
-_MIGRATIONS_DIR = "migrations"
+# 마이그레이션 SQL 디렉터리. corpus_owner 전용 서브디렉터리만 가리킨다 — migrations/
+# 전체를 돌리면 ai_owner 소유 오브젝트(ocr_results 등)를 건드리다 권한 에러로 기동이
+# 막힌다(실측, #48~#50). ai_owner 쪽은 src/ocr_worker/__main__.py가 migrations/ai를 돈다.
+_MIGRATIONS_DIR = "migrations/corpus"
 # 다운로드 HTTP 타임아웃(초). 스트리밍이라 청크 read 단위 타임아웃이다(총량 아님).
 _DOWNLOAD_TIMEOUT_SECONDS = 60.0
 

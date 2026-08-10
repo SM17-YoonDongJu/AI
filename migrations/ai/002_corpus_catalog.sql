@@ -11,7 +11,7 @@
 -- IF NOT EXISTS로 작성해 반복 적용해도 안전하다.
 
 -- 출처 카탈로그 미러. notion_page_id를 PK로 써서 Notion 페이지와 1:1 멱등 매핑한다.
-CREATE TABLE IF NOT EXISTS corpus_source (
+CREATE TABLE IF NOT EXISTS ai.corpus_source (
     notion_page_id      uuid PRIMARY KEY,                       -- Notion page id(멱등 키)
     name                text        NOT NULL,                   -- 이름(title)
     category            text,                                   -- 카테고리(terms/precedent/...)
@@ -31,9 +31,9 @@ CREATE TABLE IF NOT EXISTS corpus_source (
 
 -- 약관 문서 미러(우선순위 큐 단위). Notion 메타 + 큐/상태 컬럼이 한 행에 공존하되,
 -- 큐/상태 컬럼은 동기화가 건드리지 않는다(repository.upsert_file 주석 참조).
-CREATE TABLE IF NOT EXISTS corpus_file (
+CREATE TABLE IF NOT EXISTS ai.corpus_file (
     notion_page_id      uuid PRIMARY KEY,                       -- Notion page id(멱등 키)
-    source_id           uuid REFERENCES corpus_source(notion_page_id),  -- 출처(relation 첫값)
+    source_id           uuid REFERENCES ai.corpus_source(notion_page_id),  -- 출처(relation 첫값)
     category            text        NOT NULL DEFAULT 'terms',   -- 코퍼스 카테고리(MVP=terms)
     product_name        text,                                   -- 상품명(수요 매칭 trigram 대상)
     company             text,                                   -- 회사
@@ -65,10 +65,10 @@ CREATE TABLE IF NOT EXISTS corpus_file (
 
 -- 약관 문서의 첨부 파일 파트. Notion files 첨부는 만료 URL이라 URL은 저장하지 않고
 -- 이름·순서만 미러한다. sha256/s3_key/byte_size는 다운로드·업로드(P2)가 채운다.
-CREATE TABLE IF NOT EXISTS corpus_file_part (
+CREATE TABLE IF NOT EXISTS ai.corpus_file_part (
     id                  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     file_page_id        uuid        NOT NULL
-                            REFERENCES corpus_file(notion_page_id) ON DELETE CASCADE,
+                            REFERENCES ai.corpus_file(notion_page_id) ON DELETE CASCADE,
     part_order          smallint    NOT NULL,                   -- 파일 내 파트 순서(0-base)
     notion_file_name    text,                                   -- Notion 첨부 파일명
     sha256              text,                                   -- 내용 해시(업로드 후, P2)
@@ -83,14 +83,14 @@ CREATE TABLE IF NOT EXISTS corpus_file_part (
 
 -- 우선순위 큐 스캔: 상태별로 priority 내림차순 상위 N개를 뽑는 폴링 쿼리 인덱스.
 CREATE INDEX IF NOT EXISTS corpus_file_status_priority_idx
-    ON corpus_file (status, priority DESC);
+    ON ai.corpus_file (status, priority DESC);
 
 -- 상품명 근사 검색(수요 매칭) — pg_trgm gin 인덱스. product_name NULL은 색인되지 않는다.
 CREATE INDEX IF NOT EXISTS corpus_file_product_name_trgm_idx
-    ON corpus_file USING gin (product_name gin_trgm_ops);
+    ON ai.corpus_file USING gin (product_name gin_trgm_ops);
 
 -- 내용주소 조회·수요 매칭용(전역 유니크 아님). 여러 문서가 동일 첨부(공통 특약·별표)를
 -- 공유할 수 있으므로 sha256을 유일하게 강제하지 않는다 — 실제 중복 업로드 방지는 S3
 -- HeadObject(내용주소 키 corpus/{category}/{sha256}.pdf)가 담당한다.
 CREATE INDEX IF NOT EXISTS corpus_file_part_sha256_idx
-    ON corpus_file_part (sha256) WHERE sha256 IS NOT NULL;
+    ON ai.corpus_file_part (sha256) WHERE sha256 IS NOT NULL;

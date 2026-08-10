@@ -37,7 +37,7 @@ Spring과의 인터페이스 계약. 전부 pydantic v2 `BaseModel`. 확정 즉�
 ## 4. 인프라 래퍼 — `src/core/`
 - `kafka/`: aiokafka consumer 래퍼(자동 오프셋 커밋 전략·역직렬화→pydantic·핸들러 콜백·에러 시 DLQ), producer 래퍼.
 - `db.py`: asyncpg 풀 생성/해제, `async with` 컨텍스트. pgvector 등록.
-- `ai_client.py`: Ollama HTTP(qwen3:embedding 1024d, EXAONE). 임베딩 실패 시 BGE-M3(sentence-transformers) 폴백. 차원 1024 고정.
+- `ai_client.py`: Ollama HTTP(qwen3-embedding 1024d, Qwen3 MoE LLM). 임베딩 실패 시 BGE-M3(sentence-transformers) 폴백. 차원 1024 고정.
 - `logging.py`: structlog 구조적 로깅, job_id/session_id/correlation_id 바인딩, **PII 로깅 금지**.
 
 ## 5. 로컬 환경 + 마이그레이션

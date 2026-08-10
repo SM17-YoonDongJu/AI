@@ -34,8 +34,8 @@ jobs:
           base: ${{ github.ref_name }}
           filters: |
             shared: ['pyproject.toml','uv.lock','src/core/**']
-            ocr: ['src/ocr_worker/**']
-            corpus: ['src/corpus_worker/**','migrations/**']
+            ocr: ['src/ocr_worker/**','migrations/ai/**']
+            corpus: ['src/corpus_worker/**','migrations/corpus/**']
             report: ['src/report_worker/**','src/rag/**','src/guardrail/**']
             chatbot: ['src/chatbot/**','src/rag/**','src/guardrail/**']
       - id: set

@@ -30,7 +30,9 @@ from ocr_worker.pipeline import OcrPipeline
 logger = get_logger(__name__)
 
 # 마이그레이션 SQL 디렉터리(리포지토리 루트 기준 상대). 진입 시 멱등 DDL을 적용한다.
-_MIGRATIONS_DIR = "migrations"
+# ai_owner 전용 서브디렉터리만 가리킨다 — migrations/ 전체를 돌리면 corpus_owner 소유
+# 오브젝트(policy_chunks 등)를 건드리다 권한 에러로 기동이 막힌다(실측, #48~#50).
+_MIGRATIONS_DIR = "migrations/ai"
 
 # 종료 시 미완료 S3 원본 삭제 task를 기다리는 상한(초). ``OcrPipeline``은 원본 삭제를
 # ReportJob 발행과 떼어 백그라운드 task로 돌리므로, 종료 신호가 오면 몇 건이 떠 있을 수

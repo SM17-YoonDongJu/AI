@@ -1,0 +1,31 @@
+# tempVectorDB — RAG 실험용 로컬 pgvector
+#
+# 메리츠 약관 임베딩(Policy-Chunker)을 적재해 rag.search() 실험에 쓰는 임시 DB.
+# halfvec(1024) 사용 → pgvector >= 0.7 필요. pgvector/pgvector:pg16 이미지가 지원.
+#
+# 기동:  docker compose -f tempVectorDB/docker-compose.yml up -d
+# 접속:  postgresql://postgres:postgres@localhost:5433/aiengine
+# (메인 앱이 5432를 쓰므로 충돌 피해 5433로 노출)
+
+services:
+  pgvector:
+    image: pgvector/pgvector:pg16
+    container_name: temp-pgvector
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: aiengine
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # init/*.sql 은 최초 1회(빈 볼륨)만 자동 실행된다.
+      - ./init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d aiengine"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata:

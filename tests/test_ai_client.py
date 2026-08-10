@@ -84,3 +84,32 @@ async def test_chat_wraps_http_error() -> None:
     # Act / Assert
     with pytest.raises(ai_client.AiClientError):
         await ai_client.chat([{"role": "user", "content": "hi"}])
+
+
+def _json_reply(content: str):  # type: ignore[no-untyped-def]
+    """chat 완성 응답에 임의 content를 실어 주는 MockTransport 핸들러."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
+
+    return handler
+
+
+async def test_chat_json_parses_fenced_block() -> None:
+    _install_mock(_json_reply('```json\n{"a": 1}\n```'))
+    assert await ai_client.chat_json([{"role": "user", "content": "hi"}]) == {"a": 1}
+
+
+async def test_chat_json_parses_plain_json() -> None:
+    _install_mock(_json_reply('{"b": 2}'))
+    assert await ai_client.chat_json([{"role": "user", "content": "hi"}]) == {"b": 2}
+
+
+async def test_chat_json_recovers_from_surrounding_noise() -> None:
+    _install_mock(_json_reply('앞말 {"c": 3} 뒷말'))
+    assert await ai_client.chat_json([{"role": "user", "content": "hi"}]) == {"c": 3}
+
+
+async def test_chat_json_returns_empty_on_unparseable() -> None:
+    _install_mock(_json_reply("이건 JSON이 아니에요"))
+    assert await ai_client.chat_json([{"role": "user", "content": "hi"}]) == {}

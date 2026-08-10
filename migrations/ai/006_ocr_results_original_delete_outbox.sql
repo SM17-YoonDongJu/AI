@@ -14,25 +14,25 @@
 --
 -- 004와 같은 스타일: IF NOT EXISTS DDL + CHECK는 NOT VALID → VALIDATE(쓰기 차단 최소화).
 
-ALTER TABLE ocr_results ADD COLUMN IF NOT EXISTS original_s3_key text;
-ALTER TABLE ocr_results
+ALTER TABLE ai.ocr_results ADD COLUMN IF NOT EXISTS original_s3_key text;
+ALTER TABLE ai.ocr_results
     ADD COLUMN IF NOT EXISTS original_delete_status text NOT NULL DEFAULT 'not_eligible';
-ALTER TABLE ocr_results
+ALTER TABLE ai.ocr_results
     ADD COLUMN IF NOT EXISTS original_delete_attempts integer NOT NULL DEFAULT 0;
 -- NULL이면 "즉시 시도 가능"(최초 pending 삽입 시점). 실패하면 다음 시도 시각이 채워진다.
-ALTER TABLE ocr_results
+ALTER TABLE ai.ocr_results
     ADD COLUMN IF NOT EXISTS original_delete_next_attempt_at timestamptz;
 
 -- NOT VALID로 추가해 기존 행 풀스캔 동안 쓰기가 막히지 않게 한다(ACCESS EXCLUSIVE는
 -- 짧게만 잡힘). VALIDATE CONSTRAINT는 SHARE UPDATE EXCLUSIVE라 스캔 중에도 쓰기 가능 —
 -- 새/변경 행은 NOT VALID 상태에서도 즉시 제약이 적용된다.
-ALTER TABLE ocr_results DROP CONSTRAINT IF EXISTS ocr_results_original_delete_status_check;
-ALTER TABLE ocr_results ADD CONSTRAINT ocr_results_original_delete_status_check
+ALTER TABLE ai.ocr_results DROP CONSTRAINT IF EXISTS ocr_results_original_delete_status_check;
+ALTER TABLE ai.ocr_results ADD CONSTRAINT ocr_results_original_delete_status_check
     CHECK (original_delete_status IN ('not_eligible', 'pending', 'deleted', 'exhausted')) NOT VALID;
-ALTER TABLE ocr_results VALIDATE CONSTRAINT ocr_results_original_delete_status_check;
+ALTER TABLE ai.ocr_results VALIDATE CONSTRAINT ocr_results_original_delete_status_check;
 
 -- 스윕 조회 전용 부분 인덱스 — 종결 상태(deleted/exhausted)와 애초 비대상(not_eligible)은
 -- 인덱스에 싣지 않는다. 전체 행 대비 pending은 극소수라 인덱스가 작게 유지된다.
 CREATE INDEX IF NOT EXISTS ocr_results_pending_delete_idx
-    ON ocr_results (original_delete_next_attempt_at)
+    ON ai.ocr_results (original_delete_next_attempt_at)
     WHERE original_delete_status = 'pending';

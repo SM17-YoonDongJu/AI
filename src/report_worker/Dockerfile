@@ -15,5 +15,8 @@ ENV PYTHONUNBUFFERED=1 \
 COPY --from=builder /app/.venv /app/.venv
 COPY src ./src
 
-# 엔트리포인트(report_worker/__main__.py)는 구현 단계에서 추가.
+# report-worker 서비스명 (관측성 로그/메트릭 라벨). SQS 큐 URL·리전은 런타임 env로 주입.
+ENV SERVICE_NAME=report-worker
+
+# 진입점: src/report_worker/__main__.py (report-job 컨슈머)
 CMD ["python", "-m", "report_worker"]

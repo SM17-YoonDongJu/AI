@@ -5,7 +5,7 @@
 -- 로컬 PG·RDS에 **같은 SQL**을 적용해 스키마 드리프트를 차단한다. 모든 DDL은
 -- IF NOT EXISTS로 작성해 반복 적용해도 안전하다.
 
-CREATE TABLE IF NOT EXISTS ocr_results (
+CREATE TABLE IF NOT EXISTS ai.ocr_results (
     id                    uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     job_id                uuid        NOT NULL,               -- OCR 작업(멱등 키)
     doc_type              text        NOT NULL,               -- DocType enum 값
@@ -23,4 +23,4 @@ CREATE TABLE IF NOT EXISTS ocr_results (
 
 -- job_id 멱등: at-least-once 재소비/재처리 시 한 OCR 작업은 정확히 한 행만 유지한다
 -- (repository의 ON CONFLICT (job_id) 업서트 앵커).
-CREATE UNIQUE INDEX IF NOT EXISTS ocr_results_job_id_key ON ocr_results (job_id);
+CREATE UNIQUE INDEX IF NOT EXISTS ocr_results_job_id_key ON ai.ocr_results (job_id);

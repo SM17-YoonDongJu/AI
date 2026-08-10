@@ -15,7 +15,11 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # 임베딩 차원은 계약상 고정값(qwen3:embedding 1024d, BGE-M3 폴백도 1024d).
 DEFAULT_EMBEDDING_DIM = 1024
 
-# CD 스모크: shared(core) 변경으로 3개 서비스 배포 경로 검증(값·동작 무변경). 재트리거 4.
+# CD 스모크: shared(core) 변경으로 3개 서비스 배포 경로 검증(값·동작 무변경). 재트리거 6.
+# migrations/만 건드리는 변경은 ocr 필터(src/ocr_worker/**)엔 안 걸린다 — migrations/가
+# Dockerfile COPY로 이미지에 박히므로 재빌드 없인 옛 마이그레이션이 그대로 남는다.
+# 이번엔 CREATE SCHEMA IF NOT EXISTS 권한 에러 핫픽스(같은 커밋)를 ocr_worker에도
+# 반영하려고 재트리거.
 
 
 class Settings(BaseSettings):
@@ -106,7 +110,7 @@ class Settings(BaseSettings):
     # --- AI 서빙 (OpenAI 호환: Ollama/vLLM/TEI) — 모델 미정, env 주입 ---
     ai_base_url: str = "http://localhost:11434/v1"  # 챗 추론 엔드포인트
     ai_api_key: str = "not-needed"  # OpenAI 호환 인증(로컬은 미사용)
-    llm_model: str = ""  # 예: EXAONE 계열
+    llm_model: str = ""  # 예: qwen3.6:35b-a3b (Qwen3 MoE — EXAONE은 라이선스상 상업 사용 불가)
     embedding_base_url: str = "http://localhost:11434/v1"  # 임베딩 엔드포인트(별도 노드 가능)
     embedding_model: str = ""  # 예: qwen3:embedding (1024d)
     embedding_dim: int = DEFAULT_EMBEDDING_DIM
