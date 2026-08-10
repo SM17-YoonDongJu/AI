@@ -1,6 +1,6 @@
 """OCR 파이프라인 오케스트레이션 테스트 (이슈 #15/#20).
 
-Kafka·DB·GPU·PIL 없이 경계(프로듀서·풀·OCR 프로세서·이미지 트랙)를 페이크로 주입해
+SQS·DB·GPU·PIL 없이 경계(프로듀서·풀·OCR 프로세서·이미지 트랙)를 페이크로 주입해
 ``OcrPipeline.handle``의 흐름을 검증한다:
 - 정상 흐름: OCR→분류→추출→마스킹→저장→ReportJob 발행이 계약대로 이어지는가.
 - 멱등 단락: 이미 저장된 job_id는 OCR을 건너뛰고 ReportJob만 재발행하는가.
@@ -48,13 +48,13 @@ _EXISTING_ID = uuid.UUID("33333333-3333-3333-3333-333333333333")
 
 # ── 페이크 경계 ──────────────────────────────────────────────────
 class FakeProducer:
-    """KafkaProducer.publish 대역 — 발행한 (topic, message, key)를 포착한다."""
+    """SqsProducer.send 대역 — 발행한 (queue_url, message)를 포착한다."""
 
     def __init__(self) -> None:
-        self.published: list[tuple[str, ReportJob, str]] = []
+        self.published: list[tuple[str, ReportJob]] = []
 
-    async def publish(self, topic: str, message: ReportJob, *, key: str) -> None:
-        self.published.append((topic, message, key))
+    async def send(self, queue_url: str, message: ReportJob) -> None:
+        self.published.append((queue_url, message))
 
 
 class FakePool:
@@ -196,13 +196,12 @@ async def test_full_flow_masks_persists_and_publishes() -> None:
     assert insert_args[1] == "policy"  # 분류 결과(StrEnum→text)
     assert json.loads(insert_args[7]) == [f"masked/{_JOB_ID}/page-0.png"]  # masked_image_s3_keys
 
-    # 발행: report-job 토픽에 계약대로 ReportJob 1건.
+    # 발행: report-job 큐에 계약대로 ReportJob 1건.
     assert len(producer.published) == 1
-    topic, report, key = producer.published[0]
-    assert topic == "report-job"
+    queue_url, report = producer.published[0]
+    assert queue_url == pipeline._settings.sqs_report_job_queue_url  # 발행 큐 = 설정값
     assert report.ocr_result_id == str(_SAVE_ID)
     assert report.report_id == _derive_report_id(str(_SAVE_ID))
-    assert key == report.report_id  # 파티션 키 = report_id
     assert report.doc_type is DocType.POLICY
     assert report.job_id == _JOB_ID
     assert report.claim_id == "claim-9"  # 패스스루
@@ -259,7 +258,7 @@ async def test_idempotent_short_circuit_skips_ocr_and_republishes() -> None:
     assert processor.called is False
     assert pool.insert_calls() == []
     assert len(producer.published) == 1
-    _, report, _ = producer.published[0]
+    _, report = producer.published[0]
     assert report.ocr_result_id == str(_EXISTING_ID)
     assert report.report_id == _derive_report_id(str(_EXISTING_ID))
     assert report.doc_type is DocType.POLICY
@@ -633,9 +632,7 @@ async def test_ocr_quality_needs_reupload_when_low_confidence_no_name_no_domain_
     # quality_source_text가 유지되게 한다.
     pool = FakePool(existing=None)
     producer = FakeProducer()
-    processor = FakeProcessor(
-        _result("보험증권", "증권번호 202301-042", confidence=0.5)
-    )
+    processor = FakeProcessor(_result("보험증권", "증권번호 202301-042", confidence=0.5))
     vlm = _RecordingVlm(error=VlmClientError("연결 실패"))
     pipeline = _pipeline(pool, producer, processor, vlm_transcribe=vlm)
 
@@ -764,9 +761,7 @@ async def test_ocr_quality_ok_when_confidence_high_even_without_name_or_domain_i
     # needs_reupload로 판정하지 않는다(저신뢰 게이트가 AND 조건).
     pool = FakePool(existing=None)
     producer = FakeProducer()
-    processor = FakeProcessor(
-        _result("보험증권", "증권번호 202301-042", confidence=0.95)
-    )
+    processor = FakeProcessor(_result("보험증권", "증권번호 202301-042", confidence=0.95))
     pipeline = _pipeline(pool, producer, processor)
 
     # Act
@@ -849,9 +844,9 @@ class _ProbingProducer(FakeProducer):
         self._s3 = s3
         self.delete_finished_at_publish: list[bool] = []
 
-    async def publish(self, topic: str, message: ReportJob, *, key: str) -> None:
+    async def send(self, queue_url: str, message: ReportJob) -> None:
         self.delete_finished_at_publish.append(self._s3.delete_finished.is_set())
-        await super().publish(topic, message, key=key)
+        await super().send(queue_url, message)
 
 
 class _FakeReocrEngine:
@@ -1055,7 +1050,7 @@ async def test_original_kept_when_only_one_page_has_no_ocr_text() -> None:
 
 async def test_delete_failure_does_not_fail_the_job() -> None:
     # Arrange: 검증은 통과했지만 S3 삭제가 실패 — 사본·저장은 이미 유효하므로 작업을
-    # 되돌리지 않는다(원본이 남을 뿐, 운영 정리 대상). 백그라운드 task라 Kafka 재시도가
+    # 되돌리지 않는다(원본이 남을 뿐, 운영 정리 대상). 백그라운드 task라 SQS 재전달이
     # 이 실패를 받아주지 못하므로, 조용히 사라지지 않고 경고로 드러나는지까지 본다.
     pool = FakePool(existing=None)
     producer = FakeProducer()
@@ -1346,7 +1341,7 @@ async def test_immediate_delete_success_marks_outbox_deleted(
 async def test_immediate_delete_failure_records_retry_with_settings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Arrange: 즉시 삭제 실패는 Kafka 재시도가 못 받는다(fire-and-forget) — 유일한
+    # Arrange: 즉시 삭제 실패는 SQS 재전달이 못 받는다(fire-and-forget) — 유일한
     # 재시도 경로가 outbox이므로, 실패가 설정된 상한·간격과 함께 기록돼야 한다.
     outbox = _RecordingOutbox()
     _install_outbox(monkeypatch, outbox)

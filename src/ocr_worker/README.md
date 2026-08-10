@@ -1,6 +1,6 @@
 # ocr_worker — OCR 워커 (02)
 
-`ocr-job-queue` Kafka 메시지를 소비해 문서를 OCR·분류·마스킹하는 워커. **surya-ocr(PyTorch)를 인프로세스로 실행하므로 GPU 노드에 배포**한다(Ollama/vLLM 노드와 co-location 가능).
+`ocr-job-queue` SQS 메시지를 소비해 문서를 OCR·분류·마스킹하는 워커. **surya-ocr(PyTorch)를 인프로세스로 실행하므로 GPU 노드에 배포**한다(Ollama/vLLM 노드와 co-location 가능).
 
 ## 처리 흐름
 
@@ -18,7 +18,7 @@
 
 ## 의존 / 배포
 
-- `core.kafka`·`core.db` · S3 · surya-ocr(`.[ocr]` extra, **PyTorch/CUDA**)
+- `core.sqs`·`core.db` · S3 · surya-ocr(`.[ocr]` extra, **PyTorch/CUDA**)
 - 배포: `src/ocr_worker/Dockerfile` (CUDA 베이스) → **GPU 노드**
 - PII 마스킹 규칙은 `guardrail` 입력단과 정렬
 

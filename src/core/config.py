@@ -4,7 +4,7 @@
 코드에 하드코딩하지 않고 env로 주입하며, 시크릿(DB 비밀번호 등)은 코드·로그·커밋에 두지 않는다.
 아래 기본값은 로컬 개발(docker-compose.dev)용이며 실제 값이 아니다.
 
-필드 네이밍은 팀 정본 규약을 따른다 — 인프라(DB·Kafka·AI)는 서술적 이름, 관측성은 환경/서비스
+필드 네이밍은 팀 정본 규약을 따른다 — 인프라(DB·SQS·AI)는 서술적 이름, 관측성은 환경/서비스
 식별자. `os.getenv` 산재를 금지하고 여기서만 로드한다.
 """
 
@@ -45,16 +45,22 @@ class Settings(BaseSettings):
     rds_ca_path: str | None = None  # RDS TLS CA 번들 경로. 로컬 PG면 비움(SSL 끔)
     redis_url: str = "redis://localhost:6379/0"
 
-    # --- Kafka (AWS MSK / 로컬 redpanda) ---
-    kafka_bootstrap_servers: str = "localhost:9092"
-    kafka_ocr_job_topic: str = "ocr-job-queue"
-    kafka_report_job_topic: str = "report-job"
-    kafka_security_protocol: str = "PLAINTEXT"  # PLAINTEXT | SSL | SASL_SSL
-    kafka_consumer_group: str = "ocr-worker"
-    kafka_dlq_suffix: str = ".dlq"
-    kafka_max_retries: int = 3
+    # --- SQS (AWS SQS Standard 큐 / 로컬 LocalStack) ---
+    # 큐는 전체 URL로 지정한다(토픽명이 아님). 자격증명은 표준 AWS 체인(워커 IAM Role) —
+    # 정적 키 없음. 로컬은 sqs_endpoint_url(LocalStack)만 주면 된다. 전송 계층 배선은
+    # core.sqs.client, 수신/발행은 core.sqs.consumer/producer.
+    sqs_ocr_job_queue_url: str = ""  # 소비 큐(Spring → ocr_worker) 전체 URL
+    sqs_report_job_queue_url: str = ""  # 발행 큐(ocr_worker → report_worker) 전체 URL
+    # 로컬 LocalStack 엔드포인트(예: http://localhost:4566). 비면 실 AWS 기본 엔드포인트.
+    sqs_endpoint_url: str | None = None
+    sqs_wait_time_seconds: int = 20  # 롱폴링 대기(0~20). 빈 큐 폴링 비용·지연 절감
+    sqs_visibility_timeout: int = 600  # 처리시간보다 길게(초). 짧으면 처리 중 재전달로 중복 처리
+    sqs_max_messages: int = 1  # ReceiveMessage 배치 크기(1~10). 워커는 1건씩 처리
+    # 이 횟수를 넘겨 재수신되면 poison(못 살리는 메시지)으로 보고 명시적 삭제(스킵)한다 —
+    # DLQ 미도입 상태의 자체 방어(4일 재전달 루프 차단). 향후 DLQ 도입 시 redrive policy로 대체.
+    sqs_max_receive_count: int = 5
 
-    # --- S3 (OCR 원본 — OCR Worker가 GetObject) ---
+    # --- AWS (S3 원본 GetObject · SQS 리전) ---
     aws_region: str = "ap-northeast-2"
     s3_bucket: str = ""
 

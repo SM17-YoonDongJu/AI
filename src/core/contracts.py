@@ -30,7 +30,7 @@ __all__ = [
     "ReportJob",
 ]
 
-# Kafka 토픽명 — 발행부(ocr_worker)·소비부(report_worker) 공유 상수.
+# SQS 큐명 — 발행부(ocr_worker)·소비부(report_worker) 공유 상수(값 불변, 큐 URL은 config).
 OCR_JOB_TOPIC = "ocr-job-queue"
 REPORT_JOB_TOPIC = "report-job"
 
@@ -57,14 +57,14 @@ class DocType(StrEnum):
 
 
 # --------------------------------------------------------------------------- #
-# Kafka 토픽 페이로드
+# SQS 큐 페이로드
 # --------------------------------------------------------------------------- #
 
 
 class OcrJob(BaseModel):
     """Spring → `ocr-job-queue` → `ocr_worker`. 문서 1건마다 발행되는 OCR 작업.
 
-    토픽 `ocr-job-queue`, 파티션 키 `job_id`, at-least-once + `job_id` 멱등 처리.
+    큐 `ocr-job-queue`(SQS Standard), at-least-once + `job_id` 멱등 처리(파티션 키 없음).
 
     소유권(2026-07-10, 발행측 `OcrJob.java` 정본): Spring이 `reports`·`report_attachments`
     shell 행을 먼저 생성하고, 워커는 OCR·AI 결과로 그 행을 UPDATE(생성 아님)한다 →
@@ -88,7 +88,7 @@ class OcrJob(BaseModel):
 class ReportJob(BaseModel):
     """`ocr_worker` → `report-job` → `report_worker`. OCR·마스킹 완료 후 리포트 트리거.
 
-    토픽 `report-job`, 파티션 키 `report_id`, `report_id` 멱등 처리.
+    큐 `report-job`(SQS Standard), `report_id` 멱등 처리(파티션 키 없음).
     """
 
     report_id: str  # 리포트 식별자(UUID, 신규 생성). 멱등 키

@@ -1,26 +1,28 @@
 """OCR 워커 파이프라인 (이슈 #15) — consume→OCR→분류→추출→마스킹→저장→produce.
 
-``KafkaConsumer``가 역직렬화·검증한 ``OcrJob`` 하나를 받아 전 과정을 오케스트레이션하고
+``SqsConsumer``가 역직렬화·검증한 ``OcrJob`` 하나를 받아 전 과정을 오케스트레이션하고
 ``ReportJob``을 발행하는 **핸들러 본체**다. 순수 로직(분류·추출·마스킹)은 각 모듈에
-있고, 여기서는 I/O 경계(S3·OCR·DB·Kafka)를 잇는 오케스트레이션만 담당한다.
+있고, 여기서는 I/O 경계(S3·OCR·DB·SQS)를 잇는 오케스트레이션만 담당한다.
 
 정식 at-least-once 규약(계획 · [[ocr-worker-build]]):
 - **멱등(job_id)**: 진입부에서 이미 저장된 작업이면 무거운 OCR을 건너뛰고 기존
   ``ocr_result_id``로 ``ReportJob``만 재발행한다. 저장은 ``job_id`` 업서트라 중복
   소비가 새 행을 만들지 않는다. 다운스트림은 ``ocr_result_id``로 멱등 처리한다.
-- **수동 커밋(발행 후)**: 커밋은 컨슈머가 핸들러 성공 후 수행한다. 그래서 저장~발행
-  사이 crash 시 메시지가 재전달되고, 재발행이 안전해야 한다 → 위 멱등 단락 + 결정적
-  ``report_id``(``ocr_result_id`` 파생)로 완전 멱등을 만든다.
-- **DLQ**: 핸들러가 예외를 던지면 컨슈머가 재시도 후 DLQ로 보낸다. 마스킹 잔류 검증
-  실패(``MaskingError``)도 예외로 전파해 **PII를 저장하지 않고** 격리한다(fail-closed).
+- **삭제=ack(발행 후)**: 컨슈머는 핸들러 성공 후에만 메시지를 삭제한다(SQS DeleteMessage).
+  그래서 저장~발행 사이 crash 시 메시지가 visibility timeout 뒤 재전달되고, 재발행이
+  안전해야 한다 → 위 멱등 단락 + 결정적 ``report_id``(``ocr_result_id`` 파생)로 완전 멱등을 만든다.
+- **실패 격리(DLQ 미도입)**: 핸들러가 예외를 던지면 컨슈머가 삭제하지 않아 재전달되고,
+  끝내 못 살리면 수신 횟수 상한(poison 가드)에서 스킵한다. 마스킹 잔류 검증 실패
+  (``MaskingError``)도 예외로 전파해 **PII를 저장하지 않고** 격리한다(fail-closed) — 결정적
+  오류라 재전달마다 같은 실패를 반복하다 상한에서 스킵되며, PII는 끝내 저장되지 않는다.
 
 원본 삭제 게이트(#18 노션 5장): 비식별 사본이 S3에 안착하고 페이지별 검증(5.1 bbox
 커버리지 + 5.2 재OCR 잔류)을 **모두** 통과해야 ``job.s3_key`` 원본을 지운다. 검증 실패는
 예외가 아니라 "원본 보존 + 경고 로그"다 — 복구 가능한 방향으로만 실패시킨다.
 - **삭제 시점 = ``ocr_results`` 저장 성공 이후**: 이미지 트랙은 삭제 가능 여부를 판정만
   하고(``ImageTrackResult``) 실행은 저장 뒤로 미룬다. 저장 전에 지우면 일시적 DB 오류로
-  인한 인프로세스 재시도(``KafkaConsumer._handle_with_retry``)가 원본을 다시 못 받아
-  ``OcrError``로 승격되고, 재시도로 흡수 가능했던 오류가 복구 불가능한 원본 유실이 된다.
+  인한 재전달 재처리(SQS visibility timeout 후 재소비)가 원본을 다시 못 받아
+  ``OcrError``로 승격되고, 재전달로 흡수 가능했던 오류가 복구 불가능한 원본 유실이 된다.
 - **삭제 실행은 non-blocking**: 트리거 시점은 저장 이후로 고정하되 완료는 기다리지 않고
   백그라운드 task로 던진다(``_schedule_original_delete``). ``ReportJob`` 발행이 S3 왕복
   뒤로 밀릴 이유가 없다 — 삭제 성공 여부는 다운스트림 결과를 바꾸지 않고, 실패해도
@@ -59,8 +61,8 @@ import asyncpg
 from core.config import Settings, get_settings
 from core.contracts import DocType, OcrJob, ReportJob
 from core.exceptions import OcrError
-from core.kafka.producer import KafkaProducer
 from core.logging import bind_context, clear_context, get_logger
+from core.sqs.producer import SqsProducer
 from ocr_worker.classify import classify
 from ocr_worker.extract import extract
 from ocr_worker.masking.image_masker import ImageMasker, RedactedPage, image_to_png_bytes
@@ -216,14 +218,14 @@ class OcrPipeline:
     """``OcrJob`` 한 건을 처리해 ``ReportJob``을 발행하는 파이프라인 핸들러.
 
     I/O 경계(OCR 프로세서·마스커·이미지 마스킹·업로드·원본 삭제·프로듀서·DB 풀)를 주입
-    가능하게 두어, Kafka·DB·GPU·PIL 없이 오케스트레이션을 단위 테스트한다(#20).
+    가능하게 두어, SQS·DB·GPU·PIL 없이 오케스트레이션을 단위 테스트한다(#20).
     """
 
     def __init__(
         self,
         *,
         pool: asyncpg.Pool,
-        producer: KafkaProducer,
+        producer: SqsProducer,
         settings: Settings | None = None,
         processor: OcrProcessor | None = None,
         masker: Masker | None = None,
@@ -238,7 +240,7 @@ class OcrPipeline:
 
         Args:
             pool: asyncpg 연결 풀(``ocr_results`` 저장·조회).
-            producer: ``ReportJob`` 발행용 Kafka 프로듀서(시작된 상태).
+            producer: ``ReportJob`` 발행용 SQS 프로듀서.
             settings: 환경설정. ``None``이면 ``get_settings()``.
             processor: OCR 오케스트레이터. ``None``이면 프로세스 공용 ``get_processor()``.
             masker: 텍스트 마스커. ``None``이면 프로세스 공용 ``get_masker()``.
@@ -615,9 +617,9 @@ class OcrPipeline:
         """검증을 통과한 S3 원본을 삭제하고 결과를 outbox에 기록한다.
 
         ``ocr_results`` 저장 성공 후에만 호출된다. 삭제 실패는 사본·저장 결과에 영향이
-        없다. 여기서 예외를 올리면 이미 저장된 작업이 통째로 재시도/DLQ로 가므로(재OCR
+        없다. 여기서 예외를 올리면 이미 저장된 작업이 통째로 재전달·재처리되므로(재OCR
         비용 포함) 경고만 남긴다 — 실패한 원본은 outbox에 ``pending``으로 남아
-        ``sweep_pending_deletes``가 재시도한다(백그라운드 task라 Kafka 재시도가 이 실패를
+        ``sweep_pending_deletes``가 재시도한다(백그라운드 task라 SQS 재전달이 이 실패를
         받아주지 못하므로, 재시도 경로는 outbox뿐이다).
         """
         try:
@@ -636,9 +638,7 @@ class OcrPipeline:
         await self._mark_deleted(ocr_result_id)
 
     @staticmethod
-    def _log_delete_failure(
-        event: str, state: DeleteRetryState | None, **fields: object
-    ) -> None:
+    def _log_delete_failure(event: str, state: DeleteRetryState | None, **fields: object) -> None:
         """삭제 실패를 남긴다 — ``exhausted``면 ``error``, 아니면 ``warning``.
 
         ``exhausted``는 자동 재시도가 끝났다는 뜻이고, 이후 마스킹 검증까지 통과한 PII
@@ -777,7 +777,7 @@ class OcrPipeline:
     async def _publish_report(
         self, job: OcrJob, ocr_result_id: str, doc_type: DocType, ocr_quality: str
     ) -> None:
-        """``ReportJob``을 ``report-job`` 토픽에 발행한다(파티션 키 = report_id).
+        """``ReportJob``을 ``report-job`` 큐에 발행한다(Standard 큐 — 파티션 키 없음).
 
         ``report_id``는 ``ocr_result_id``에서 결정적으로 파생해 재발행 시 동일하다 —
         report_worker가 ``report_id``/``ocr_result_id`` 어느 쪽으로 멱등 처리해도 안전하다.
@@ -796,4 +796,4 @@ class OcrPipeline:
             created_at=datetime.now(UTC),
             ocr_quality=ocr_quality,
         )
-        await self._producer.publish(self._settings.kafka_report_job_topic, report, key=report_id)
+        await self._producer.send(self._settings.sqs_report_job_queue_url, report)

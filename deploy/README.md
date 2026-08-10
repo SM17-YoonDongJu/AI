@@ -119,7 +119,7 @@ docker image prune -f
 
 ### backend EC2 (`/home/ubuntu/backend/`)
 - `docker-compose.yml`(report·chatbot 서비스 포함) + `.env.dev` — **backend팀이 관리**
-- Kafka 브로커(EXTERNAL 리스너 `:9094`, `advertised=<backend_ip>:9094`), SSM Agent
+- SSM Agent (메시지 큐는 **AWS SQS 관리형** — backend EC2에 브로커 없음)
 - 이 레포는 그 위에서 `pull/up`만 원격 실행한다.
 
 ---
@@ -138,8 +138,9 @@ docker image prune -f
 2. **pgvector 확장** — 워커 풀은 커넥션마다 `vector` 타입을 등록하므로 DB에 확장이 먼저 있어야
    풀 생성이 성공한다. 빈 DB는 최초 1회 `CREATE EXTENSION IF NOT EXISTS vector;` 필요
    (마이그레이션 `000_extensions.sql`).
-3. **Kafka 도달** — OCR/Report 워커는 backend EC2의 Kafka(`:9094`)에 붙는다.
-   `advertised.listeners`가 원격에서 접근 가능한 사설 IP로 광고돼야 한다.
+3. **SQS 도달** — OCR/Report 워커는 AWS SQS 퍼블릭 엔드포인트에 붙는다. 프라이빗 서브넷이면
+   VPC 엔드포인트(interface) 또는 NAT 경유가 필요하고, 워커 IAM Role에 SQS 권한(ReceiveMessage·
+   DeleteMessage·GetQueueAttributes 등)이 있어야 한다.
 
 ---
 
