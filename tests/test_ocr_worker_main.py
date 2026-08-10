@@ -1,7 +1,7 @@
 """OCR 워커 진입점의 삭제 outbox 스윕 루프 테스트 (``ocr_worker.__main__``).
 
 스윕 루프는 "원본이 조용히 남는" 경로를 닫는 **유일한 재시도 수단**이라, 루프가 죽거나
-종료 때 어중간한 상태를 남기면 그 보증이 통째로 사라진다. Kafka·DB·S3 없이 파이프라인을
+종료 때 어중간한 상태를 남기면 그 보증이 통째로 사라진다. SQS·DB·S3 없이 파이프라인을
 페이크로 주입해 루프 자체의 계약만 고정한다:
 
 - 설정 간격(``ocr_delete_retry_interval_seconds``)대로 사이클을 돈다.
@@ -164,7 +164,7 @@ async def test_sleep_or_stop_returns_quietly_after_interval() -> None:
 
 def test_sweep_loop_is_wired_into_worker_startup() -> None:
     # Arrange / Act: 배선 자체(진입점이 스윕 task를 띄우고 종료 시 정리하는지)는
-    # Kafka·DB 없이 실행할 수 없어, 소스에 계약이 남아 있는지로 최소 회귀만 막는다.
+    # SQS·DB 없이 실행할 수 없어, 소스에 계약이 남아 있는지로 최소 회귀만 막는다.
     source = _run_source()
 
     # Assert

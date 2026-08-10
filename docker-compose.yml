@@ -1,38 +1,27 @@
 #
 # 배포(prod)는 docker-compose로 앱 서비스를 띄우되, 다음은 AWS 관리형을 사용한다:
-#   - Kafka     → AWS MSK
+#   - SQS       → AWS SQS (로컬은 LocalStack)
 #   - Redis     → AWS ElastiCache
 
 services:
 
-  # Kafka — apache/kafka 단일 노드, KRaft 모드(ZooKeeper 불필요). prod은 AWS MSK.
-  # listener 2개: EXTERNAL(localhost:9092) = 호스트 실행 워커용 / INTERNAL(kafka:29092) = compose 네트워크 내부용.
-  kafka:
-    image: apache/kafka:3.9.0
+  # LocalStack — 로컬 SQS(ocr-job-queue·report-job 큐). prod은 AWS SQS.
+  # 워커는 boto3 endpoint_url로 접속한다: 호스트 실행 시 http://localhost:4566,
+  # compose 내부 실행 시 http://localstack:4566. 자격증명은 더미(test/test — .env.example 참고).
+  # 큐는 ready.d 훅(./localstack/ready.d)이 기동 시 생성한다. e2e 테스트는 자체 유니크
+  # 큐를 만들므로 이 훅과 무관하다.
+  localstack:
+    image: localstack/localstack:3
     ports:
-      - "9092:9092"
+      - "4566:4566"
     environment:
-      # KRaft 단일 노드 = broker + controller 겸임
-      # LISTENERS는 host를 비워(=0.0.0.0) 바인딩하고, ADVERTISED에만 라우팅 가능한
-      # 호스트명을 준다(INTERNAL=compose 내부용 kafka:29092 / EXTERNAL=호스트용 localhost:9092).
-      # advertised에 0.0.0.0을 두면 KRaft 검증에서 거부되므로 절대 넣지 않는다.
-      KAFKA_NODE_ID: 1
-      KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
-      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
-      KAFKA_LISTENERS: CONTROLLER://:29093,INTERNAL://:29092,EXTERNAL://:9092
-      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:9092
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
-      # 단일 노드 → 복제계수·ISR 1
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
-      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      SERVICES: sqs
+      DEBUG: "0"
     volumes:
-      - kafka:/var/lib/kafka/data
+      - localstack:/var/lib/localstack
+      - ./localstack/ready.d:/etc/localstack/init/ready.d:ro
     healthcheck:
-      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list"]
+      test: ["CMD-SHELL", "curl -sf http://localhost:4566/_localstack/health || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -71,6 +60,6 @@ services:
       retries: 10
 
 volumes:
-  kafka:
+  localstack:
   pgdata:
   redisdata:

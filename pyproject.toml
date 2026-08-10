@@ -6,7 +6,6 @@ requires-python = ">=3.12"
 dependencies = [
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
-    "aiokafka>=0.11",
     "asyncpg>=0.29",
     "pgvector>=0.3",
     "redis>=5.0",
@@ -26,17 +25,18 @@ ocr = [
     "transformers>=4.56.1,<5.0",  # transformers 5.x는 SuryaDecoderConfig.pad_token_id 깨짐(datalab-to/surya#484)
     "pymupdf>=1.24",   # PDF → 페이지 이미지 렌더
     "pillow>=10.0",    # surya 입력(PIL.Image)
-    "boto3>=1.34",     # S3 GetObject(원본 다운로드)
+    "boto3>=1.34",     # S3 GetObject(원본 다운로드) · SQS 소비(ocr-job-queue)·발행(report-job)
 ]
 # 약관 코퍼스 S3 스테이징 워커(GPU 불필요·경량). Notion 첨부 → S3.
 # base(httpx·asyncpg·pydantic·structlog) + boto3만. torch/surya 없음.
 corpus = [
     "boto3>=1.34",   # S3 PutObject/HeadObject
 ]
-# LangGraph 멀티에이전트 리포트 생성
+# LangGraph 멀티에이전트 리포트 생성 (report-job SQS 큐 소비)
 report = [
     "langgraph>=0.2",
     "langchain-core>=0.3",
+    "boto3>=1.34",  # SQS ReceiveMessage/DeleteMessage(report-job 큐 소비)
 ]
 # 챗봇 (FastAPI WebSocket 직결, 비스트리밍)
 chatbot = [
@@ -79,8 +79,8 @@ src = ["src", "tests"]
 select = ["E", "F", "I", "UP", "B", "ASYNC", "S", "SIM", "RUF"]
 
 [tool.ruff.lint.per-file-ignores]
-# 테스트: assert(S101)·가짜 시크릿(S106)·임시파일 접근(ASYNC230/240) 허용
-"tests/**" = ["S101", "S106", "ASYNC230", "ASYNC240"]
+# 테스트: assert(S101)·가짜 시크릿(S105·S106)·임시파일 접근(ASYNC230/240) 허용
+"tests/**" = ["S101", "S105", "S106", "ASYNC230", "ASYNC240"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -104,7 +104,5 @@ module = [
     "botocore.*",
     "PIL.*",
     "asyncpg",
-    "aiokafka",
-    "aiokafka.*",
 ]
 ignore_missing_imports = true

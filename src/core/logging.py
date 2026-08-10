@@ -162,7 +162,7 @@ def _shared_processors() -> list[Any]:
 def configure_logging() -> None:
     """앱 시작 시 1회 호출. structlog + stdlib 로깅을 팀 표준 포맷으로 구성한다.
 
-    third-party 로그(asyncpg·aiokafka·httpx·uvicorn)도 동일 포맷으로 라우팅된다.
+    third-party 로그(asyncpg·boto3·httpx·uvicorn)도 동일 포맷으로 라우팅된다.
     환경(local)에서는 사람이 읽는 콘솔, 그 외에는 JSON으로 렌더링한다.
     """
     global _SERVICE, _ENVIRONMENT, _INSTANCE_ID
