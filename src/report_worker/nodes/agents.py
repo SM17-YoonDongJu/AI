@@ -77,6 +77,37 @@ def _decrypt_pii_column(row: Any, table: str, column: str, dek: bytes) -> str | 
     return crypto.maybe_decrypt(row[column], table, column, dek)
 
 
+def _extract_claim_diagnosis(claim: Any) -> str | None:
+    """`user_claims.details`(jsonb, sealed `ClaimDetails`)에서 진단명을 뽑는다.
+
+    Jackson `@JsonTypeInfo`로 사고유형(`accident_type`)별 7개 구현체(의료비·교통사고·
+    후유장해·암진단·화재·배상책임·기타) 중 하나로 나뉘지만, `diagnosis: string[]`는
+    전 타입 공통 필드라 타입 분기 없이 그대로 뽑을 수 있다(Notion `ClaimDetails` 구조
+    문서 참고). `hospitalizations`나 `medical_indemnity` 전용 필드(치료유형·수술일 등)는
+    아직 이 값을 쓰는 downstream이 없어 뽑지 않는다 — 쓰는 곳이 생기면 그때 추가한다.
+
+    아직 암호화 대상이 아니다(백엔드가 이번 라운드에서 제외 확인) — 평문 jsonb로 읽는다.
+
+    Args:
+        claim: `user_claims` 행(`details` 컬럼 포함) 또는 행 자체가 없으면 None.
+
+    Returns:
+        진단명을 ", "로 합친 문자열. 행이 없거나 `details`가 비었거나 형식이 예상과
+        다르면 None — 호출부가 `reports.treatment` 폴백으로 넘어간다(그래프를 막지
+        않는다 — 이건 암복호화 실패와 달리 데이터 품질 이슈일 뿐이다).
+    """
+    if claim is None or not claim["details"]:
+        return None
+    details = claim["details"]
+    try:
+        parsed = details if isinstance(details, dict) else json.loads(details)
+        names = [str(d) for d in parsed.get("diagnosis") or [] if d]
+    except (TypeError, ValueError, AttributeError):
+        logger.warning("claim details parse failed")
+        return None
+    return ", ".join(names) or None
+
+
 def _decrypt_enrolled_at(value: Any, dek: bytes) -> datetime.date | None:
     """`user_insurances.enrolled_at`을 복호화해 date로 되돌린다.
 
@@ -138,7 +169,7 @@ async def load_context(state: ReportState) -> dict[str, Any]:
         if rep and rep["claim_id"]:
             claim = await c.fetchrow(
                 "SELECT accident_date, accident_type, offered_amount, description, "
-                "additional_information FROM user_claims WHERE id = $1",
+                "additional_information, details FROM user_claims WHERE id = $1",
                 rep["claim_id"],
             )
         ins = await c.fetchrow(
@@ -161,9 +192,9 @@ async def load_context(state: ReportState) -> dict[str, Any]:
         case_info = {
             "accident_type": (rep["accident_type"] if rep else None)
             or (claim["accident_type"] if claim else None),
-            # 진단명은 reports.treatment만 쓴다 — user_claims의 진단 정보는 details(jsonb)로
-            # 흡수돼 별도 컬럼이 없고, 그 jsonb 파싱은 이번 범위 밖(후속 작업)이다.
-            "diagnosis": (rep["treatment"] if rep else None),
+            # 진단명은 user_claims.details(jsonb)의 diagnosis[]를 우선 쓰고, 없거나
+            # 파싱이 안 되면 reports.treatment로 폴백한다(_extract_claim_diagnosis 참고).
+            "diagnosis": _extract_claim_diagnosis(claim) or (rep["treatment"] if rep else None),
             "offered_amount": (rep["offered_amount"] if rep else None),
             "question": _decrypt_pii_column(rep, "reports", "question", dek),
             "description": _decrypt_pii_column(claim, "user_claims", "description", dek),
