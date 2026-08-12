@@ -25,3 +25,11 @@ class CorpusStagingError(AppError):
     이 항상-임포트 가능한 도메인 예외로 감싸 전파한다 — 소비자(pipeline)가 botocore를
     import하지 않고도 실패를 포착할 수 있게 한다.
     """
+
+
+class PiiCryptoError(AppError):
+    """PII 컬럼 복호화 실패(봉투 포맷 불일치·DEK 설정 누락·활성 키 부재 등).
+
+    태그 검증 실패(``cryptography.exceptions.InvalidTag``)는 이미 구체적 예외라 감싸지
+    않고 그대로 전파한다 — 이 예외는 그 앞 단계(포맷·설정) 검증 실패만 담당한다.
+    """

@@ -45,3 +45,29 @@ def test_env_overrides_settings(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_get_settings_returns_singleton() -> None:
     # Arrange / Act / Assert
     assert get_settings() is get_settings()
+
+
+def test_environment_accepts_env_alias(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Arrange: 배포 템플릿(.env.*.example·docker-compose*.yml)은 전부 ENV를 주입한다.
+    # 별칭이 없으면 이 필드가 항상 기본값(local)에 고정되고, core.crypto.get_pii_dek()가
+    # 그 값으로 dev(평문 env 키)/prod(KMS)를 가르므로 이건 보안 버그다.
+    monkeypatch.delenv("ENVIRONMENT", raising=False)
+    monkeypatch.setenv("ENV", "prod")
+
+    # Act
+    cfg = Settings(_env_file=None)
+
+    # Assert
+    assert cfg.environment == "prod"
+
+
+def test_environment_still_accepts_full_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Arrange: ENV 별칭 추가가 기존 ENVIRONMENT 변수명을 깨면 안 된다.
+    monkeypatch.delenv("ENV", raising=False)
+    monkeypatch.setenv("ENVIRONMENT", "prod")
+
+    # Act
+    cfg = Settings(_env_file=None)
+
+    # Assert
+    assert cfg.environment == "prod"

@@ -13,6 +13,7 @@ dependencies = [
     "structlog>=24.1",
     "httpx>=0.27",
     "kiwipiepy>=0.23.2",
+    "cryptography>=42",  # core.crypto의 AES-256-GCM PII 컬럼 복호화 — 전 워커 공용이라 base
 ]
 
 [project.optional-dependencies]
