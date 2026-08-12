@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import datetime
 import functools
 import json
 import re
@@ -14,7 +15,8 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 import guardrail
-from core import ai_client, db
+from core import ai_client, crypto, db
+from core.exceptions import PiiCryptoError
 from core.logging import get_logger
 from report_worker.disability_rules import combine_disability_rate
 
@@ -63,8 +65,64 @@ def _as_str_list(v: Any) -> list[str]:
 
 
 # ── load_context: DB 조회로 사고/약관 컨텍스트 조립 ──────────────
+def _decrypt_pii_column(row: Any, table: str, column: str, dek: bytes) -> str | None:
+    """행이 있으면 그 행의 PII 컬럼을 복호화해 돌려준다(행 자체가 없으면 None).
+
+    load_context가 읽는 세 행(reports·user_claims·user_insurances)은 모두 없을 수 있어
+    `... if row else None`이 매번 반복된다. AAD 규약("{table}:{column}")과 그 반복을
+    한곳에 모은다. 암호화 미배포 컬럼(text)은 maybe_decrypt가 그대로 통과시킨다.
+    """
+    if row is None:
+        return None
+    return crypto.maybe_decrypt(row[column], table, column, dek)
+
+
+def _decrypt_enrolled_at(value: Any, dek: bytes) -> datetime.date | None:
+    """`user_insurances.enrolled_at`을 복호화해 date로 되돌린다.
+
+    이 컬럼만 원래 타입이 date라 별도 처리가 필요하다. 암호화 미배포 상태에선 asyncpg가
+    date를 그대로 주므로 통과시키고(maybe_decrypt가 text를 통과시키는 것과 같은 역할),
+    배포 후엔 bytea가 와서 복호화 결과가 문자열이 된다. 그런데 downstream
+    (`disability_rag` → `hybrid.search(contract_date=...)`)의 계약은 `date | None`이라
+    문자열을 그대로 흘리면 SQL 바인딩에서 깨진다.
+
+    Args:
+        value: asyncpg가 돌려준 컬럼 값(date=평문, bytes=암호화됨, None=NULL).
+        dek: 32바이트 평문 DEK.
+
+    Returns:
+        파싱한 date. NULL이거나 ISO-8601로 읽히지 않으면 None — 표준 장해분류표를 현행판으로
+        검색하고 리포트에 '계약일 불명' 캐비앗이 붙는다(disability_rag). 계약일 하나 때문에
+        리포트 전체를 죽이지 않는다.
+    """
+    if value is None or isinstance(value, datetime.date):
+        return value
+    plain = crypto.maybe_decrypt(value, "user_insurances", "enrolled_at", dek)
+    if plain is None:
+        return None
+    try:
+        return datetime.date.fromisoformat(plain)
+    except ValueError:
+        # 값 자체는 로그에 남기지 않는다(암호화 대상 컬럼 = PII 취급).
+        logger.warning("enrolled_at parse failed", column="user_insurances.enrolled_at")
+        return None
+
+
 @safe_node
 async def load_context(state: ReportState) -> dict[str, Any]:
+    # PII 컬럼(description·question 등)은 백엔드가 AES-256-GCM 봉투(bytea)로 넣어 둔다.
+    # DEK는 프로세스당 1회 확보 후 캐시라 노드마다 받아도 비용이 없다 — 한 번 받아 재사용한다.
+    #
+    # DEK 미확보·복호화 실패(PiiCryptoError)는 safe_node의 범용 캐치에 맡기지 않고 여기서
+    # 직접 "input_blocked:..."로 반환한다 — route_after_input이 그 접두사를 보고 기존
+    # 차단 경로(persist_blocked → status='BLOCKED')로 보낸다. 그냥 흘려보내면(safe_node가
+    # "load_context_failed:..."로 삼킴) case_info가 텅 빈 채 그래프가 끝까지 돌고,
+    # guard_input은 빈 masked_text를 막지 않아 빈 리포트가 정상 상태로 저장된다.
+    try:
+        dek = await crypto.get_pii_dek()
+    except PiiCryptoError as e:
+        logger.error("pii dek unavailable", report_id=state.get("report_id"), error=str(e))
+        return {"errors": _err(state, f"input_blocked:pii_dek_unavailable:{type(e).__name__}")}
     pool = db.get_pool()
     async with pool.acquire() as c:
         ocr = await c.fetchrow(
@@ -79,12 +137,12 @@ async def load_context(state: ReportState) -> dict[str, Any]:
         claim = None
         if rep and rep["claim_id"]:
             claim = await c.fetchrow(
-                "SELECT diagnosis, accident_date, accident_type, offered_amount, description, "
-                "hospitalization FROM user_claims WHERE id = $1",
+                "SELECT accident_date, accident_type, offered_amount, description, "
+                "additional_information FROM user_claims WHERE id = $1",
                 rep["claim_id"],
             )
         ins = await c.fetchrow(
-            "SELECT insurer_name, product_name, coverages, coverage_details, enrolled_at "
+            "SELECT insurer_name, product_name, coverages, enrolled_at "
             "FROM user_insurances "
             "WHERE user_id = (SELECT user_id FROM reports WHERE id = $1) LIMIT 1",
             uuid.UUID(state["report_id"]),
@@ -99,29 +157,44 @@ async def load_context(state: ReportState) -> dict[str, Any]:
             ocr["entities"] if isinstance(ocr["entities"], dict) else json.loads(ocr["entities"])
         )
 
-    case_info = {
-        "accident_type": (rep["accident_type"] if rep else None)
-        or (claim["accident_type"] if claim else None),
-        "diagnosis": (claim["diagnosis"] if claim else None) or (rep["treatment"] if rep else None),
-        "offered_amount": (rep["offered_amount"] if rep else None),
-        "question": (rep["question"] if rep else None),
-        "description": (claim["description"] if claim else None),
-        "insurer": ins["insurer_name"] if ins else None,
-        "product_name": ins["product_name"] if ins else None,
-        "enrolled_at": ins["enrolled_at"]
-        if ins
-        else None,  # 가입일(date|None) — 표준표 버전 매칭용
-    }
-    coverage_details = []
-    if ins and ins["coverage_details"]:
-        cd = ins["coverage_details"]
-        coverage_details = cd if isinstance(cd, list) else json.loads(cd)
+    try:
+        case_info = {
+            "accident_type": (rep["accident_type"] if rep else None)
+            or (claim["accident_type"] if claim else None),
+            # 진단명은 reports.treatment만 쓴다 — user_claims의 진단 정보는 details(jsonb)로
+            # 흡수돼 별도 컬럼이 없고, 그 jsonb 파싱은 이번 범위 밖(후속 작업)이다.
+            "diagnosis": (rep["treatment"] if rep else None),
+            "offered_amount": (rep["offered_amount"] if rep else None),
+            "question": _decrypt_pii_column(rep, "reports", "question", dek),
+            "description": _decrypt_pii_column(claim, "user_claims", "description", dek),
+            "additional_information": _decrypt_pii_column(
+                claim, "user_claims", "additional_information", dek
+            ),
+            "insurer": _decrypt_pii_column(ins, "user_insurances", "insurer_name", dek),
+            "product_name": _decrypt_pii_column(ins, "user_insurances", "product_name", dek),
+            # 가입일(date|None) — 표준표 버전 매칭용
+            "enrolled_at": _decrypt_enrolled_at(ins["enrolled_at"], dek) if ins else None,
+        }
+        subscribed_coverages: list[str] = []
+        if ins and ins["coverages"]:
+            # text[] 원소별 봉투로 가정한다 — 배열 전체를 한 봉투로 싼다는 계약은 백엔드
+            # 스펙에 없다.
+            decrypted = [
+                crypto.maybe_decrypt(cov, "user_insurances", "coverages", dek)
+                for cov in ins["coverages"]
+            ]
+            subscribed_coverages = [cov for cov in decrypted if cov]
+    except PiiCryptoError as e:
+        logger.error("pii decrypt failed", report_id=state.get("report_id"), error=str(e))
+        errors.append(f"input_blocked:pii_decrypt_failed:{type(e).__name__}")
+        return {"errors": errors}
+    # user_insurances에는 특약별 가입금액 컬럼이 없다(실제 스키마는 coverages text[] 하나뿐) —
+    # coverage_details는 채우지 않고, payment_calc가 배수 어림 폴백으로 지급액을 산출한다.
     return {
         "case_info": case_info,
         "masked_text": (ocr["masked_text"] if ocr else ""),
         "entities": entities,
-        "subscribed_coverages": list(ins["coverages"]) if ins and ins["coverages"] else [],
-        "coverage_details": coverage_details,
+        "subscribed_coverages": subscribed_coverages,
         "errors": errors,
     }
 

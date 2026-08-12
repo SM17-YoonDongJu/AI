@@ -19,6 +19,11 @@ class _FakeConn:
     async def fetchrow(self, query: str, *args: object) -> dict | None:
         if "ocr_results" in query:
             return {"masked_text": "도메인 외 질문 원문", "entities": None}
+        # user_insurances 쿼리는 상관 서브쿼리에 "FROM reports"를 포함하므로, 그 아래
+        # "FROM reports" 체크보다 먼저 걸러야 한다 — 안 그러면 reports 행으로 오분류돼
+        # load_context의 컬럼 조회(row["insurer_name"] 등)가 KeyError로 죽는다.
+        if "FROM user_insurances" in query or "FROM user_claims" in query:
+            return None
         if "FROM reports" in query:
             return {
                 "accident_type": "traffic",
@@ -27,7 +32,7 @@ class _FakeConn:
                 "question": None,
                 "claim_id": None,
             }
-        return None  # user_insurances 등
+        return None
 
     async def fetchval(self, query: str, *args: object) -> int:
         return 0
@@ -60,6 +65,14 @@ async def _blocked_guard_input(text: str) -> InputGuardResult:
     return InputGuardResult(masked_text=text, blocked=True, reason="off_domain")
 
 
+async def _fake_pii_dek(*args: object, **kwargs: object) -> bytes:
+    """load_context의 PII 복호화 DEK 확보를 끊는다(env 키·KMS 없이 돌게).
+
+    페이크 DB가 돌려주는 컬럼은 전부 평문(str|None)이라 실제 복호화는 일어나지 않는다.
+    """
+    return b"\x00" * 32
+
+
 async def _forbidden_llm(*args: object, **kwargs: object):
     raise AssertionError("차단 경로에서 LLM 노드가 호출되면 안 된다")
 
@@ -68,6 +81,7 @@ async def test_blocked_path_skips_llm_and_persists_blocked_status(monkeypatch) -
     # Arrange
     pool = _FakePool()
     monkeypatch.setattr(agents.db, "get_pool", lambda: pool)
+    monkeypatch.setattr(agents.crypto, "get_pii_dek", _fake_pii_dek)
     monkeypatch.setattr(agents.guardrail, "guard_input", _blocked_guard_input)
     monkeypatch.setattr(agents.ai_client, "chat", _forbidden_llm)
     monkeypatch.setattr(agents.ai_client, "chat_json", _forbidden_llm)

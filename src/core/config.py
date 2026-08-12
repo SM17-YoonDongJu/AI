@@ -10,6 +10,7 @@
 
 from functools import lru_cache
 
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # 임베딩 차원은 계약상 고정값(qwen3:embedding 1024d, BGE-M3 폴백도 1024d).
@@ -33,7 +34,13 @@ class Settings(BaseSettings):
     )
 
     # --- 환경·관측성 ---
-    environment: str = "local"  # local | dev | prod
+    # 배포 템플릿(.env.*.example·docker-compose*.yml)이 전부 `ENV`를 주입하는데 별칭이
+    # 없으면 pydantic-settings는 `ENVIRONMENT`만 찾아 이 필드가 항상 기본값(local)으로
+    # 고정된다. core.crypto.get_pii_dek()가 이 값으로 dev(평문 env 키)/prod(KMS)를
+    # 가르므로, 지금은 로그 레벨 정도에만 영향이던 오배선이 prod에서 KMS를 건너뛰는
+    # 보안 버그가 된다 — `ENV`·`ENVIRONMENT` 둘 다 받도록 명시적으로 별칭을 둔다.
+    environment: str = Field("local", validation_alias=AliasChoices("environment", "ENV"))
+    # local | dev | prod
     log_level: str = ""  # 빈값이면 환경별 결정(local=DEBUG, 그 외=INFO)
     service_name: str = "ai-engine"  # 워커별 env(SERVICE_NAME)로 덮어씀
     instance_id: str = ""  # 인스턴스/Pod 식별자(비면 hostname)
@@ -63,6 +70,13 @@ class Settings(BaseSettings):
     # --- AWS (S3 원본 GetObject · SQS 리전) ---
     aws_region: str = "ap-northeast-2"
     s3_bucket: str = ""
+
+    # --- PII 컬럼 복호화 (백엔드가 AES-256-GCM으로 암호화한 RDS 컬럼 읽기 — core.crypto) ---
+    # 키 소유는 백엔드다. 여기선 복호화만 하며, 출처가 환경별로 갈린다(core.crypto.get_pii_dek).
+    # local·dev: KMS 없이 이 값(base64 32바이트)을 그대로 DEK로 쓴다. 시크릿 — 코드·커밋 금지.
+    pii_enc_key: str | None = None
+    # prod: core.encryption_keys의 wrapped DEK를 이 CMK로 푼다. ARN 하드코딩 금지(계정별로 다름).
+    pii_kms_key_arn: str | None = None
 
     # --- 원본 삭제 outbox (ocr_results.original_delete_* — ocr_worker 스윕) ---
     # 마스킹 검증을 통과한 원본 삭제가 실패하면 ocr_results 행에 남겨 재시도한다.
