@@ -77,8 +77,8 @@ def _decrypt_pii_column(row: Any, table: str, column: str, dek: bytes) -> str | 
     return crypto.maybe_decrypt(row[column], table, column, dek)
 
 
-def _extract_claim_diagnosis(claim: Any) -> str | None:
-    """`user_claims.details`(jsonb, sealed `ClaimDetails`)에서 진단명을 뽑는다.
+def _extract_claim_diagnosis(claim: Any, dek: bytes) -> str | None:
+    """`user_claims.details`(sealed `ClaimDetails`)에서 진단명을 뽑는다.
 
     Jackson `@JsonTypeInfo`로 사고유형(`accident_type`)별 7개 구현체(의료비·교통사고·
     후유장해·암진단·화재·배상책임·기타) 중 하나로 나뉘지만, `diagnosis: string[]`는
@@ -86,24 +86,33 @@ def _extract_claim_diagnosis(claim: Any) -> str | None:
     문서 참고). `hospitalizations`나 `medical_indemnity` 전용 필드(치료유형·수술일 등)는
     아직 이 값을 쓰는 downstream이 없어 뽑지 않는다 — 쓰는 곳이 생기면 그때 추가한다.
 
-    아직 암호화 대상이 아니다(백엔드가 이번 라운드에서 제외 확인) — 평문 jsonb로 읽는다.
+    백엔드 PR #236(이슈 #235)에서 이 컬럼이 `jsonb`→`bytea`로 바뀌었다 — `ClaimDetails`를
+    JSON 문자열로 직렬화한 뒤 통째로 한 번 암호화한다(AAD=`user_claims:details`). 그래서
+    `maybe_decrypt`로 먼저 복호화해 JSON 문자열을 얻은 다음 파싱한다.
 
     Args:
         claim: `user_claims` 행(`details` 컬럼 포함) 또는 행 자체가 없으면 None.
+        dek: 32바이트 평문 DEK.
 
     Returns:
-        진단명을 ", "로 합친 문자열. 행이 없거나 `details`가 비었거나 형식이 예상과
-        다르면 None — 호출부가 `reports.treatment` 폴백으로 넘어간다(그래프를 막지
-        않는다 — 이건 암복호화 실패와 달리 데이터 품질 이슈일 뿐이다).
+        진단명을 ", "로 합친 문자열. 행이 없거나 `details`가 비었거나 복호화 후 JSON
+        형식이 예상과 다르면 None — 호출부가 `reports.treatment` 폴백으로 넘어간다.
+
+    Raises:
+        PiiCryptoError: 복호화 실패(태그 불일치 등). 이건 데이터 품질 문제가 아니라
+            보안 문제라 여기서 삼키지 않고 호출부(load_context)의 기존 PiiCryptoError
+            처리(차단 경로)에 맡긴다 — JSON 구조 파싱 실패만 이 함수에서 흡수한다.
     """
     if claim is None or not claim["details"]:
         return None
-    details = claim["details"]
+    raw = crypto.maybe_decrypt(claim["details"], "user_claims", "details", dek)
+    if not raw:
+        return None
     try:
-        parsed = details if isinstance(details, dict) else json.loads(details)
+        parsed = raw if isinstance(raw, dict) else json.loads(raw)
         names = [str(d) for d in parsed.get("diagnosis") or [] if d]
     except (TypeError, ValueError, AttributeError):
-        logger.warning("claim details parse failed")
+        logger.warning("claim details json parse failed")
         return None
     return ", ".join(names) or None
 
@@ -137,6 +146,39 @@ def _decrypt_enrolled_at(value: Any, dek: bytes) -> datetime.date | None:
         # 값 자체는 로그에 남기지 않는다(암호화 대상 컬럼 = PII 취급).
         logger.warning("enrolled_at parse failed", column="user_insurances.enrolled_at")
         return None
+
+
+def _extract_coverages(ins: Any, dek: bytes) -> list[str]:
+    """`user_insurances.coverages`에서 특약명 목록을 복호화·파싱한다.
+
+    백엔드 PR #222에서 이 컬럼이 `text[]`→`bytea`로 바뀌었다 — 배열 전체를 JSON
+    문자열로 직렬화한 뒤 통째로 한 번 암호화한다(AAD=`user_insurances:coverages`).
+    원소별 봉투가 아니다 — 예전엔 원소별로 잘못 가정해서 `bytea`를 바이트 단위로
+    순회하며 `TypeError`가 나던 버그가 있었다.
+
+    Args:
+        ins: `user_insurances` 행(`coverages` 컬럼 포함) 또는 행 자체가 없으면 None.
+        dek: 32바이트 평문 DEK.
+
+    Returns:
+        특약명 리스트. 행이 없거나 `coverages`가 비었거나 복호화 후 JSON 형식이
+        예상과 다르면 빈 리스트 — 이건 데이터 품질 문제라 리포트 전체를 막지 않는다.
+
+    Raises:
+        PiiCryptoError: 복호화 실패(태그 불일치 등). 데이터 품질 문제가 아니라 보안
+            문제라 여기서 삼키지 않고 호출부(load_context)의 차단 경로에 맡긴다.
+    """
+    if ins is None or not ins["coverages"]:
+        return []
+    raw = crypto.maybe_decrypt(ins["coverages"], "user_insurances", "coverages", dek)
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+        return [str(c) for c in parsed if c]
+    except (TypeError, ValueError):
+        logger.warning("coverages json parse failed")
+        return []
 
 
 @safe_node
@@ -192,9 +234,10 @@ async def load_context(state: ReportState) -> dict[str, Any]:
         case_info = {
             "accident_type": (rep["accident_type"] if rep else None)
             or (claim["accident_type"] if claim else None),
-            # 진단명은 user_claims.details(jsonb)의 diagnosis[]를 우선 쓰고, 없거나
+            # 진단명은 user_claims.details의 diagnosis[]를 우선 쓰고, 없거나
             # 파싱이 안 되면 reports.treatment로 폴백한다(_extract_claim_diagnosis 참고).
-            "diagnosis": _extract_claim_diagnosis(claim) or (rep["treatment"] if rep else None),
+            "diagnosis": _extract_claim_diagnosis(claim, dek)
+            or (rep["treatment"] if rep else None),
             "offered_amount": (rep["offered_amount"] if rep else None),
             "question": _decrypt_pii_column(rep, "reports", "question", dek),
             "description": _decrypt_pii_column(claim, "user_claims", "description", dek),
@@ -206,16 +249,12 @@ async def load_context(state: ReportState) -> dict[str, Any]:
             # 가입일(date|None) — 표준표 버전 매칭용
             "enrolled_at": _decrypt_enrolled_at(ins["enrolled_at"], dek) if ins else None,
         }
-        subscribed_coverages: list[str] = []
-        if ins and ins["coverages"]:
-            # text[] 원소별 봉투로 가정한다 — 배열 전체를 한 봉투로 싼다는 계약은 백엔드
-            # 스펙에 없다.
-            decrypted = [
-                crypto.maybe_decrypt(cov, "user_insurances", "coverages", dek)
-                for cov in ins["coverages"]
-            ]
-            subscribed_coverages = [cov for cov in decrypted if cov]
-    except PiiCryptoError as e:
+        subscribed_coverages = _extract_coverages(ins, dek)
+    except (PiiCryptoError, TypeError) as e:
+        # TypeError도 여기서 같이 잡는다 — 예상 타입(bytes/str/None)이 아닌 값이 오면
+        # 스키마가 또 어긋났다는 신호다(coverages를 text[]로 잘못 가정했던 게 실제
+        # 사례). safe_node의 범용 캐치에 맡기면 "load_context_failed:..."로만 남아
+        # 차단 경로를 안 타고, 빈 컨텍스트가 정상 리포트로 저장되는 문제가 재발한다.
         logger.error("pii decrypt failed", report_id=state.get("report_id"), error=str(e))
         errors.append(f"input_blocked:pii_decrypt_failed:{type(e).__name__}")
         return {"errors": errors}
