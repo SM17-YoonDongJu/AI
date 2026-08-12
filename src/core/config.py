@@ -98,7 +98,7 @@ class Settings(BaseSettings):
 
     # --- Corpus S3 스테이징 (Notion 첨부 → S3, 청킹/임베딩은 범위 밖) ---
     corpus_categories: str = "terms"  # MVP 필터. 확장 시 "terms,precedent,medical,legal"
-    s3_corpus_prefix: str = "corpus/"  # 키 = corpus/{category}/{sha256}.pdf (OCR 키공간과 분리)
+    s3_corpus_prefix: str = "corpus/"  # 키 = corpus/{category}/{sha256}{ext} (OCR 키공간과 분리)
     s3_corpus_sse: str = "AES256"  # SSE-S3(공개 약관·비-PII)
     corpus_poll_interval_seconds: float = 5.0  # 우선순위 큐 폴링 간격
     corpus_max_concurrent_uploads: int = 4  # 동시 업로드 수

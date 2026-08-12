@@ -87,6 +87,7 @@ class PartRow:
 
     id: str
     part_order: int
+    notion_file_name: str | None
     sha256: str | None
     status: str
 
@@ -315,7 +316,7 @@ WHERE notion_page_id = $1
 """
 
 _LIST_PARTS_SQL = """
-SELECT id, part_order, sha256, status
+SELECT id, part_order, notion_file_name, sha256, status
 FROM corpus_file_part
 WHERE file_page_id = $1
 ORDER BY part_order
@@ -397,6 +398,7 @@ async def list_parts(pool: asyncpg.Pool, file_page_id: str) -> list[PartRow]:
         PartRow(
             id=str(row["id"]),
             part_order=row["part_order"],
+            notion_file_name=row["notion_file_name"],
             sha256=row["sha256"],
             status=row["status"],
         )

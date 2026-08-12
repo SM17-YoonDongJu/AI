@@ -23,8 +23,6 @@ logger = get_logger(__name__)
 
 # 스트리밍 청크 크기(64KiB). 메모리 상주량과 syscall 횟수의 절충.
 _CHUNK_SIZE = 64 * 1024
-# 임시파일 접미사(약관은 전부 PDF — corpus_key도 .pdf).
-_TEMP_SUFFIX = ".pdf"
 
 
 class DownloadResult(NamedTuple):
@@ -49,7 +47,9 @@ class _StreamingClient(Protocol):
     def stream(self, method: str, url: str) -> AbstractAsyncContextManager[_StreamResponse]: ...
 
 
-async def download_to_temp(url: str, tmp_dir: str, *, client: _StreamingClient) -> DownloadResult:
+async def download_to_temp(
+    url: str, tmp_dir: str, *, client: _StreamingClient, suffix: str
+) -> DownloadResult:
     """URL을 스트리밍으로 임시파일에 내려받고 SHA256·크기를 함께 계산한다.
 
     네트워크 수신은 async로 양보하고, 각 청크의 디스크 기록·해시 갱신은 작은(64KiB) 단위라
@@ -59,6 +59,7 @@ async def download_to_temp(url: str, tmp_dir: str, *, client: _StreamingClient) 
         url: 신선한(만료 전) 다운로드 URL.
         tmp_dir: 임시파일을 둘 디렉터리(설정 ``corpus_download_tmp_dir``).
         client: 스트리밍 GET 클라이언트(주입 — 테스트 페이크).
+        suffix: 임시파일 접미사(첨부 파일명에서 판정한 확장자 — ``corpus_worker.filetype``).
 
     Returns:
         ``DownloadResult(temp_path, sha256, byte_size)``.
@@ -70,7 +71,7 @@ async def download_to_temp(url: str, tmp_dir: str, *, client: _StreamingClient) 
     os.makedirs(tmp_dir, exist_ok=True)
     # 원시 fd에 os.write로 직접 쓴다 — 느린 부분(네트워크 수신)은 async로 양보하고,
     # 64KiB 버퍼드 write·해시 갱신은 이벤트 루프를 사실상 막지 않는다.
-    fd, temp_path = tempfile.mkstemp(suffix=_TEMP_SUFFIX, dir=tmp_dir)
+    fd, temp_path = tempfile.mkstemp(suffix=suffix, dir=tmp_dir)
     hasher = hashlib.sha256()
     byte_size = 0
     completed = False

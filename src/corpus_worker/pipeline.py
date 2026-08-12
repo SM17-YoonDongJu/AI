@@ -28,6 +28,7 @@ import httpx
 from core.config import Settings
 from core.exceptions import CorpusStagingError, CorpusSyncError
 from core.logging import bind_context, clear_context, get_logger
+from corpus_worker import filetype
 from corpus_worker.downloader import DownloadResult
 from corpus_worker.repository import (
     ClaimedDoc,
@@ -36,7 +37,7 @@ from corpus_worker.repository import (
     mark_document_failed,
     mark_part_uploaded,
 )
-from corpus_worker.s3 import CORPUS_CONTENT_TYPE, corpus_key
+from corpus_worker.s3 import corpus_key
 
 logger = get_logger(__name__)
 
@@ -50,8 +51,8 @@ _STAGING_FAILURES = (
     CorpusStagingError,
 )
 
-# url → 다운로드 산출물. 임시 디렉터리·httpx 클라이언트는 배선 시 바인딩한다.
-type DownloadFn = Callable[[str], Awaitable[DownloadResult]]
+# (url, 임시파일 접미사) → 다운로드 산출물. 임시 디렉터리·httpx 클라이언트는 배선 시 바인딩한다.
+type DownloadFn = Callable[[str, str], Awaitable[DownloadResult]]
 
 
 class _UrlSource(Protocol):
@@ -123,17 +124,22 @@ async def _stage_parts(deps: ProcessDeps, doc: ClaimedDoc, parts: list[PartRow])
 
 
 async def _stage_one_part(deps: ProcessDeps, doc: ClaimedDoc, part: PartRow, url: str) -> None:
-    """파트 1개를 다운로드→(dedup)업로드→상태전이한다. 임시파일은 반드시 정리한다."""
-    result = await deps.download(url)
+    """파트 1개를 다운로드→(dedup)업로드→상태전이한다. 임시파일은 반드시 정리한다.
+
+    타입(확장자·ContentType)은 다운로드 전에 ``notion_file_name``에서 판정한다 — 실패 시
+    (파일명 없음·미상 확장자) 네트워크 호출 없이 바로 예외를 던진다.
+    """
+    file_type = filetype.detect(part.notion_file_name)
+    result = await deps.download(url, file_type.ext)
     try:
-        key = corpus_key(doc.category, result.sha256, settings=deps.settings)
+        key = corpus_key(doc.category, result.sha256, file_type.ext, settings=deps.settings)
         if await deps.s3.head_exists(key):
             logger.info("corpus_dedup_hit", key=key)  # 같은 내용 이미 존재 → 업로드 생략
         else:
             await deps.s3.put_file(
                 result.temp_path,
                 key,
-                content_type=CORPUS_CONTENT_TYPE,
+                content_type=file_type.content_type,
                 sse=deps.settings.s3_corpus_sse,
             )
         await mark_part_uploaded(deps.pool, part.id, result.sha256, key, result.byte_size)

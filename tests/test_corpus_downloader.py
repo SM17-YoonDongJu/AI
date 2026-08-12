@@ -66,11 +66,12 @@ async def test_download_computes_sha256_and_size(tmp_path) -> None:
     client = FakeStreamingClient(_chunked(data, 7))
 
     # Act
-    result = await download_to_temp("https://x/f.pdf", str(tmp_path), client=client)
+    result = await download_to_temp("https://x/f.pdf", str(tmp_path), client=client, suffix=".pdf")
 
     # Assert: 청크 경계와 무관하게 해시·크기 정확
     assert result.byte_size == len(data)
     assert result.sha256 == hashlib.sha256(data).hexdigest()
+    assert result.temp_path.endswith(".pdf")  # suffix가 임시파일명에 반영됨
     with open(result.temp_path, "rb") as file:
         assert file.read() == data
     assert client.calls == [("GET", "https://x/f.pdf")]
@@ -82,7 +83,9 @@ async def test_download_handles_empty_stream(tmp_path) -> None:
     client = FakeStreamingClient([])
 
     # Act
-    result = await download_to_temp("https://x/empty.pdf", str(tmp_path), client=client)
+    result = await download_to_temp(
+        "https://x/empty.pdf", str(tmp_path), client=client, suffix=".pdf"
+    )
 
     # Assert
     assert result.byte_size == 0
@@ -96,6 +99,6 @@ async def test_download_removes_partial_temp_on_failure(tmp_path) -> None:
 
     # Act / Assert
     with pytest.raises(httpx.HTTPError):
-        await download_to_temp("https://x/f.pdf", str(tmp_path), client=client)
+        await download_to_temp("https://x/f.pdf", str(tmp_path), client=client, suffix=".pdf")
     # 부분 임시파일이 로컬에 남지 않아야 한다
     assert os.listdir(tmp_path) == []

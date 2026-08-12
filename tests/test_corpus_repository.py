@@ -134,8 +134,20 @@ async def test_claim_next_document_returns_none_when_queue_empty() -> None:
 async def test_list_parts_maps_and_orders_rows() -> None:
     # Arrange
     rows = [
-        {"id": uuid.UUID(PART0), "part_order": 0, "sha256": None, "status": "pending"},
-        {"id": uuid.UUID(PART1), "part_order": 1, "sha256": "abc", "status": "uploaded"},
+        {
+            "id": uuid.UUID(PART0),
+            "part_order": 0,
+            "notion_file_name": "약관.pdf",
+            "sha256": None,
+            "status": "pending",
+        },
+        {
+            "id": uuid.UUID(PART1),
+            "part_order": 1,
+            "notion_file_name": "특약.hwp",
+            "sha256": "abc",
+            "status": "uploaded",
+        },
     ]
     pool = FakePool(rows=rows)
 
@@ -145,7 +157,10 @@ async def test_list_parts_maps_and_orders_rows() -> None:
     # Assert
     assert [(part.part_order, part.status) for part in parts] == [(0, "pending"), (1, "uploaded")]
     assert parts[0].id == PART0
+    assert parts[0].notion_file_name == "약관.pdf"
     assert parts[1].sha256 == "abc"
+    assert parts[1].notion_file_name == "특약.hwp"
+    assert "notion_file_name" in pool.fetch_sql
     assert "ORDER BY part_order" in pool.fetch_sql
 
 
