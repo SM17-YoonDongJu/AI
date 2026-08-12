@@ -25,6 +25,10 @@ _SIMPLE_EXTENSIONS: dict[str, str] = {
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     ".txt": "text/plain",
     ".zip": "application/zip",
+    # 법령 원문(law.go.kr 등 API 응답을 마크다운화) · 판례/통계 메타데이터 사이드카.
+    # 둘 다 Notion "보험 약관 파일" DB에 정식 라이선스·수집상태로 첨부되는 실제 코퍼스 자료다.
+    ".md": "text/markdown",
+    ".json": "application/json",
 }
 
 

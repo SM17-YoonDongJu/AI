@@ -17,6 +17,14 @@ def test_detect_simple_extension() -> None:
     assert detect("안내문.txt") == FileType(ext=".txt", content_type="text/plain")
 
 
+def test_detect_recognizes_legal_markdown_and_metadata_json() -> None:
+    # law.go.kr 등에서 수집한 법령 원문(마크다운화)·판례 라벨링 사이드카(JSON)도 실제 코퍼스 자료다
+    assert detect("01_insurance-business-act.md") == FileType(
+        ext=".md", content_type="text/markdown"
+    )
+    assert detect("labels.json") == FileType(ext=".json", content_type="application/json")
+
+
 def test_detect_is_case_insensitive() -> None:
     assert detect("약관.PDF") == FileType(ext=".pdf", content_type="application/pdf")
 
