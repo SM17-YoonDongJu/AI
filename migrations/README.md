@@ -41,6 +41,7 @@ report_worker·chatbot은 마이그레이션을 실행하지 않는다(`run_migr
 | 005 | `005_ocr_results_id_default.sql` | `id` 기본값 복구 |
 | 006 | `006_ocr_results_original_delete_outbox.sql` | 원본 S3 삭제 outbox 컬럼 |
 | 007 | `007_report_drafts.sql` | `ai.report_drafts`(리포트 초안, report_worker 출력) |
+| 008 | `008_ocr_job_failures.sql` | `ai.ocr_job_failures`(OCR 처리 실패 저널 — 종결 실패 사용자 노출·운영 조회) |
 
 ## `corpus/` 적용 순서 (corpus_owner)
 

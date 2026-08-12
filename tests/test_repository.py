@@ -7,25 +7,31 @@
 (앱-DB 시계 스큐를 피하려고 시각도 SQL ``now()`` 기준). 페이크 풀은 SQL을 실행하지
 않으므로 여기서는 "어떤 SQL·인자로 부르는가"를 고정하고, 전이 결과 자체는 실 PG를
 쓰는 통합 테스트가 확인한다.
+
+실패 저널(``ai.ocr_job_failures``, 마이그레이션 008)도 같은 분업이다 — 업서트 전이
+(attempts 증가·terminal 단방향·failure_class 보존)는 SQL 문자열로 고정한다.
 """
 
 import json
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
 
-from core.contracts import DocType
+from core.contracts import DocType, OcrJob
 from ocr_worker.masking.spans import PiiLabel, Span
 from ocr_worker.ocr import OcrLine, OcrPage, OcrResult
 from ocr_worker.repository import (
     OcrResultRecord,
     PendingDeletion,
     build_masked_lines,
+    clear_job_failure,
     fetch_due_deletions,
+    mark_failure_terminal,
     record_delete_failure,
     record_delete_success,
+    record_job_failure,
     save_ocr_result,
 )
 
@@ -374,3 +380,169 @@ def test_build_masked_lines_catches_span_split_across_lines() -> None:
 
     assert masked_lines[0]["masked_text"] == "환자성명:"  # 라벨 라인엔 PII 없음 → 원문 유지
     assert masked_lines[1]["masked_text"] == "[이름]"  # 값 라인은 마스킹됨
+
+
+# ── 실패 저널(ai.ocr_job_failures, 마이그레이션 008) ─────────────
+# upsert 전이 자체(attempts 증가·terminal 단방향·failure_class 보존)는 **SQL 안**에서
+# 일어나므로 페이크 풀로는 실행할 수 없다. 여기서는 (a) 어떤 SQL·인자로 부르는가와
+# (b) 그 SQL이 전이 규칙을 실제로 담고 있는가를 문자열로 고정하고, 전이 결과는 실 PG를
+# 쓰는 통합 검증이 확인한다(save_ocr_result의 outbox CASE와 같은 분업).
+_FAILURE_JOB_ID = "44444444-4444-4444-4444-444444444444"
+_FAILURE_REPORT_ID = "55555555-5555-5555-5555-555555555555"
+_FAILURE_ATTACHMENT_ID = "66666666-6666-6666-6666-666666666666"
+
+
+def _job(**overrides: Any) -> OcrJob:
+    base: dict[str, Any] = {
+        "job_id": _FAILURE_JOB_ID,
+        "s3_key": "uploads/x.pdf",
+        "content_type": "application/pdf",
+        "user_ref": "user-1",
+        "doc_type_hint": "diagnosis",
+        "claim_id": "claim-9",
+        "report_id": _FAILURE_REPORT_ID,
+        "attachment_id": _FAILURE_ATTACHMENT_ID,
+        "uploaded_at": datetime(2026, 1, 1, tzinfo=UTC),
+    }
+    base.update(overrides)
+    return OcrJob(**base)
+
+
+async def test_record_job_failure_upserts_with_job_context() -> None:
+    # Arrange
+    pool = FakePool(None)
+
+    # Act
+    await record_job_failure(
+        pool,  # type: ignore[arg-type]
+        _job(),
+        failure_class="masking_residual",
+        error_type="MaskingError",
+        terminal=True,
+    )
+
+    # Assert: 스키마 한정 테이블 + 인자 순서 고정(컬럼 목록과 $n이 어긋나면 조용히 뒤섞인다).
+    sql, args = pool.calls[0]
+    assert "INSERT INTO ai.ocr_job_failures" in sql
+    assert args == (
+        uuid.UUID(_FAILURE_JOB_ID),
+        "uploads/x.pdf",
+        "user-1",
+        "application/pdf",
+        "diagnosis",
+        "claim-9",
+        uuid.UUID(_FAILURE_REPORT_ID),
+        uuid.UUID(_FAILURE_ATTACHMENT_ID),
+        "masking_residual",
+        "MaskingError",
+        True,
+    )
+
+
+async def test_record_job_failure_sql_accumulates_attempts_and_pins_terminal() -> None:
+    # 같은 job의 재실패가 새 행을 만들지 않고 attempts로 쌓여야 하고(멱등), 한 번 확정된
+    # terminal이 뒤늦은 재전달로 false로 되돌아가면 안 된다(단방향).
+    pool = FakePool(None)
+
+    await record_job_failure(
+        pool,  # type: ignore[arg-type]
+        _job(),
+        failure_class="ocr_error",
+        error_type="OcrError",
+        terminal=False,
+    )
+
+    sql = pool.calls[0][0]
+    assert "ON CONFLICT (job_id) DO UPDATE" in sql
+    assert "attempts = ocr_job_failures.attempts + 1" in sql
+    assert "terminal = EXCLUDED.terminal OR ocr_job_failures.terminal" in sql
+    assert "last_failed_at = now()" in sql  # 시각은 앱이 아니라 DB 기준(시계 스큐 회피)
+    # 최초 실패 시각은 불변 — SET에 들어가면 체류 시간 산출 근거가 매 실패마다 리셋된다.
+    assert "first_failed_at =" not in sql
+
+
+async def test_record_job_failure_tolerates_malformed_identifiers() -> None:
+    # 저널은 **다른 실패를 기록하는 마지막 방어선**이라 식별자 하나 때문에 예외를 던지면
+    # 원래 실패까지 통째로 사라진다. 형식이 깨진 UUID는 그 컬럼만 NULL로 비운다.
+    pool = FakePool(None)
+
+    await record_job_failure(
+        pool,  # type: ignore[arg-type]
+        _job(job_id="not-a-uuid", report_id="", attachment_id="also-bad"),
+        failure_class="unknown",
+        error_type="RuntimeError",
+        terminal=False,
+    )
+
+    args = pool.calls[0][1]
+    assert args[0] is None and args[6] is None and args[7] is None
+    assert args[1] == "uploads/x.pdf"  # 나머지 컨텍스트는 그대로 남는다
+
+
+async def test_clear_job_failure_deletes_by_job_id() -> None:
+    pool = FakePool(None)
+
+    await clear_job_failure(pool, _FAILURE_JOB_ID)  # type: ignore[arg-type]
+
+    sql, args = pool.calls[0]
+    assert sql.strip().startswith("DELETE FROM ai.ocr_job_failures")
+    assert args == (uuid.UUID(_FAILURE_JOB_ID),)
+
+
+async def test_clear_job_failure_skips_db_for_malformed_job_id() -> None:
+    # 기록될 수 없었던 키라 지울 행도 없다 — 굳이 왕복하지 않는다(또 예외를 만들지도 않는다).
+    pool = FakePool(None)
+
+    await clear_job_failure(pool, "not-a-uuid")  # type: ignore[arg-type]
+
+    assert pool.calls == []
+
+
+async def test_mark_failure_terminal_preserves_existing_failure_class() -> None:
+    # poison 훅은 "확정" 도장만 찍는다. 파이프라인이 남긴 구체적 분류(ocr_error 등)를
+    # unknown으로 덮으면 왜 실패했는지 알 수 없게 된다 → SET 절에 failure_class가 없어야 한다.
+    pool = FakePool(None)
+
+    await mark_failure_terminal(
+        pool,  # type: ignore[arg-type]
+        job=_job(),
+        message_id="m-1",
+        receive_count=6,
+    )
+
+    sql, args = pool.calls[0]
+    update_clause = sql.split("DO UPDATE SET", 1)[1]
+    assert "failure_class" not in update_clause  # 기존 분류 보존
+    assert "terminal = true" in update_clause
+    assert "'unknown'" in sql.split("ON CONFLICT", 1)[0]  # 신규 행일 때만 unknown
+    # attempts는 뒤로 가지 않는다 — receive_count와 저널 attempts는 세는 대상이 다르다.
+    assert "attempts = GREATEST(ocr_job_failures.attempts, EXCLUDED.attempts)" in update_clause
+    assert args == (
+        uuid.UUID(_FAILURE_JOB_ID),
+        "m-1",
+        "uploads/x.pdf",
+        "user-1",
+        "application/pdf",
+        "diagnosis",
+        "claim-9",
+        uuid.UUID(_FAILURE_REPORT_ID),
+        uuid.UUID(_FAILURE_ATTACHMENT_ID),
+        6,
+    )
+
+
+async def test_mark_failure_terminal_without_job_records_schema_invalid() -> None:
+    # 역직렬화조차 실패한 poison — job_id를 모르니 message_id만으로 추적한다.
+    pool = FakePool(None)
+
+    await mark_failure_terminal(
+        pool,  # type: ignore[arg-type]
+        job=None,
+        message_id="m-2",
+        receive_count=7,
+    )
+
+    sql, args = pool.calls[0]
+    assert "'schema_invalid'" in sql
+    assert "ON CONFLICT" not in sql  # job_id가 NULL이면 UNIQUE가 안 걸려 업서트 불가
+    assert args == ("m-2", 7)

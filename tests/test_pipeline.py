@@ -11,6 +11,9 @@ SQS·DB·GPU·PIL 없이 경계(프로듀서·풀·OCR 프로세서·이미지 �
   ``ReportJob`` 발행이 그 완료를 기다리지 않는가(fire-and-forget).
 - 삭제 outbox: 저장이 삭제 대상('pending')·비대상('not_eligible')을 남기는가, 즉시
   삭제의 성공/실패가 outbox에 반영되는가, 스윕이 남은 건을 재시도·기록하는가.
+- 실패 저널: 결정적 실패는 terminal=true로, 일시 실패는 false로 남기고 원래 예외를
+  전파하는가. 기록 자체가 실패하면 결정적 실패만 **재시도 가능한 예외로 바꿔** 던지는가
+  (컨슈머가 즉시 ack해 무음 유실이 되지 않게). 성공·멱등 단락이 저널을 정리하는가.
 
 마스킹 자체(정규식·NER)의 정확성은 test_masking 계열이 다룬다 — 여기서는 실제
 기본 마스커(정규식, torch 불필요)를 써 배선이 실제로 PII를 가리는지까지 확인한다.
@@ -27,7 +30,7 @@ from structlog.testing import capture_logs
 
 from core.config import Settings
 from core.contracts import DocType, OcrJob, ReportJob
-from core.exceptions import OcrError
+from core.exceptions import NonRetryableError, OcrError, UnreadableFileError
 from ocr_worker import pipeline as pipeline_module
 from ocr_worker.masking.image_masker import ImageMasker
 from ocr_worker.masking.spans import PiiLabel, Span
@@ -58,10 +61,13 @@ class FakeProducer:
 
 
 class FakePool:
-    """asyncpg.Pool.fetchrow 대역 — SELECT(멱등 조회)와 INSERT(업서트)를 구분해 응답한다."""
+    """asyncpg.Pool 대역 — SELECT(멱등 조회)·INSERT(업서트)·실패 저널 쓰기를 받아 기록한다."""
 
-    def __init__(self, existing: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self, existing: dict[str, Any] | None = None, *, execute_error: Exception | None = None
+    ) -> None:
         self._existing = existing
+        self._execute_error = execute_error  # 저널 쓰기(DB) 장애 흉내
         self.calls: list[tuple[str, tuple[Any, ...]]] = []
 
     async def fetchrow(self, sql: str, *args: Any) -> dict[str, Any] | None:
@@ -70,8 +76,23 @@ class FakePool:
             return self._existing
         return {"id": _SAVE_ID}  # 업서트 RETURNING id
 
+    async def execute(self, sql: str, *args: Any) -> None:
+        # 실제 DB 왕복처럼 루프에 양보한다. 이게 없으면 저널 쓰기를 await하지 않고
+        # task로 흘려보내는 구현(예외가 먼저 전파되는 회귀)도 테스트를 통과해버린다.
+        await asyncio.sleep(0)
+        self.calls.append((sql, args))
+        if self._execute_error is not None:
+            raise self._execute_error
+
     def insert_calls(self) -> list[tuple[str, tuple[Any, ...]]]:
-        return [call for call in self.calls if "INSERT" in call[0]]
+        """``ocr_results`` 업서트만 추린다(실패 저널 쓰기는 제외 — 별도 테이블·별도 계약)."""
+        return [
+            call for call in self.calls if "INSERT" in call[0] and "ocr_job_failures" not in call[0]
+        ]
+
+    def journal_calls(self) -> list[tuple[str, tuple[Any, ...]]]:
+        """실패 저널(``ai.ocr_job_failures``)로 나간 쓰기만 추린다."""
+        return [call for call in self.calls if "ai.ocr_job_failures" in call[0]]
 
 
 class _FakeImage:
@@ -1646,3 +1667,181 @@ async def test_masking_residual_raises_and_skips_persist() -> None:
     # PII를 저장·발행하지 않는다(fail-closed).
     assert pool.insert_calls() == []
     assert producer.published == []
+
+
+# ── 실패 저널(ai.ocr_job_failures) ───────────────────────────────
+# 저널이 붙기 전엔 위 fail-closed 격리가 **아무 기록도 남기지 않았다** — 사용자에겐
+# 업로드가 조용히 증발하는 무음 실패였다. 아래 테스트는 세 경로(결정적·일시·회복)와
+# "저널이 원래 예외를 가리지 않는다"는 규칙을 고정한다.
+# 업서트 인자 순서는 test_repository가 고정하므로 여기서는 분류·terminal·호출 여부만 본다.
+_JOURNAL_FAILURE_CLASS_ARG = 8  # $9 failure_class
+_JOURNAL_ERROR_TYPE_ARG = 9  # $10 error_type
+_JOURNAL_TERMINAL_ARG = 10  # $11 terminal
+
+
+def _journal_entry(pool: FakePool) -> tuple[str, str, bool]:
+    """저널 쓰기 1건에서 (failure_class, error_type, terminal)을 뽑는다."""
+    calls = pool.journal_calls()
+    assert len(calls) == 1, f"저널 쓰기 1건이어야 한다: {len(calls)}건"
+    args = calls[0][1]
+    return (
+        args[_JOURNAL_FAILURE_CLASS_ARG],
+        args[_JOURNAL_ERROR_TYPE_ARG],
+        args[_JOURNAL_TERMINAL_ARG],
+    )
+
+
+def _context_chain(exc: BaseException) -> list[BaseException]:
+    """``__context__``를 따라간 예외 체인(자기 자신 제외)."""
+    chain: list[BaseException] = []
+    current = exc.__context__
+    while current is not None and current not in chain:
+        chain.append(current)
+        current = current.__context__
+    return chain
+
+
+class _RaisingProcessor:
+    """``process_with_images``가 정해진 예외를 던지는 프로세서 대역."""
+
+    def __init__(self, error: Exception) -> None:
+        self._error = error
+        self.engine = None
+
+    async def process_with_images(
+        self, s3_key: str, content_type: str
+    ) -> tuple[OcrResult, list[object]]:
+        raise self._error
+
+
+async def test_masking_residual_is_journaled_as_terminal_then_reraised() -> None:
+    # Arrange: 마스킹을 안 하는 마스커 → 주민번호 잔류 → MaskingError(결정적).
+    pool = FakePool(existing=None)
+    processor = FakeProcessor(_result("홍길동 901010-1234567"))
+    pipeline = _pipeline(pool, FakeProducer(), processor, masker=_IdentityMasker())
+
+    # Act / Assert: 원래 예외를 그대로 올려야 컨슈머가 즉시 ack할 수 있다.
+    with pytest.raises(MaskingError):
+        await pipeline.handle(_job())
+
+    # 예외가 나가기 **전에** 기록이 끝나 있어야 한다 — 컨슈머가 곧바로 메시지를 지우므로
+    # 이 순서가 깨지면 저널에도 큐에도 아무것도 남지 않는다.
+    assert _journal_entry(pool) == ("masking_residual", "MaskingError", True)
+
+
+async def test_unreadable_file_is_journaled_as_terminal_not_transient_ocr_error() -> None:
+    # UnreadableFileError는 OcrError이기도 하다. except 순서가 뒤집혀 일반 OcrError로
+    # 잡히면 확정 실패가 terminal=False로 남고 컨슈머는 재전달을 반복한다.
+    pool = FakePool(existing=None)
+    pipeline = _pipeline(
+        pool, FakeProducer(), _RaisingProcessor(UnreadableFileError("PDF 렌더 실패"))
+    )
+
+    with pytest.raises(UnreadableFileError):
+        await pipeline.handle(_job())
+
+    assert _journal_entry(pool) == ("unreadable_file", "UnreadableFileError", True)
+
+
+async def test_terminal_journal_failure_raises_retryable_error_instead() -> None:
+    # Arrange: 저널 DB가 죽었다. 원래 예외(NonRetryable)를 그대로 올리면 컨슈머가
+    # 메시지를 지워버려 기록도 메시지도 없는 무음 유실이 된다.
+    pool = FakePool(existing=None, execute_error=RuntimeError("저널 DB 다운"))
+    processor = FakeProcessor(_result("홍길동 901010-1234567"))
+    pipeline = _pipeline(pool, FakeProducer(), processor, masker=_IdentityMasker())
+
+    # Act
+    # MaskingError는 RuntimeError가 아니므로, 변환이 사라지면 여기서 바로 깨진다.
+    with pytest.raises(RuntimeError) as exc_info:
+        await pipeline.handle(_job())
+
+    # Assert: 재시도 가능한 예외로 바뀌어 나간다 → 컨슈머가 삭제하지 않고 재전달한다.
+    # (변환 예외에 마커를 달아버리는 회귀도 막는다 — 그러면 다시 즉시 ack된다.)
+    assert not isinstance(exc_info.value, NonRetryableError)
+    # 원인은 유실되지 않는다 — 저널 예외가 직접 원인이고, 그 뒤로 원래 결정적 실패가
+    # 예외 체인에 남아 트레이스백만으로 "무엇을 기록하려다 실패했는가"가 읽힌다.
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
+    assert any(isinstance(exc, MaskingError) for exc in _context_chain(exc_info.value))
+
+
+async def test_transient_ocr_error_is_journaled_as_non_terminal() -> None:
+    # 일시 실패는 재전달로 회복될 수 있다 — terminal로 굳히면 사용자에게 없는 확정
+    # 실패를 노출하게 된다.
+    pool = FakePool(existing=None)
+    pipeline = _pipeline(pool, FakeProducer(), _RaisingProcessor(OcrError("S3 다운로드 실패")))
+
+    with pytest.raises(OcrError):
+        await pipeline.handle(_job())
+
+    assert _journal_entry(pool) == ("ocr_error", "OcrError", False)
+
+
+async def test_unclassified_transient_error_falls_back_to_unknown() -> None:
+    # 분류 못 하는 예외도 기록은 남긴다 — CHECK 제약을 어겨 기록 자체가 실패하면
+    # 원래 없애려던 무음 실패로 되돌아간다.
+    pool = FakePool(existing=None)
+    pipeline = _pipeline(pool, FakeProducer(), _RaisingProcessor(ValueError("예상 못한 오류")))
+
+    with pytest.raises(ValueError):
+        await pipeline.handle(_job())
+
+    assert _journal_entry(pool) == ("unknown", "ValueError", False)
+
+
+async def test_transient_journal_failure_does_not_mask_original_error() -> None:
+    # 일시 실패 경로에선 저널 실패를 삼킨다 — 원래 예외가 이미 재전달을 유발하므로
+    # 저널 예외로 원인을 가리면 진단만 어려워진다.
+    pool = FakePool(existing=None, execute_error=RuntimeError("저널 DB 다운"))
+    pipeline = _pipeline(pool, FakeProducer(), _RaisingProcessor(OcrError("S3 다운로드 실패")))
+
+    # RuntimeError(저널 실패)가 아니라 원래 예외가 나와야 한다.
+    with capture_logs() as logs, pytest.raises(OcrError):
+        await pipeline.handle(_job())
+
+    warned = [e for e in logs if e["event"] == "ocr_job_failure_journal_failed"]
+    assert len(warned) == 1
+    assert warned[0]["error_type"] == "RuntimeError"  # 예외는 타입만 남긴다(§9)
+    assert warned[0]["original_error_type"] == "OcrError"
+
+
+async def test_success_clears_failure_journal() -> None:
+    # 이전 시도가 남긴 일시 실패 행을 지운다. 남겨두면 이미 처리된 작업이 계속
+    # "실패"로 조회된다.
+    pool = FakePool(existing=None)
+    producer = FakeProducer()
+    pipeline = _pipeline(pool, producer, FakeProcessor(_result("보험증권", "증권번호 202301-042")))
+
+    await pipeline.handle(_job())
+
+    cleared = pool.journal_calls()
+    assert len(cleared) == 1
+    assert cleared[0][0].strip().startswith("DELETE FROM ai.ocr_job_failures")
+    assert cleared[0][1] == (uuid.UUID(_JOB_ID),)
+    assert len(producer.published) == 1  # 정리는 발행을 막지 않는다
+
+
+async def test_idempotent_short_circuit_clears_failure_journal() -> None:
+    # 저장은 됐는데 발행 직전에 죽어 실패로 기록된 작업이 재전달로 여기 도달한다 —
+    # 재발행으로 끝났으니 저널도 함께 정리해야 한다.
+    pool = FakePool(existing={"id": _EXISTING_ID, "doc_type": "policy", "ocr_quality": "ok"})
+    pipeline = _pipeline(pool, FakeProducer(), FakeProcessor(_result("무시됨")))
+
+    await pipeline.handle(_job())
+
+    cleared = pool.journal_calls()
+    assert len(cleared) == 1
+    assert cleared[0][0].strip().startswith("DELETE FROM ai.ocr_job_failures")
+
+
+async def test_clear_failure_error_does_not_fail_the_job() -> None:
+    # 저장·발행이 끝난 작업을 남은 저널 행 하나 때문에 실패로 뒤집지 않는다.
+    pool = FakePool(existing=None, execute_error=RuntimeError("저널 DB 다운"))
+    producer = FakeProducer()
+    pipeline = _pipeline(pool, producer, FakeProcessor(_result("보험증권", "증권번호 202301-042")))
+
+    with capture_logs() as logs:
+        await pipeline.handle(_job())  # 예외 없음
+
+    assert len(producer.published) == 1
+    warned = [e for e in logs if e["event"] == "ocr_job_failure_clear_failed"]
+    assert [e["error_type"] for e in warned] == ["RuntimeError"]

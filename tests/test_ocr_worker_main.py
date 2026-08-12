@@ -10,14 +10,20 @@
 - 사이클 진행 중(S3 왕복 중) 취소는 **삼키지 않고** 전파된다 — 취소를 흡수한 채 루프를
   계속 돌면 종료가 지연되고, 취소 시점의 행은 outbox에 ``pending``으로 남아야 한다
   (기록 없이 취소되는지는 ``test_pipeline`` 쪽 스윕 취소 테스트가 본다).
+
+같은 진입점이 배선하는 poison 저널 훅(``_poison_journal``)도 여기서 다룬다 — 컨슈머가
+poison 메시지를 삭제하기 직전의 **마지막 기록 기회**라, 훅이 조용히 실패하면 걷어내기가
+곧 무음 유실이 된다.
 """
 
 import asyncio
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
 
 from core.config import Settings
+from core.contracts import OcrJob
 from ocr_worker import __main__ as ocr_main
 
 # 루프가 멈추지 않는 회귀가 나도 테스트가 영원히 매달리지 않도록 두는 상한(초).
@@ -179,3 +185,68 @@ def _run_source() -> str:
 
     source: Any = inspect.getsource(ocr_main._run)
     return str(source)
+
+
+# ── poison 저널 훅 ───────────────────────────────────────────────
+# 훅은 컨슈머가 poison 메시지를 **삭제하기 직전**의 마지막 기록 기회다. 얇지만 계약이
+# 둘 있다: (a) 파싱 결과를 그대로 리포지토리에 넘긴다, (b) 예외를 삼키지 않는다.
+class _FakeJournal:
+    """``mark_failure_terminal`` 대역 — 호출 인자를 포착하고 선택적으로 실패한다."""
+
+    def __init__(self, error: Exception | None = None) -> None:
+        self.calls: list[tuple[Any, str, int]] = []
+        self._error = error
+
+    async def __call__(self, pool: Any, *, job: Any, message_id: str, receive_count: int) -> None:
+        self.calls.append((job, message_id, receive_count))
+        if self._error is not None:
+            raise self._error
+
+
+def _job(job_id: str = "11111111-1111-1111-1111-111111111111") -> OcrJob:
+    return OcrJob(
+        job_id=job_id,
+        s3_key="uploads/x.pdf",
+        content_type="application/pdf",
+        user_ref="user-1",
+        report_id="aaaaaaaa-0000-0000-0000-000000000001",
+        attachment_id="aaaaaaaa-0000-0000-0000-000000000002",
+        uploaded_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+
+
+async def test_poison_hook_journals_parsed_job(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Arrange
+    journal = _FakeJournal()
+    monkeypatch.setattr(ocr_main, "mark_failure_terminal", journal)
+    hook = ocr_main._poison_journal(object())  # type: ignore[arg-type]
+    job = _job()
+
+    # Act
+    await hook(job, "m-1", 6)
+
+    # Assert: 컨슈머가 넘긴 (모델, message_id, receive_count)를 그대로 전달한다.
+    assert journal.calls == [(job, "m-1", 6)]
+
+
+async def test_poison_hook_journals_unparsable_message(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 역직렬화조차 실패한 메시지도 message_id로 흔적을 남겨야 한다(job=None 패스스루).
+    journal = _FakeJournal()
+    monkeypatch.setattr(ocr_main, "mark_failure_terminal", journal)
+    hook = ocr_main._poison_journal(object())  # type: ignore[arg-type]
+
+    await hook(None, "m-2", 7)
+
+    assert journal.calls == [(None, "m-2", 7)]
+
+
+async def test_poison_hook_propagates_journal_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Arrange: 컨슈머는 훅의 성공 여부로 삭제/보류를 정한다. 훅이 예외를 삼키면
+    # 컨슈머가 성공으로 오인해 메시지를 지우고, 기록도 메시지도 없는 무음 유실이 된다.
+    journal = _FakeJournal(error=RuntimeError("저널 DB 다운"))
+    monkeypatch.setattr(ocr_main, "mark_failure_terminal", journal)
+    hook = ocr_main._poison_journal(object())  # type: ignore[arg-type]
+
+    # Act / Assert
+    with pytest.raises(RuntimeError):
+        await hook(_job(), "m-3", 6)

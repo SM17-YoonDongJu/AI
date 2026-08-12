@@ -8,7 +8,9 @@
   db_pool → run_migrations → SqsProducer(ReportJob 발행) → 삭제 스윕 task +
   SqsConsumer.run()
 ``SqsConsumer``는 롱폴링으로 소비하고 SIGTERM/SIGINT에 우아하게 멈춘다(DLQ 미도입 —
-실패=삭제 안 함으로 재전달, poison은 수신 횟수 상한으로 스킵).
+실패=삭제 안 함으로 재전달, poison은 수신 횟수 상한으로 스킵). 스킵 직전에는
+``_poison_journal`` 훅이 ``ai.ocr_job_failures``에 확정 실패를 남긴다 — 걷어내기가
+"조용한 유실"이 되지 않게 하는 마지막 기록 지점이다.
 소비 루프와 **병행해** 원본 삭제 outbox 스윕(``_run_delete_sweep``)을 주기적으로 돈다 —
 즉시 삭제가 실패했거나 그 전에 crash가 나 ``pending``으로 남은 원본을 재시도한다.
 소비 루프가 멈춘 뒤에는 스윕 task를 정리하고, 파이프라인이 백그라운드로 돌리는 S3 원본
@@ -18,6 +20,9 @@
 
 import asyncio
 import contextlib
+from collections.abc import Awaitable, Callable
+
+import asyncpg
 
 from core.config import Settings, get_settings
 from core.contracts import OcrJob
@@ -26,6 +31,7 @@ from core.logging import configure_logging, get_logger
 from core.sqs.consumer import SqsConsumer
 from core.sqs.producer import SqsProducer
 from ocr_worker.pipeline import OcrPipeline
+from ocr_worker.repository import mark_failure_terminal
 
 logger = get_logger(__name__)
 
@@ -59,6 +65,7 @@ async def _run() -> None:
             schema=OcrJob,
             handler=pipeline.handle,
             settings=settings,
+            on_poison=_poison_journal(pool),
         )
         logger.info("ocr worker starting", queue_url=settings.sqs_ocr_job_queue_url)
         # 소비와 병행해 도는 outbox 스윕. 소비 루프와 독립적이라 gather로 묶지 않고
@@ -88,6 +95,32 @@ async def _run() -> None:
             with contextlib.suppress(TimeoutError):
                 async with asyncio.timeout(_SHUTDOWN_DELETE_TIMEOUT_S):
                     await pipeline.wait_for_pending_deletes()
+
+
+def _poison_journal(pool: asyncpg.Pool) -> Callable[[OcrJob | None, str, int], Awaitable[None]]:
+    """poison 메시지를 걷어내기 직전 실패 저널에 확정 기록하는 훅을 만든다.
+
+    컨슈머의 poison 가드는 수신 횟수 상한을 넘긴 메시지를 **삭제**한다. 그게 마지막
+    기회라, 여기서 기록하지 않으면 사용자는 원인 조회조차 불가능한 무음 실패를 겪는다.
+
+    **예외를 삼키지 않는다** — 컨슈머가 훅의 성공 여부로 삭제/보류를 정하기 때문이다
+    (``_run_poison_hook``). 여기서 잡아 로그만 남기면 컨슈머는 성공으로 오인해 메시지를
+    지우고, 정확히 이 함수가 막으려던 무음 실패가 다시 생긴다. 훅은 얇게 두고 판단은
+    호출부에 맡긴다.
+
+    Args:
+        pool: asyncpg 연결 풀(워커 수명과 같다 — 클로저로 잡아 둔다).
+
+    Returns:
+        ``SqsConsumer(on_poison=...)``에 넘길 훅.
+    """
+
+    async def on_poison(job: OcrJob | None, message_id: str, receive_count: int) -> None:
+        await mark_failure_terminal(
+            pool, job=job, message_id=message_id, receive_count=receive_count
+        )
+
+    return on_poison
 
 
 async def _run_delete_sweep(

@@ -15,6 +15,10 @@ OCR·분류·추출·마스킹의 산출물을 ``ocr_results``(contracts.md §3)
 - **원본 삭제 outbox**: 마스킹 검증을 통과해 지워야 할 원본 S3 키와 그 시도 상태를
   같은 행(``original_delete_*``)에 담는다. 저장과 같은 트랜잭션이라 삭제 전에 crash가
   나도 ``pending`` 행이 남아 워커 스윕(``pipeline.sweep_pending_deletes``)이 이어받는다.
+- **실패 저널**(``ai.ocr_job_failures``, 마이그레이션 008): 처리에 실패한 작업을 한 행으로
+  남긴다. ``job_id`` 업서트라 반복 실패가 ``attempts``로 쌓이고, 회복하면 파이프라인이
+  행을 지운다. ``terminal``은 단방향(false→true) — 확정 실패 판정이 재전달 한 번으로
+  되돌아가지 않게 한다. 예외 **메시지는 저장하지 않는다**(클래스명만, §9).
 """
 
 import json
@@ -23,7 +27,7 @@ from dataclasses import dataclass, field
 
 import asyncpg
 
-from core.contracts import DocType
+from core.contracts import DocType, OcrJob
 from core.logging import get_logger
 from ocr_worker.masking.image_masker import (
     DetectFn,
@@ -116,6 +120,69 @@ WHERE original_delete_status = 'pending'
 ORDER BY original_delete_next_attempt_at NULLS FIRST
 LIMIT $1
 FOR UPDATE SKIP LOCKED
+"""
+
+# ── 실패 저널(ai.ocr_job_failures, 마이그레이션 008) ─────────────
+# 스키마를 명시(ai.)한다 — search_path에 기대지 않는다(#48~#52 소유권 사건 이후 관례).
+#
+# job_id 업서트라 같은 작업의 반복 실패가 새 행을 만들지 않고 attempts로 쌓인다.
+# ON CONFLICT DO UPDATE의 SET 절에서 **기존 행은 스키마 없는 테이블명**으로 참조한다
+# (`ocr_job_failures.attempts`) — range table 엔트리 이름이 `ocr_job_failures`라
+# `ai.ocr_job_failures.attempts`로 쓰면 "missing FROM-clause entry"가 난다.
+#
+# terminal은 `EXCLUDED.terminal OR ocr_job_failures.terminal`로 **단방향**(false→true)이다.
+# 확정 실패로 판정된 작업이 뒤늦은 재전달 한 번으로 "아직 진행 중"으로 되돌아가면,
+# 사용자에게 이미 노출한 실패가 근거 없이 사라진다.
+# first_failed_at은 갱신하지 않는다(최초 실패 시각은 불변 — 체류 시간 산출 근거).
+# 시각은 전부 SQL의 now() 기준(앱-DB 시계 스큐 회피 — outbox 관례와 동일).
+_UPSERT_JOB_FAILURE_SQL = """
+INSERT INTO ai.ocr_job_failures (
+    job_id, s3_key, user_ref, content_type, doc_type_hint, claim_id,
+    report_id, attachment_id, failure_class, error_type, attempts, terminal
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 1, $11)
+ON CONFLICT (job_id) DO UPDATE SET
+    attempts = ocr_job_failures.attempts + 1,
+    last_failed_at = now(),
+    terminal = EXCLUDED.terminal OR ocr_job_failures.terminal,
+    failure_class = EXCLUDED.failure_class,
+    error_type = EXCLUDED.error_type,
+    s3_key = EXCLUDED.s3_key,
+    user_ref = EXCLUDED.user_ref,
+    content_type = EXCLUDED.content_type,
+    doc_type_hint = EXCLUDED.doc_type_hint,
+    claim_id = EXCLUDED.claim_id,
+    report_id = EXCLUDED.report_id,
+    attachment_id = EXCLUDED.attachment_id
+"""
+
+# 회복(재전달 후 성공)한 작업의 저널 정리. 남겨두면 이미 처리된 작업이 실패로 조회된다.
+_CLEAR_JOB_FAILURE_SQL = "DELETE FROM ai.ocr_job_failures WHERE job_id = $1"
+
+# poison 훅 전용 — 확정 실패 도장. failure_class를 SET 절에 **넣지 않아** 기존 행의
+# 분류(예: masking_residual)를 보존한다. 행이 없을 때만 'unknown'으로 삽입된다.
+# attempts는 GREATEST로 뒤로 가지 않게 한다 — receive_count(SQS 전달 횟수)와 저널의
+# attempts(핸들러 실패 횟수)는 세는 대상이 달라 어느 쪽이 클지 정해져 있지 않다.
+_MARK_JOB_FAILURE_TERMINAL_SQL = """
+INSERT INTO ai.ocr_job_failures (
+    job_id, message_id, s3_key, user_ref, content_type, doc_type_hint, claim_id,
+    report_id, attachment_id, failure_class, attempts, terminal
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'unknown', $10, true)
+ON CONFLICT (job_id) DO UPDATE SET
+    terminal = true,
+    message_id = EXCLUDED.message_id,
+    attempts = GREATEST(ocr_job_failures.attempts, EXCLUDED.attempts),
+    last_failed_at = now()
+"""
+
+# 역직렬화조차 안 되는 poison — job_id를 모르니 message_id로만 추적한다.
+# job_id가 NULL이면 UNIQUE 제약이 걸리지 않아(NULL은 서로 충돌하지 않음) 업서트가
+# 불가능하다 → 순수 INSERT다. 훅 성공 후에만 메시지가 삭제되므로 보통 1건이지만,
+# 삭제 자체가 실패해 재전달되면 같은 message_id로 행이 하나 더 생길 수 있다.
+# 추적 목적상 중복은 무해하고(같은 message_id로 묶어 보면 된다), 이를 막자고
+# 유니크 인덱스를 더하면 "기록조차 못 남기는" 실패 모드가 새로 생긴다.
+_INSERT_UNPARSED_FAILURE_SQL = """
+INSERT INTO ai.ocr_job_failures (message_id, failure_class, attempts, terminal)
+VALUES ($1, 'schema_invalid', $2, true)
 """
 
 
@@ -366,3 +433,133 @@ async def fetch_due_deletions(pool: asyncpg.Pool, limit: int) -> list[PendingDel
         )
         for row in rows
     ]
+
+
+# ── 실패 저널 ────────────────────────────────────────────────────
+def _as_uuid(value: str | None, *, field_name: str) -> uuid.UUID | None:
+    """UUID 문자열을 관대하게 변환한다(빈 값·형식 오류면 ``None``).
+
+    실패 저널은 **다른 실패를 기록하는 마지막 방어선**이라, 여기서 예외를 던지면
+    원래 실패까지 통째로 삼켜 무음 실패가 된다. 식별자 하나가 형식에 안 맞으면
+    그 컬럼만 비우고 나머지는 남긴다 — "일부만 아는 기록"이 "기록 없음"보다 낫다.
+    값 자체는 로그에 남기지 않고 어떤 필드였는지만 남긴다.
+
+    ``job_id``가 UUID가 아니면(``OcrJob.job_id``는 형식 검증 없는 ``str``이라 통과할 수
+    있다) 멱등 키가 NULL이 되고, NULL은 UNIQUE 충돌을 일으키지 않아 재실패마다 행이
+    하나씩 늘어난다(실측). 수신 횟수 상한이 상한선이라 메시지당 몇 행 수준이고, 이를
+    막자고 예외를 던지면 위의 "기록 없음"으로 되돌아간다 — 중복을 감수한다.
+    """
+    if not value:
+        return None
+    try:
+        return uuid.UUID(value)
+    except ValueError:
+        logger.warning("ocr_job_failure_invalid_uuid", field=field_name)
+        return None
+
+
+async def record_job_failure(
+    pool: asyncpg.Pool, job: OcrJob, *, failure_class: str, error_type: str, terminal: bool
+) -> None:
+    """OCR 작업 실패를 ``ai.ocr_job_failures``에 업서트한다(``job_id`` 멱등).
+
+    같은 작업이 재전달돼 또 실패하면 새 행이 아니라 ``attempts``가 늘고
+    ``last_failed_at``이 갱신된다. ``terminal``은 단방향이라, 이미 확정 실패로
+    기록된 작업은 이후 호출이 ``terminal=False``여도 확정 상태를 유지한다.
+
+    Args:
+        pool: asyncpg 연결 풀(core.db).
+        job: 실패한 작업(식별자·S3 키 등 비-PII 컨텍스트를 함께 남긴다).
+        failure_class: 실패 분류(마이그레이션 008의 CHECK 목록 중 하나).
+        error_type: 예외 **클래스명만**. 메시지 문자열은 넘기지 않는다(§9) —
+            정형화되지 않은 예외 문자열에 OCR 원문 조각이 섞일 수 있다.
+        terminal: 확정 실패(사용자 노출 대상)인가.
+    """
+    await pool.execute(
+        _UPSERT_JOB_FAILURE_SQL,
+        _as_uuid(job.job_id, field_name="job_id"),
+        job.s3_key,
+        job.user_ref,
+        job.content_type,
+        job.doc_type_hint,
+        job.claim_id,
+        _as_uuid(job.report_id, field_name="report_id"),
+        _as_uuid(job.attachment_id, field_name="attachment_id"),
+        failure_class,
+        error_type,
+        terminal,
+    )
+    logger.info(
+        "ocr_job_failure_recorded",
+        job_id=job.job_id,
+        failure_class=failure_class,
+        error_type=error_type,
+        terminal=terminal,
+    )
+
+
+async def clear_job_failure(pool: asyncpg.Pool, job_id: str) -> None:
+    """회복한 작업의 실패 저널 행을 지운다(없으면 아무 일도 하지 않는다).
+
+    일시 실패(``terminal=false``)로 기록됐다가 재전달에서 성공한 작업이 계속
+    "실패"로 조회되지 않게 한다. 확정 실패(``terminal=true``) 행도 함께 지워지지만,
+    그 경로는 애초에 성공으로 끝나지 않으므로 여기에 도달하지 않는다.
+
+    Args:
+        pool: asyncpg 연결 풀(core.db).
+        job_id: OCR 작업 식별자(UUID 문자열).
+    """
+    job_uuid = _as_uuid(job_id, field_name="job_id")
+    if job_uuid is None:
+        return  # 애초에 기록될 수 없는 키 — 지울 행도 없다
+    await pool.execute(_CLEAR_JOB_FAILURE_SQL, job_uuid)
+
+
+async def mark_failure_terminal(
+    pool: asyncpg.Pool, *, job: OcrJob | None, message_id: str, receive_count: int
+) -> None:
+    """poison 메시지를 확정 실패로 도장 찍는다(``SqsConsumer.on_poison`` 훅용).
+
+    컨슈머가 수신 횟수 상한을 넘긴 메시지를 큐에서 걷어내기 **직전**에 부른다 —
+    이게 마지막 기록 기회다. 여기서 실패하면 컨슈머가 삭제를 보류하므로, 이 함수가
+    성공했다는 것은 곧 "추적 근거를 남겼다"는 뜻이 된다.
+
+    두 갈래를 다룬다:
+    - ``job``이 있으면(본문은 유효했으나 처리가 계속 실패) ``job_id`` 업서트로
+      ``terminal=true``를 확정한다. 기존 행이 있으면 그 ``failure_class``를
+      **보존**한다 — 파이프라인이 남긴 구체적 분류(예: ``ocr_error``)가
+      ``unknown``으로 덮이면 왜 실패했는지 알 수 없게 된다.
+    - ``job``이 없으면(역직렬화조차 실패) ``job_id``를 모르므로 ``message_id``로만
+      ``schema_invalid`` 행을 남긴다.
+
+    Args:
+        pool: asyncpg 연결 풀(core.db).
+        job: 파싱된 작업. 스키마 위반이면 ``None``.
+        message_id: SQS MessageId(``job``이 없을 때의 유일한 추적 키).
+        receive_count: ``ApproximateReceiveCount``(재전달 횟수).
+    """
+    if job is None:
+        await pool.execute(_INSERT_UNPARSED_FAILURE_SQL, message_id, receive_count)
+        logger.error(
+            "ocr_job_failure_terminal", message_id=message_id, failure_class="schema_invalid"
+        )
+        return
+    await pool.execute(
+        _MARK_JOB_FAILURE_TERMINAL_SQL,
+        _as_uuid(job.job_id, field_name="job_id"),
+        message_id,
+        job.s3_key,
+        job.user_ref,
+        job.content_type,
+        job.doc_type_hint,
+        job.claim_id,
+        _as_uuid(job.report_id, field_name="report_id"),
+        _as_uuid(job.attachment_id, field_name="attachment_id"),
+        receive_count,
+    )
+    logger.error(
+        "ocr_job_failure_terminal",
+        job_id=job.job_id,
+        message_id=message_id,
+        receive_count=receive_count,
+    )

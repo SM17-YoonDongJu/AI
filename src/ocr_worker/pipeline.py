@@ -13,8 +13,19 @@
   안전해야 한다 → 위 멱등 단락 + 결정적 ``report_id``(``ocr_result_id`` 파생)로 완전 멱등을 만든다.
 - **실패 격리(DLQ 미도입)**: 핸들러가 예외를 던지면 컨슈머가 삭제하지 않아 재전달되고,
   끝내 못 살리면 수신 횟수 상한(poison 가드)에서 스킵한다. 마스킹 잔류 검증 실패
-  (``MaskingError``)도 예외로 전파해 **PII를 저장하지 않고** 격리한다(fail-closed) — 결정적
-  오류라 재전달마다 같은 실패를 반복하다 상한에서 스킵되며, PII는 끝내 저장되지 않는다.
+  (``MaskingError``)도 예외로 전파해 **PII를 저장하지 않고** 격리한다(fail-closed).
+
+실패 저널(``ai.ocr_job_failures``, 마이그레이션 008): 예전엔 위 격리가 **아무 기록도
+남기지 않았다** — 사용자는 업로드가 조용히 증발하는 무음 실패를 겪었고, 운영은 로그를
+뒤지는 것 말고 조회 수단이 없었다. 이제 ``handle``이 모든 실패를 저널에 남긴다:
+- **결정적 실패**(``NonRetryableError`` — 마스킹 잔류·파일 디코드 실패): ``terminal=True``로
+  기록한 뒤 원래 예외를 그대로 올린다. 컨슈머가 이 타입을 보고 **첫 시도에서 즉시 ack**
+  하므로(``core.sqs.consumer``) 재전달 낭비 없이 사용자 신호가 바로 뜬다.
+- **일시 실패**(그 외): ``terminal=False``로 기록하고 예외를 올려 재전달에 맡긴다.
+  기록 자체가 실패해도 삼키고 경고만 남긴다 — 저널이 원래 예외를 가려선 안 된다.
+- **회복**: 성공 경로(멱등 단락 포함) 끝에서 저널 행을 지운다. 남겨두면 이미 처리된
+  작업이 계속 실패로 조회된다. 이 DELETE 실패는 작업의 성공을 뒤집지 않는다(경고만).
+- 기록이 실패한 결정적 실패는 **재시도 가능한 예외로 바꿔** 던진다(아래 ``handle`` 참고).
 
 원본 삭제 게이트(#18 노션 5장): 비식별 사본이 S3에 안착하고 페이지별 검증(5.1 bbox
 커버리지 + 5.2 재OCR 잔류)을 **모두** 통과해야 ``job.s3_key`` 원본을 지운다. 검증 실패는
@@ -60,7 +71,7 @@ import asyncpg
 
 from core.config import Settings, get_settings
 from core.contracts import DocType, OcrJob, ReportJob
-from core.exceptions import OcrError
+from core.exceptions import NonRetryableError, OcrError, UnreadableFileError
 from core.logging import bind_context, clear_context, get_logger
 from core.sqs.producer import SqsProducer
 from ocr_worker.classify import classify
@@ -76,10 +87,12 @@ from ocr_worker.repository import (
     OcrResultRecord,
     PendingDeletion,
     build_masked_lines,
+    clear_job_failure,
     fetch_due_deletions,
     find_ocr_result,
     record_delete_failure,
     record_delete_success,
+    record_job_failure,
     save_ocr_result,
 )
 from ocr_worker.storage import delete_object, put_object
@@ -173,6 +186,20 @@ def _encode_pngs(redacted_pages: list[RedactedPage]) -> list[bytes]:
 def _derive_report_id(ocr_result_id: str) -> str:
     """``ocr_result_id``에서 결정적 ``report_id``를 파생한다(재발행 시 동일 값)."""
     return str(uuid.uuid5(_REPORT_ID_NAMESPACE, f"report:{ocr_result_id}"))
+
+
+def _failure_class(exc: Exception) -> str:
+    """결정적 실패 예외를 저널의 ``failure_class``로 매핑한다(마이그레이션 008의 CHECK 값).
+
+    분류를 못 하면 ``'unknown'``으로 폴백한다 — 새 ``NonRetryableError`` 하위 타입이
+    생겼을 때 CHECK 제약 위반으로 **기록 자체가 실패하는** 것보다, 덜 구체적인 분류로라도
+    남기는 편이 낫다(error_type 컬럼에 클래스명이 남아 사후 분류는 가능하다).
+    """
+    if isinstance(exc, MaskingError):
+        return "masking_residual"
+    if isinstance(exc, UnreadableFileError):
+        return "unreadable_file"
+    return "unknown"
 
 
 @dataclass(frozen=True, slots=True)
@@ -278,10 +305,22 @@ class OcrPipeline:
         """OCR 작업 하나를 처리한다(컨슈머 핸들러 진입점).
 
         멱등: 이미 저장된 ``job_id``면 OCR을 건너뛰고 ``ReportJob``만 재발행한다.
-        예외는 그대로 전파해 컨슈머의 재시도/DLQ 규약에 맡긴다(핸들러가 삼키지 않는다).
+        예외는 그대로 전파해 컨슈머의 재시도/종결 규약에 맡긴다(핸들러가 삼키지 않는다) —
+        다만 전파 **전에** 실패 저널(``ai.ocr_job_failures``)에 흔적을 남긴다. 모듈
+        docstring의 "실패 저널" 절이 세 경로(결정적·일시·회복)의 근거다.
+
+        ``except`` 순서가 의미를 만든다: ``NonRetryableError``가 먼저다.
+        ``UnreadableFileError``는 ``OcrError``이기도 해서 순서가 뒤집히면 확정 실패가
+        ``terminal=False``로 기록되고, 컨슈머는 즉시 ack 대신 재전달을 반복한다.
 
         Args:
             job: 검증된 ``OcrJob``.
+
+        Raises:
+            RuntimeError: 결정적 실패를 저널에 기록하지 **못한** 경우. 원래 예외 대신
+                재시도 가능한 이 예외를 던져 컨슈머가 메시지를 남기게 한다(아래
+                ``_journal_terminal`` 참고).
+            Exception: 그 외에는 처리 중 발생한 원래 예외를 그대로 전파한다.
         """
         bind_context(job_id=job.job_id, user_ref=job.user_ref)
         try:
@@ -290,10 +329,89 @@ class OcrPipeline:
                 ocr_result_id, doc_type, ocr_quality = existing
                 logger.info("job already processed → republish", ocr_result_id=ocr_result_id)
                 await self._publish_report(job, ocr_result_id, doc_type, ocr_quality)
-                return
-            await self._process(job)
+            else:
+                await self._process(job)
+            # 회복 경로: 이전 시도가 남긴 일시 실패 행을 지운다. 멱등 단락도 "이 작업은
+            # 끝났다"는 같은 결론이라 함께 정리한다 — 저장은 됐는데 발행 직전에 죽어
+            # 실패로 기록된 작업이 재전달로 여기 도달하는 게 정확히 그 경우다.
+            await self._clear_failure(job)
+        except NonRetryableError as exc:
+            await self._journal_terminal(job, exc)
+            raise
+        except Exception as exc:
+            await self._journal_transient(job, exc)
+            raise
         finally:
             clear_context()
+
+    async def _journal_terminal(self, job: OcrJob, exc: Exception) -> None:
+        """결정적 실패를 ``terminal=True``로 기록한다. **기록 실패 시 예외를 바꿔 던진다.**
+
+        여기서만 저널 실패를 삼키지 않는 이유: 컨슈머는 ``NonRetryableError``를 보면
+        메시지를 즉시 삭제한다. 기록이 실패한 채로 원래 예외를 올리면 메시지는 사라지고
+        저널에도 아무것도 없다 — 사용자 관점에선 업로드가 조용히 증발하는 무음 실패이고,
+        이건 이 기능이 없애려던 바로 그 상태다.
+
+        그래서 재시도 가능한 ``RuntimeError``로 바꿔 던진다. 컨슈머는 이 타입을 삭제
+        사유로 보지 않아 메시지가 재전달되고, 다음 시도에서 (결정적 실패는 어차피 같은
+        지점에서 다시 나므로) 기록을 다시 노려볼 수 있다. 끝내 실패해도 수신 횟수 상한의
+        poison 훅(``mark_failure_terminal``)이 백스톱이다.
+
+        원래 예외는 유실되지 않는다 — 저널 예외가 직접 원인(``__cause__``)이고, 그 저널
+        예외가 다시 원래 실패를 ``__context__``로 물고 있어 예외 체인에 둘 다 남는다.
+        """
+        try:
+            await record_job_failure(
+                self._pool,
+                job,
+                failure_class=_failure_class(exc),
+                error_type=type(exc).__name__,
+                terminal=True,
+            )
+        except Exception as journal_exc:
+            # 예외는 타입만 남긴다(§9) — 원래 예외 타입도 함께 남겨야 무엇을 기록하려다
+            # 실패했는지 로그만으로 추적된다.
+            logger.warning(
+                "ocr_job_failure_journal_failed",
+                error_type=type(journal_exc).__name__,
+                original_error_type=type(exc).__name__,
+            )
+            raise RuntimeError("실패 저널 기록 실패 — 재전달로 재시도") from journal_exc
+
+    async def _journal_transient(self, job: OcrJob, exc: Exception) -> None:
+        """일시 실패를 ``terminal=False``로 기록한다(기록 실패는 삼킨다).
+
+        여기서는 저널 실패를 삼킨다 — 원래 예외가 이미 재전달을 유발하므로(컨슈머가
+        삭제하지 않는다) 기록은 다음 시도에서 다시 시도된다. 저널 예외를 올리면 원인
+        예외를 가려 진단만 어려워진다.
+        """
+        try:
+            await record_job_failure(
+                self._pool,
+                job,
+                failure_class="ocr_error" if isinstance(exc, OcrError) else "unknown",
+                error_type=type(exc).__name__,
+                terminal=False,
+            )
+        except Exception as journal_exc:
+            logger.warning(
+                "ocr_job_failure_journal_failed",
+                error_type=type(journal_exc).__name__,
+                original_error_type=type(exc).__name__,
+            )
+
+    async def _clear_failure(self, job: OcrJob) -> None:
+        """성공한 작업의 실패 저널 행을 지운다(실패해도 잡의 성공을 뒤집지 않는다).
+
+        DELETE가 실패해도 이미 저장·발행은 끝났다. 예외를 올리면 성공한 작업이 실패로
+        뒤집혀 재전달되고, 멱등 단락을 타며 같은 DELETE를 또 시도한다 — 남은 행 하나
+        때문에 잡을 실패시키는 건 비용이 이득보다 크다. 남은 일시 실패 행은 다음 성공
+        시도나 운영 정리가 걷어낸다.
+        """
+        try:
+            await clear_job_failure(self._pool, job.job_id)
+        except Exception as exc:
+            logger.warning("ocr_job_failure_clear_failed", error_type=type(exc).__name__)
 
     async def _process(self, job: OcrJob) -> None:
         """신규 작업의 전체 처리 흐름(OCR→분석→하이브리드 VLM→품질 판정→저장→발행)."""
