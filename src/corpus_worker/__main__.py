@@ -63,8 +63,10 @@ async def _run() -> None:
         http_client = httpx.AsyncClient(timeout=_DOWNLOAD_TIMEOUT_SECONDS)
         s3 = CorpusS3(settings=settings)
 
-        async def download(url: str) -> DownloadResult:
-            return await download_to_temp(url, settings.corpus_download_tmp_dir, client=http_client)
+        async def download(url: str, suffix: str) -> DownloadResult:
+            return await download_to_temp(
+                url, settings.corpus_download_tmp_dir, client=http_client, suffix=suffix
+            )
 
         deps = ProcessDeps(
             pool=pool,

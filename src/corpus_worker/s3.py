@@ -1,6 +1,7 @@
 """약관 첨부 S3 스테이징 (이슈 #35 P2 — ocr_worker.storage 패턴 재사용).
 
-내용주소(content-addressed) 키(``corpus/{category}/{sha256}.pdf``)로 dedup 업로드한다:
+내용주소(content-addressed) 키(``corpus/{category}/{sha256}{ext}``, ext는 파일명에서 판정)로
+dedup 업로드한다:
 같은 내용은 같은 키라, ``head_exists``로 존재를 확인해 중복 업로드를 건너뛴다. 업로드는
 boto3 ``upload_file``(대용량 멀티파트 스트리밍)을 쓰고, 동기 SDK이므로 ``asyncio.to_thread``로
 격리해 워커 이벤트 루프를 막지 않는다(§7).
@@ -23,24 +24,23 @@ logger = get_logger(__name__)
 
 # HeadObject가 없는 객체에 주는 HTTP 상태(404). 내용주소 dedup의 "미존재" 신호.
 _NOT_FOUND_STATUS = 404
-# 약관은 전부 PDF — 키 접미사·ContentType 고정.
-CORPUS_CONTENT_TYPE = "application/pdf"
-_KEY_SUFFIX = ".pdf"
 
 
-def corpus_key(category: str, sha256: str, *, settings: Settings | None = None) -> str:
-    """내용주소 S3 키를 만든다: ``{s3_corpus_prefix}{category}/{sha256}.pdf``.
+def corpus_key(category: str, sha256: str, ext: str, *, settings: Settings | None = None) -> str:
+    """내용주소 S3 키를 만든다: ``{s3_corpus_prefix}{category}/{sha256}{ext}``.
 
     Args:
         category: 코퍼스 카테고리(terms 등) — 키 공간 분리.
         sha256: 파트 내용 해시(hex) — dedup 앵커.
+        ext: 첨부 파일명에서 판정한 확장자(``corpus_worker.filetype.detect``). 약관이
+            전부 PDF는 아니므로 고정 접미사를 쓰지 않는다.
         settings: 설정. None이면 ``get_settings()``.
 
     Returns:
         OCR 원본 키공간과 분리된 코퍼스 스테이징 키.
     """
     settings = settings or get_settings()
-    return f"{settings.s3_corpus_prefix}{category}/{sha256}{_KEY_SUFFIX}"
+    return f"{settings.s3_corpus_prefix}{category}/{sha256}{ext}"
 
 
 class CorpusS3:

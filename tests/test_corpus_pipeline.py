@@ -73,10 +73,12 @@ class FakeDownloader:
         self._tmp_dir = tmp_dir
         self._meta = meta
         self.created_paths: list[str] = []
+        self.suffixes: list[str] = []
 
-    async def __call__(self, url: str) -> DownloadResult:
+    async def __call__(self, url: str, suffix: str) -> DownloadResult:
+        self.suffixes.append(suffix)
         sha256, byte_size = self._meta[url]
-        fd, path = tempfile.mkstemp(dir=self._tmp_dir)
+        fd, path = tempfile.mkstemp(suffix=suffix, dir=self._tmp_dir)
         os.write(fd, b"x")
         os.close(fd)
         self.created_paths.append(path)
@@ -109,7 +111,10 @@ async def test_process_document_downloads_uploads_and_marks(tmp_path) -> None:
     s3 = FakeS3()
     deps = _deps(pool, notion, downloader, s3)
     doc = ClaimedDoc(notion_page_id=PAGE, category="terms", part_total=2)
-    parts = [PartRow(PART0, 0, None, "pending"), PartRow(PART1, 1, None, "pending")]
+    parts = [
+        PartRow(PART0, 0, "약관.pdf", None, "pending"),
+        PartRow(PART1, 1, "약관.pdf", None, "pending"),
+    ]
 
     # Act
     await process_document(deps, doc, parts)
@@ -121,11 +126,52 @@ async def test_process_document_downloads_uploads_and_marks(tmp_path) -> None:
     ]
     assert s3.put_calls[0][2] == "application/pdf"  # content_type
     assert s3.put_calls[0][3] == "AES256"  # sse
+    assert downloader.suffixes == [".pdf", ".pdf"]  # 파일명에서 판정한 확장자가 그대로 전달
     assert len(_uploaded_part_calls(pool)) == 2
     assert any("status = 'done'" in sql for sql, _ in pool.executed)
     assert notion.calls == 1  # 신선 URL은 문서당 1회만 조회
     for path in downloader.created_paths:
         assert not os.path.exists(path)  # 임시파일 미잔류
+
+
+async def test_process_document_derives_type_from_file_name(tmp_path) -> None:
+    # Arrange: 약관이 전부 PDF는 아니다 — HWP 첨부는 .hwp 키·ContentType으로 업로드돼야 한다
+    pool = FakePool()
+    notion = FakeNotion([URL0])
+    downloader = FakeDownloader(str(tmp_path), {URL0: (SHA0, 10)})
+    s3 = FakeS3()
+    deps = _deps(pool, notion, downloader, s3)
+    doc = ClaimedDoc(notion_page_id=PAGE, category="terms", part_total=1)
+    parts = [PartRow(PART0, 0, "특별약관.hwp", None, "pending")]
+
+    # Act
+    await process_document(deps, doc, parts)
+
+    # Assert: .pdf로 하드코딩되지 않고 실제 파일명에서 판정한 타입을 씀
+    assert [call[1] for call in s3.put_calls] == [f"corpus/terms/{SHA0}.hwp"]
+    assert s3.put_calls[0][2] == "application/x-hwp"
+    assert downloader.suffixes == [".hwp"]
+    assert len(_uploaded_part_calls(pool)) == 1
+
+
+async def test_process_document_fails_when_file_name_missing(tmp_path) -> None:
+    # Arrange: notion_file_name이 없으면 타입을 추측하지 않고 즉시 실패한다
+    pool = FakePool()
+    notion = FakeNotion([URL0])
+    downloader = FakeDownloader(str(tmp_path), {URL0: (SHA0, 10)})
+    s3 = FakeS3()
+    deps = _deps(pool, notion, downloader, s3)
+    doc = ClaimedDoc(notion_page_id=PAGE, category="terms", part_total=1)
+    parts = [PartRow(PART0, 0, None, None, "pending")]
+
+    # Act
+    await process_document(deps, doc, parts)
+
+    # Assert: 다운로드·업로드는 시도조차 안 하고 문서를 실패 처리한다
+    assert downloader.created_paths == []
+    assert s3.put_calls == []
+    assert any("attempts = attempts + 1" in sql for sql, _ in pool.executed)
+    assert _uploaded_part_calls(pool) == []
 
 
 async def test_process_document_skips_put_on_dedup_hit(tmp_path) -> None:
@@ -137,7 +183,7 @@ async def test_process_document_skips_put_on_dedup_hit(tmp_path) -> None:
     s3 = FakeS3(existing={key})
     deps = _deps(pool, notion, downloader, s3)
     doc = ClaimedDoc(notion_page_id=PAGE, category="terms", part_total=1)
-    parts = [PartRow(PART0, 0, None, "pending")]
+    parts = [PartRow(PART0, 0, "약관.pdf", None, "pending")]
 
     # Act
     await process_document(deps, doc, parts)
@@ -157,7 +203,10 @@ async def test_process_document_resumes_skipping_uploaded_parts(tmp_path) -> Non
     s3 = FakeS3()
     deps = _deps(pool, notion, downloader, s3)
     doc = ClaimedDoc(notion_page_id=PAGE, category="terms", part_total=2)
-    parts = [PartRow(PART0, 0, "already", "uploaded"), PartRow(PART1, 1, None, "pending")]
+    parts = [
+        PartRow(PART0, 0, "약관.pdf", "already", "uploaded"),
+        PartRow(PART1, 1, "약관.pdf", None, "pending"),
+    ]
 
     # Act
     await process_document(deps, doc, parts)
@@ -171,14 +220,14 @@ async def test_process_document_resumes_skipping_uploaded_parts(tmp_path) -> Non
 async def test_process_document_marks_failed_on_download_error(tmp_path) -> None:
     # Arrange: 다운로드가 httpx 오류
     class FailingDownloader:
-        async def __call__(self, url: str) -> DownloadResult:
+        async def __call__(self, url: str, suffix: str) -> DownloadResult:
             raise httpx.HTTPError("boom")
 
     pool = FakePool()
     notion = FakeNotion([URL0])
     deps = _deps(pool, notion, FailingDownloader(), FakeS3())
     doc = ClaimedDoc(notion_page_id=PAGE, category="terms", part_total=1)
-    parts = [PartRow(PART0, 0, None, "pending")]
+    parts = [PartRow(PART0, 0, "약관.pdf", None, "pending")]
 
     # Act
     await process_document(deps, doc, parts)
@@ -202,7 +251,7 @@ async def test_process_document_cleans_temp_and_fails_on_upload_error(tmp_path) 
     downloader = FakeDownloader(str(tmp_path), {URL0: (SHA0, 10)})
     deps = _deps(pool, notion, downloader, FailingS3())
     doc = ClaimedDoc(notion_page_id=PAGE, category="terms", part_total=1)
-    parts = [PartRow(PART0, 0, None, "pending")]
+    parts = [PartRow(PART0, 0, "약관.pdf", None, "pending")]
 
     # Act
     await process_document(deps, doc, parts)
