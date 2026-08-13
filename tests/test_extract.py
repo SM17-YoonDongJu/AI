@@ -50,6 +50,17 @@ def test_diagnosis_name_none_when_no_kcd_and_no_label() -> None:
     assert entities == {"diagnosis_name": None, "icd": None}
 
 
+def test_diagnosis_falls_back_to_label_text_from_vlm_markdown_table_row() -> None:
+    # Arrange — 하이브리드 VLM(저신뢰도 문서 보완 경로)이 표를 마크다운으로 낼 때
+    # 라벨-값이 "|"로 구분된다("상병명 | 값", 콜론 없음). VLM이 정확히 읽었는데도
+    # 이전 정규식은 "|"를 못 건너뛰어 추출에 실패하던 실측 케이스(KCD 코드 없는 문서).
+    text = "| 상병명 | 급성 위장염 |\n| 부상일 | 2026년 07월 28일 |"
+    # Act
+    entities = extract(DocType.DIAGNOSIS, text)
+    # Assert — 값이 다음 "|"에서 멈추고(뒤 셀 안 삼킴), 트레일링 공백도 없다.
+    assert entities == {"diagnosis_name": "급성 위장염", "icd": None}
+
+
 def test_diagnosis_name_discarded_when_label_line_merges_pii() -> None:
     # Arrange — 코드리뷰 지적(실측 가능성): OCR이 인접 셀을 한 줄로 병합하면
     # "병명" 라벨의 [^\n]+ 캡처가 뒤에 오는 "성명: 홍길동"까지 통째로 삼킬 수 있다.
@@ -81,6 +92,15 @@ def test_policy_fields_none_when_absent() -> None:
     entities = extract(DocType.POLICY, text)
     # Assert
     assert entities == {"insurer": None, "product": None}
+
+
+def test_policy_extracts_product_from_vlm_markdown_table_row() -> None:
+    # Arrange — VLM 마크다운 표 형식("| 상품명 | 값 |"), 실측 확인된 실패 케이스.
+    text = "| 상품명 | 무배당 다온 생활안심 건강보험(테스트형) |\n| 월 보험료 | 87,430원 |"
+    # Act
+    entities = extract(DocType.POLICY, text)
+    # Assert — 값이 다음 "|"에서 멈춘다(트레일링 " |" 안 붙음).
+    assert entities["product"] == "무배당 다온 생활안심 건강보험(테스트형)"
 
 
 def test_product_falls_back_when_label_line_merges_pii() -> None:
@@ -157,6 +177,17 @@ def test_hospitalization_cert_extracts_days_from_direct_label() -> None:
     assert entities["admission_days"] == 7
 
 
+def test_hospitalization_cert_extracts_days_from_vlm_markdown_table_row() -> None:
+    # Arrange — VLM 마크다운 표 형식("| 입원일수 | 6일 |"). 실측 확인된 실패 케이스 —
+    # surya가 저신뢰도 문서에서 라벨 자체를 오독해(예: "일본일수") VLM이 개입했는데,
+    # VLM이 정확히 읽은 값도 이전 정규식은 "|"를 못 건너뛰어 놓치고 있었다.
+    text = "| 입원일시 | 2026년 07월 29일 14시 20분 |\n| 입원일수 | 6일 |"
+    # Act
+    entities = extract(DocType.HOSPITALIZATION_CERT, text)
+    # Assert
+    assert entities["admission_days"] == 6
+
+
 def test_hospitalization_cert_extracts_days_from_separate_labels() -> None:
     # Arrange — 입원일/퇴원일이 서로 다른 라벨로 떨어져 있는 형태.
     text = "입원일자: 2026-02-10\n퇴원일자: 2026-02-15"
@@ -178,6 +209,15 @@ def test_hospitalization_cert_days_none_when_dates_absent() -> None:
 def test_hospitalization_cert_surgery_true_when_named() -> None:
     # Arrange
     text = "입원확인서\n수술명: 골절정복술"
+    # Act
+    entities = extract(DocType.HOSPITALIZATION_CERT, text)
+    # Assert
+    assert entities["surgery"] is True
+
+
+def test_hospitalization_cert_surgery_from_vlm_markdown_table_row() -> None:
+    # Arrange — VLM 마크다운 표 형식("| 수술명 | 값 |").
+    text = "| 수술명 | 골절정복술 |\n| 담당의 | 박가상 |"
     # Act
     entities = extract(DocType.HOSPITALIZATION_CERT, text)
     # Assert
