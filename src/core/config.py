@@ -144,6 +144,10 @@ class Settings(BaseSettings):
     # 전사보다 훨씬 보수적으로 골라야 하므로, 검증된 모델을 별도로 고정한다.
     vlm_grounding_model: str = "qwen3-vl:8b-instruct"
     vlm_timeout_seconds: float = 60.0  # 실측 평균 15초·최대 34초 — 여유 두고 60초
+    # ollama 기본 num_ctx는 페이지 이미지 토큰만으로 대부분 차 표 전사 응답이 문장
+    # 중간에서 조용히 잘렸다(실측: 지급결과서 응답이 "피" 한 글자에서 끊김 — 에러 없이
+    # 200 OK로 절단된 텍스트만 옴). 16384로 명시하니 4개 표 문서 전부 완전히 전사됐다.
+    vlm_num_ctx: int = 16384
 
 
 @lru_cache

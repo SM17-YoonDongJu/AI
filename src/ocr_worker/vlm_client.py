@@ -87,7 +87,10 @@ async def transcribe_table(image: PageImage) -> str:
         "stream": False,
         # temperature=0: 창작 경향을 낮춰 환각(이미지에 없는 내용 지어내기)을 줄인다.
         # 완전히 막진 못하므로 pipeline._looks_grounded()가 별도 안전장치로 검증한다.
-        "options": {"temperature": 0.0},
+        # num_ctx: 명시하지 않으면 ollama 기본값에 걸려 페이지 이미지 토큰만으로 컨텍스트
+        # 대부분이 차, 표가 많은 문서에서 응답이 에러 없이(200 OK) 문장 중간에서 잘렸다
+        # (실측 확인). settings.vlm_num_ctx 참고.
+        "options": {"temperature": 0.0, "num_ctx": settings.vlm_num_ctx},
     }
     try:
         resp = await client.post("/api/generate", json=payload)
@@ -134,7 +137,9 @@ async def ground_pii(image: PageImage) -> list[tuple[PiiLabel, tuple[int, int, i
         "prompt": GROUNDING_PROMPT,
         "images": [b64],
         "stream": False,
-        "options": {"temperature": 0.0},
+        # num_ctx: transcribe_table과 동일 이유(§ 위 주석) — 짧은 JSON 응답이라 출력
+        # 잘림 위험은 낮지만, 입력(이미지) 처리에도 같은 컨텍스트를 쓰므로 일관되게 맞춘다.
+        "options": {"temperature": 0.0, "num_ctx": settings.vlm_num_ctx},
     }
     try:
         resp = await client.post("/api/generate", json=payload)
