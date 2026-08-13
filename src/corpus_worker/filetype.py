@@ -1,8 +1,9 @@
-"""약관 첨부 파일명 → 확장자·ContentType 판정 (이슈 #35 하드코딩 제거).
+"""약관 첨부 파일명 → 타입 검증 (PDF 전용 정책).
 
-Notion 첨부는 전부 PDF가 아니다(hwp·zip·txt 등 혼재) — 파일명에서 정직하게 판정해
-S3 키 접미사·ContentType에 반영한다. 확장자를 모르면 추측하지 않고 ``CorpusSyncError``로
-실패시켜(§8) ``mark_document_failed`` 재시도·수동 검토에 맡긴다.
+corpus_worker는 PDF만 코퍼스에 올린다. Notion 첨부가 실제로는 HWP·zip·txt·법령 md·
+판례 메타 json 등 다양하더라도, PDF가 아닌 첨부는 스테이징하지 않는다 — 파일명이
+``.pdf``로 끝나지 않으면 추측 없이 즉시 실패시켜(§8) ``mark_document_failed``로
+재시도/수동 검토에 넘긴다.
 """
 
 from __future__ import annotations
@@ -11,25 +12,8 @@ from dataclasses import dataclass
 
 from core.exceptions import CorpusSyncError
 
-# 압축 컨테이너 등 복합 확장자는 마지막 조각만 보면 내용물 정보가 사라진다
-# (예: ".hwp.zip"을 ".zip"으로만 보면 "zip 안이 HWP"라는 사실이 소실) — 단순 확장자보다
-# 먼저 매칭해야 한다.
-_COMPOUND_EXTENSIONS: dict[str, str] = {
-    ".hwp.zip": "application/zip",
-}
-
-_SIMPLE_EXTENSIONS: dict[str, str] = {
-    ".pdf": "application/pdf",
-    ".hwp": "application/x-hwp",
-    ".doc": "application/msword",
-    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    ".txt": "text/plain",
-    ".zip": "application/zip",
-    # 법령 원문(law.go.kr 등 API 응답을 마크다운화) · 판례/통계 메타데이터 사이드카.
-    # 둘 다 Notion "보험 약관 파일" DB에 정식 라이선스·수집상태로 첨부되는 실제 코퍼스 자료다.
-    ".md": "text/markdown",
-    ".json": "application/json",
-}
+_PDF_EXT = ".pdf"
+_PDF_CONTENT_TYPE = "application/pdf"
 
 
 @dataclass(slots=True, frozen=True)
@@ -41,25 +25,19 @@ class FileType:
 
 
 def detect(notion_file_name: str | None) -> FileType:
-    """Notion 첨부 파일명에서 확장자·ContentType을 판정한다.
+    """Notion 첨부 파일명이 PDF인지 확인한다(코퍼스는 PDF만 허용).
 
     Args:
         notion_file_name: Notion ``files`` 첨부의 원본 파일명.
 
     Returns:
-        판정된 ``FileType``(예: ``.hwp.zip`` → ``application/zip``).
+        PDF일 때만 ``FileType(ext=".pdf", content_type="application/pdf")``.
 
     Raises:
-        CorpusSyncError: 파일명이 없거나 알려진 확장자로 끝나지 않는 경우 — 타입을
-            추측해 잘못 라벨링하지 않는다.
+        CorpusSyncError: 파일명이 없거나 ``.pdf``로 끝나지 않는 경우.
     """
     if not notion_file_name:
         raise CorpusSyncError("첨부 파일명 없음 — 타입 판정 불가")
-    lowered = notion_file_name.lower()
-    for ext, content_type in _COMPOUND_EXTENSIONS.items():
-        if lowered.endswith(ext):
-            return FileType(ext=ext, content_type=content_type)
-    for ext, content_type in _SIMPLE_EXTENSIONS.items():
-        if lowered.endswith(ext):
-            return FileType(ext=ext, content_type=content_type)
-    raise CorpusSyncError(f"알 수 없는 첨부 확장자: {notion_file_name}")
+    if not notion_file_name.lower().endswith(_PDF_EXT):
+        raise CorpusSyncError(f"PDF가 아닌 첨부(코퍼스는 PDF만 허용): {notion_file_name}")
+    return FileType(ext=_PDF_EXT, content_type=_PDF_CONTENT_TYPE)

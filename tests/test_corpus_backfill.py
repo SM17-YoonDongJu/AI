@@ -1,9 +1,10 @@
 """corpus_worker.backfill 테스트 — 옛 .pdf 하드코딩 오염 데이터 재라벨링.
 
 plan_backfill(순수 함수)이 이미 올바른 키/판정 불가 파일명을 건너뛰고, 잘못 라벨링된
-파트만 올바른 키·ContentType으로 계획하는지 검증한다. apply_item은 페이크 S3
-client·DB pool로 CopyObject→DB 갱신→구 키 삭제 순서를 검증한다(중간 실패 시 데이터
-유실 없는 순서).
+파트만 올바른 키·ContentType으로 계획하는지 검증한다. 타입 판정은 filetype.detect()에
+위임하므로(PDF 전용 정책), PDF가 아닌 첨부는 재라벨링 대상이 아니라 스킵된다.
+apply_item은 페이크 S3 client·DB pool로 CopyObject→DB 갱신→구 키 삭제 순서를
+검증한다(중간 실패 시 데이터 유실 없는 순서).
 """
 
 import uuid
@@ -14,11 +15,9 @@ from corpus_worker.backfill import BackfillItem, apply_item, plan_backfill
 
 PART0 = "aaaaaaaa-0000-0000-0000-000000000000"
 PART1 = "bbbbbbbb-0000-0000-0000-000000000000"
-PART2 = "cccccccc-0000-0000-0000-000000000000"
 PART3 = "dddddddd-0000-0000-0000-000000000000"
 SHA0 = "0" * 64
 SHA1 = "1" * 64
-SHA2 = "2" * 64
 SHA3 = "3" * 64
 
 
@@ -47,8 +46,8 @@ def test_plan_backfill_skips_already_correct_pdf() -> None:
     assert skipped[0].reason == "이미 올바른 키"
 
 
-def test_plan_backfill_relabels_mismatched_hwp() -> None:
-    # Arrange: HWP 첨부가 옛 로직으로 .pdf 키에 잘못 올라가 있음
+def test_plan_backfill_skips_non_pdf_attachment() -> None:
+    # Arrange: 코퍼스는 PDF만 허용 — HWP 첨부는 재라벨링 대상이 아니라 수동 검토로 넘어간다
     rows = [
         {
             "id": uuid.UUID(PART1),
@@ -63,35 +62,8 @@ def test_plan_backfill_relabels_mismatched_hwp() -> None:
     items, skipped = plan_backfill(rows, settings=_settings())
 
     # Assert
-    assert skipped == []
-    assert items == [
-        BackfillItem(
-            part_id=PART1,
-            old_key=f"corpus/terms/{SHA1}.pdf",
-            new_key=f"corpus/terms/{SHA1}.hwp",
-            content_type="application/x-hwp",
-        )
-    ]
-
-
-def test_plan_backfill_preserves_compound_extension() -> None:
-    # Arrange: 압축 컨테이너(.hwp.zip)도 옛 로직으론 .pdf로 잘못 올라가 있음
-    rows = [
-        {
-            "id": uuid.UUID(PART2),
-            "s3_key": f"corpus/terms/{SHA2}.pdf",
-            "notion_file_name": "특별약관.hwp.zip",
-            "sha256": SHA2,
-            "category": "terms",
-        }
-    ]
-
-    # Act
-    items, _ = plan_backfill(rows, settings=_settings())
-
-    # Assert
-    assert items[0].new_key == f"corpus/terms/{SHA2}.hwp.zip"
-    assert items[0].content_type == "application/zip"
+    assert items == []
+    assert skipped[0].part_id == PART1
 
 
 def test_plan_backfill_skips_unknown_file_name_for_manual_review() -> None:

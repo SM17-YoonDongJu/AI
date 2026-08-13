@@ -134,8 +134,8 @@ async def test_process_document_downloads_uploads_and_marks(tmp_path) -> None:
         assert not os.path.exists(path)  # 임시파일 미잔류
 
 
-async def test_process_document_derives_type_from_file_name(tmp_path) -> None:
-    # Arrange: 약관이 전부 PDF는 아니다 — HWP 첨부는 .hwp 키·ContentType으로 업로드돼야 한다
+async def test_process_document_rejects_non_pdf_attachment(tmp_path) -> None:
+    # Arrange: 코퍼스는 PDF만 허용 — HWP 첨부는 다운로드조차 시도하지 않고 실패해야 한다
     pool = FakePool()
     notion = FakeNotion([URL0])
     downloader = FakeDownloader(str(tmp_path), {URL0: (SHA0, 10)})
@@ -147,11 +147,11 @@ async def test_process_document_derives_type_from_file_name(tmp_path) -> None:
     # Act
     await process_document(deps, doc, parts)
 
-    # Assert: .pdf로 하드코딩되지 않고 실제 파일명에서 판정한 타입을 씀
-    assert [call[1] for call in s3.put_calls] == [f"corpus/terms/{SHA0}.hwp"]
-    assert s3.put_calls[0][2] == "application/x-hwp"
-    assert downloader.suffixes == [".hwp"]
-    assert len(_uploaded_part_calls(pool)) == 1
+    # Assert: 다운로드·업로드 시도 없이 문서를 실패 처리한다
+    assert downloader.created_paths == []
+    assert s3.put_calls == []
+    assert any("attempts = attempts + 1" in sql for sql, _ in pool.executed)
+    assert _uploaded_part_calls(pool) == []
 
 
 async def test_process_document_fails_when_file_name_missing(tmp_path) -> None:
