@@ -30,8 +30,15 @@ KCD_RE = re.compile(r"(?<![A-Za-z0-9])([A-Z]\d{2}(?:\.\d)?)(?![0-9])")
 # 실측(실제 진단서 샘플): KCD 코드 없이 한글 병명만 적히는 문서가 더 흔하다.
 # 표 양식은 라벨 글자 사이·줄 사이에 공백/개행이 끼는 경우가 많다(예: "병 명\n및\n진 단"
 # 처럼 셀이 여러 줄로 쪼개짐) → 라벨 글자 사이 \s*로 이를 흡수한다.
+#
+# 라벨-값 정규식 전반에 `|`(파이프)를 콜론과 동급으로 허용하는 이유: extract()는
+# surya 원문뿐 아니라 하이브리드 VLM(ocr_worker.vlm_client) 전사 결과도 입력으로
+# 받는데, VLM은 표를 마크다운(`| 라벨 | 값 |`)으로 낸다. 실측 확인 — 저신뢰도 문서라
+# VLM이 개입한 바로 그 케이스에서 라벨과 값 사이가 콜론이 아니라 "` | `"라 기존
+# 정규식이 매칭에 실패했다(VLM은 정확히 읽었는데 추출만 실패). 값 캡처도 `[^\n]+` →
+# `[^\n|]+`로 바꿔 다음 표 셀의 `|`에서 멈추게 한다(안 그러면 값 끝에 " |"가 붙는다).
 DIAGNOSIS_LABEL_RE = re.compile(
-    r"(?:상\s*병\s*명|병\s*명|진\s*단\s*명)(?:\s*및\s*진\s*단)?\s*[:：]?\s*([^\n]+)"  # noqa: RUF001 (전각 콜론)
+    r"(?:상\s*병\s*명|병\s*명|진\s*단\s*명)(?:\s*및\s*진\s*단)?\s*[|:：]?\s*([^\n|]+)"  # noqa: RUF001 (전각 콜론)
 )
 # 라벨 캡처가 한 줄 전체를 삼키지 않도록 상한(PRODUCT_MAX_LEN과 동일 정책).
 DIAGNOSIS_NAME_MAX_LEN = 40
@@ -45,7 +52,8 @@ INSURER_RE = re.compile(
 
 # ── 상품명 ───────────────────────────────────────────────────────
 # 1순위: '상품명' 라벨 뒤 같은 줄. 2순위: '무배당…보험' 형태(보험상품 관용 표기).
-PRODUCT_LABEL_RE = re.compile(r"상품\s*명\s*[:：]?\s*([^\n]+)")  # noqa: RUF001 (전각 콜론)
+# `|` 허용 이유는 DIAGNOSIS_LABEL_RE 주석 참고(VLM 마크다운 표 대응).
+PRODUCT_LABEL_RE = re.compile(r"상품\s*명\s*[|:：]?\s*([^\n|]+)")  # noqa: RUF001 (전각 콜론)
 PRODUCT_FALLBACK_RE = re.compile(r"(무배당\s*[가-힣A-Za-z0-9()]+(?:\s*[가-힣A-Za-z0-9()]+)*보험)")
 # 라벨 캡처가 한 줄 전체를 삼키지 않도록 상한(과도한 꼬리·다음 항목 혼입 방지).
 PRODUCT_MAX_LEN = 40
@@ -58,29 +66,35 @@ AMOUNT_KEYWORD_WINDOW = 15
 # 유형별 금액 문맥 키워드.
 _PAYOUT_AMOUNT_KEYWORDS = ("지급", "보험금", "결정")
 _CLAIM_AMOUNT_KEYWORDS = ("청구", "보험금")
+# 알려진 한계(다중 항목 표 문서, 미해결): VLM 마크다운 표는 "청구금액"·"지급금액"이
+# 헤더 행에만 있고 값은 별도 데이터 행에 있어(예: "| 청구 담보 | 청구금액 | 지급금액 |
+# 결과 |\n| 상해입원일당 | 150,000원 | 150,000원 | 지급 |"), 값 앞 15자 윈도우에 키워드가
+# 안 걸린다. 위 라벨-값 정규식(단일 셀 대응)과 달리 열(column) 인식이 필요해 이번
+# 범위에서는 손대지 않는다 — payout_amount/claim의 참고값 한계로 남긴다.
 
 # ── 입원일수(참고값) ────────────────────────────────────────────
 # YYYY-MM-DD / YYYY.MM.DD / YYYY년 MM월 DD일 형태를 폭넓게 허용.
 _DATE_RE = r"(\d{4})[.\-./년]\s*(\d{1,2})[.\-./월]\s*(\d{1,2})일?"
 # 직접 일수 표기("입원일수: 5일", "재원일수 5일")가 있으면 최우선으로 쓴다.
-ADMISSION_DAYS_LABEL_RE = re.compile(r"(?:입원|재원)\s*일수\s*[:：]?\s*(\d{1,4})\s*일")  # noqa: RUF001
+# `|` 허용 이유는 DIAGNOSIS_LABEL_RE 주석 참고(VLM 마크다운 표 대응).
+ADMISSION_DAYS_LABEL_RE = re.compile(r"(?:입원|재원)\s*일수\s*[|:：]?\s*(\d{1,4})\s*일")  # noqa: RUF001
 # "입원기간 2026-01-01부터 2026-01-05까지"처럼 한 라벨 아래 범위로 오는 형태.
 ADMISSION_RANGE_RE = re.compile(
-    rf"입원\s*(?:기간|일자?)\s*[:：]?\s*{_DATE_RE}\s*(?:부터|~|-|–)\s*{_DATE_RE}\s*까지?"  # noqa: RUF001
+    rf"입원\s*(?:기간|일자?)\s*[|:：]?\s*{_DATE_RE}\s*(?:부터|~|-|–)\s*{_DATE_RE}\s*까지?"  # noqa: RUF001
 )
 # "입원일"/"퇴원일"이 서로 다른 라벨로 떨어져 있는 형태.
-ADMISSION_DATE_RE = re.compile(rf"입원\s*일자?\s*[:：]?\s*{_DATE_RE}")  # noqa: RUF001
-DISCHARGE_DATE_RE = re.compile(rf"퇴원\s*일자?\s*[:：]?\s*{_DATE_RE}")  # noqa: RUF001
+ADMISSION_DATE_RE = re.compile(rf"입원\s*일자?\s*[|:：]?\s*{_DATE_RE}")  # noqa: RUF001
+DISCHARGE_DATE_RE = re.compile(rf"퇴원\s*일자?\s*[|:：]?\s*{_DATE_RE}")  # noqa: RUF001
 
 # ── 수술 여부 ────────────────────────────────────────────────────
-SURGERY_LABEL_RE = re.compile(r"수술\s*명\s*[:：]?\s*([^\n]+)")  # noqa: RUF001
+SURGERY_LABEL_RE = re.compile(r"수술\s*명\s*[|:：]?\s*([^\n|]+)")  # noqa: RUF001
 _SURGERY_NEGATIONS = frozenset({"없음", "해당없음", "해당 없음", "무", "-", "x", "X"})
 
 # ── 라벨 폴백 후보의 PII 오염 검사 ──────────────────────────────
-# DIAGNOSIS_LABEL_RE·PRODUCT_LABEL_RE의 [^\n]+는 라벨 뒤 줄 끝까지 통째로 캡처한다.
-# OCR이 인접 셀을 한 줄로 병합하면(예: "병명: 급성 기관지염 성명: 홍길동") 이름 같은
-# PII가 같이 캡처될 수 있다 — 마스킹(§13)은 이 값을 검사하지 않으므로 여기서 직접
-# 걸러야 한다. RegexDetector만 쓴다(정규식 전용, NER 모델 로드 없음 — extract()는
+# DIAGNOSIS_LABEL_RE·PRODUCT_LABEL_RE의 [^\n|]+는 라벨 뒤 줄(또는 표 셀) 끝까지 통째로
+# 캡처한다. OCR이 인접 셀을 한 줄로 병합하면(예: "병명: 급성 기관지염 성명: 홍길동")
+# 이름 같은 PII가 같이 캡처될 수 있다 — 마스킹(§13)은 이 값을 검사하지 않으므로 여기서
+# 직접 걸러야 한다. RegexDetector만 쓴다(정규식 전용, NER 모델 로드 없음 — extract()는
 # 순수·경량이어야 함).
 _PII_DETECTOR = RegexDetector()
 
