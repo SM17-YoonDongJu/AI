@@ -27,6 +27,32 @@
   작업이 계속 실패로 조회된다. 이 DELETE 실패는 작업의 성공을 뒤집지 않는다(경고만).
 - 기록이 실패한 결정적 실패는 **재시도 가능한 예외로 바꿔** 던진다(아래 ``handle`` 참고).
 
+청구 fan-in(``ai.claim_readiness``, 마이그레이션 009·010): 예전엔 문서 1건이 성공할
+때마다 즉시 ``ReportJob``을 발행했다 — 문서 N건짜리 청구가 리포트 N건을 만들었다.
+한 청구(claim)는 증권·진단서 등 여러 문서로 이루어지고 ``OcrJob``에 이미 ``claim_id``·
+``report_id``(Spring이 청구 단위로 부여)·``doc_index``·``doc_total``이 실려 온다. 이제
+문서가 **종결**될 때마다 청구 종결 카운터를 원자적으로 올리고(``advance_claim_progress``),
+마지막 문서를 끝낸 워커만 필수 유형(증권+진단서) 충족을 판정해 청구당 1건을 발행한다.
+- **종결 = 성공 + 확정 실패 + poison 소진**이다. 실패를 안 세면 문서 하나가 못 읽힌
+  순간 그 청구의 리포트가 영영 나오지 않는다. 대신 "무엇이 실제로 인식됐는가"는
+  카운터가 아니라 ``ai.ocr_results`` 재조회로 판정한다(성공한 문서만 행이 있다) —
+  3건 중 2건 성공 + 1건 실패라도 그 2건이 필수 유형을 채우면 정상 발행된다.
+- **필수 유형 미충족 → ``blocked``**(발행 없음). 증권·진단서는 업로드가 강제되므로,
+  이 상태는 "안 올림"이 아니라 **"올렸는데 인식 못 함"**이다(``_REQUIRED_DOC_TYPES`` 참고).
+- **단독 문서**(``claim_id``·``doc_total`` 없음)는 기존 문서별 즉시 발행 경로 그대로다.
+
+fan-in의 정합성은 두 규칙에 걸려 있다(QA 실측으로 확정된 실패 모드의 반대편):
+- **"이 문서가 끝났다"는 기록과 그 근거는 한 트랜잭션**이다. 저장(``ocr_results``)과
+  종결 카운트, 확정 실패 저널(``ocr_job_failures``)과 종결 카운트를 각각 함께 커밋한다.
+  갈라 두면 "저장은 됐는데 카운트가 안 된" 상태가 남는데, 재전달은 멱등 단락으로
+  빠져 카운트를 재시도하지 않으므로 그 청구는 **영구 정지**한다.
+- **종결 카운트는 문서별 멱등**이다(``job_id`` 집합, 마이그레이션 010). 같은 문서가
+  두 번 종결로 보고돼도(가시성 타임아웃으로 인한 동시 중복 전달, ack 실패 후 재전달,
+  poison 중복) 수가 늘지 않는다 — 늘면 아직 처리도 안 된 문서를 빼고 불완전한 리포트를
+  조기 발행하게 된다.
+판정·발행(SQS 왕복)은 트랜잭션 **밖**이라 그 사이에 죽을 수 있다. 그래서 "모든 문서
+종결 + 여전히 ``pending``"을 멱등 단락이 판정 재개 신호로 읽는다(``_replay_processed``).
+
 원본 삭제 게이트(#18 노션 5장): 비식별 사본이 S3에 안착하고 페이지별 검증(5.1 bbox
 커버리지 + 5.2 재OCR 잔류)을 **모두** 통과해야 ``job.s3_key`` 원본을 지운다. 검증 실패는
 예외가 아니라 "원본 보존 + 경고 로그"다 — 복구 가능한 방향으로만 실패시킨다.
@@ -83,15 +109,21 @@ from ocr_worker.masking.spans import PiiLabel
 from ocr_worker.masking.verify import MaskingError, assert_no_residual
 from ocr_worker.ocr import OcrProcessor, OcrResult, PageImage, get_processor
 from ocr_worker.repository import (
+    ClaimDocument,
     DeleteRetryState,
     OcrResultRecord,
     PendingDeletion,
     build_masked_lines,
     clear_job_failure,
+    fetch_claim_documents,
+    fetch_claim_readiness,
     fetch_due_deletions,
     find_ocr_result,
+    mark_claim_blocked,
+    mark_claim_published,
     record_delete_failure,
     record_delete_success,
+    record_document_terminal,
     record_job_failure,
     save_ocr_result,
 )
@@ -101,7 +133,28 @@ from ocr_worker.vlm_client import VlmClientError, ground_pii, transcribe_table
 logger = get_logger(__name__)
 
 # 결정적 report_id 파생용 네임스페이스(같은 ocr_result_id → 같은 report_id → 완전 멱등).
+# 청구에 묶이지 않은 **단독 문서**(claim_id 없음) 경로에서만 쓴다 — 청구 경로는 Spring이
+# 청구 전체에 이미 부여한 ``OcrJob.report_id``를 그대로 쓴다(_publish_claim_report).
 _REPORT_ID_NAMESPACE = uuid.NAMESPACE_URL
+
+# 청구 리포트를 만들기 위해 **반드시 인식돼 있어야** 하는 문서 유형.
+# 보험증권·진단서는 업로드 자체가 필수라(게이트웨이가 강제) 청구의 모든 문서가 종결된
+# 시점에도 이 유형이 안 잡혔다면, 그건 "사용자가 안 올렸다"가 아니라 **"올렸는데 인식을
+# 못 했다"**는 뜻이다 — 분류가 다른 유형으로 새거나(OTHER 폴백) 마스킹 잔류·파일 디코드
+# 실패로 저장 자체가 안 된 경우다. 그래서 사용자에게 필요한 후속 조치도 "다시 업로드"가
+# 아니라 **"해당 문서를 다시 촬영"**이고, blocked 사유(missing_doc_types)는 그 안내 근거다.
+#
+# 알려진 트레이드오프(의도적, 2026-08 결정): 이 판정은 doc_type만 보고
+# doc_type_confidence는 안 본다. classify()의 hint-only 승격(본문 근거 0점이어도
+# doc_type_hint를 채택)이 만든 저신뢰 POLICY/DIAGNOSIS 분류도 여기선 "인식됨"으로
+# 친다. 이건 hint 승격을 만든 이유(저화질 증권·진단서 사진이 OTHER로 폴백해 fan-in을
+# 놓치는 것 방지)와 정확히 같은 방향이라 의도한 결과다 — 다만 반대급부로 "화질은
+# 좋은데 완전히 엉뚱한 문서가 hint 하나로 POLICY/DIAGNOSIS 행세를 하는" 오탐은 여기서
+# 못 막는다(ocr_quality도 텍스트가 선명하면 안 잡는다). "화질 나쁜 진짜 문서"가
+# "화질 좋은 엉뚱한 문서"보다 훨씬 흔할 거라 보고 지금은 감수한다. 신뢰도를 반영해
+# hint-only 승격을 여기서 걸러내려면 fetch_claim_documents가 doc_type_confidence도
+# 읽어와야 한다(현재 미저장) — 필요해지면 별도 작업으로.
+_REQUIRED_DOC_TYPES: frozenset[DocType] = frozenset({DocType.POLICY, DocType.DIAGNOSIS})
 # 비식별 이미지 사본 키 공간 — 원본 키와 분리(원본은 별도 보존정책).
 _MASKED_IMAGE_CONTENT_TYPE = "image/png"
 
@@ -186,6 +239,64 @@ def _encode_pngs(redacted_pages: list[RedactedPage]) -> list[bytes]:
 def _derive_report_id(ocr_result_id: str) -> str:
     """``ocr_result_id``에서 결정적 ``report_id``를 파생한다(재발행 시 동일 값)."""
     return str(uuid.uuid5(_REPORT_ID_NAMESPACE, f"report:{ocr_result_id}"))
+
+
+@dataclass(frozen=True, slots=True)
+class _ClaimContext:
+    """fan-in에 필요한 값이 모두 갖춰진 청구 컨텍스트(``_claim_context`` 반환).
+
+    ``report_id``가 ``str``이 아니라 ``uuid.UUID``인 게 요점이다 — 형식 검증을 진입
+    시점에 한 번 끝내, 저장 이후 단계에서 변환 예외가 터져 fan-in이 영구 정지하는 경로를
+    없앤다(``repository.record_document_terminal`` 참고).
+
+    Attributes:
+        claim_id: 청구 식별자.
+        doc_total: 청구 총 문서 수(fan-in 완료 기준).
+        report_id: Spring이 청구 전체에 부여한 ``REPORTS.id``(검증된 UUID).
+    """
+
+    claim_id: str
+    doc_total: int
+    report_id: uuid.UUID
+
+
+def _claim_context(job: OcrJob) -> _ClaimContext | None:
+    """청구 fan-in 대상이면 컨텍스트를, 단독 문서/계약 이상이면 ``None``을 돌려준다.
+
+    fan-in이 성립하려면 셋이 다 필요하다: ``claim_id``(형제 문서를 묶는 키),
+    ``doc_total``("몇 건이 모여야 끝인가"), 그리고 **UUID로 파싱되는** ``report_id``
+    (청구 대표 리포트의 멱등 키이자 ``ai.claim_readiness.report_id`` NOT NULL 컬럼 값).
+
+    이 판정을 모든 호출부(``_process``·멱등 단락·``advance_claim_progress``)가 **공유**
+    하는 게 중요하다. 조건이 갈리면 첫 처리는 문서별로 발행해 놓고 재전달 때는 청구
+    경로로 빠져 아무것도 재발행하지 않는, 경로마다 다른 동작이 생긴다.
+
+    ``claim_id``는 있는데 나머지가 빠진 조합은 **발행측 계약 위반**이다(``OcrJob``에서
+    ``report_id``는 필수, 청구 문서에는 ``doc_total``이 실려야 한다). 조용히 넘기지 않고
+    경고를 남긴다 — 이 조합은 문서별 즉시 발행으로 폴백하는데, 그 경로의 ``report_id``는
+    ``ocr_result_id``에서 파생한 값이라 report_worker가 ``REPORTS`` 행을 찾지 못해
+    **아무 일도 일어나지 않을 수 있다**(크로스팀 확인 필요 — ``_publish_report`` 참고).
+    """
+    if job.claim_id is None:
+        return None  # 청구에 묶이지 않은 단독 문서 — 정상 경로
+    report_id = None if job.doc_total is None else _as_report_uuid(job.report_id)
+    if job.doc_total is None or report_id is None:
+        logger.warning(
+            "claim_context_incomplete",
+            claim_id=job.claim_id,
+            has_doc_total=job.doc_total is not None,
+            report_id_parsable=report_id is not None,
+        )
+        return None
+    return _ClaimContext(claim_id=job.claim_id, doc_total=job.doc_total, report_id=report_id)
+
+
+def _as_report_uuid(report_id: str) -> uuid.UUID | None:
+    """``report_id``를 UUID로 파싱한다(형식 오류면 ``None`` — 값은 로그에 남기지 않는다)."""
+    try:
+        return uuid.UUID(report_id)
+    except ValueError:
+        return None
 
 
 def _failure_class(exc: Exception) -> str:
@@ -313,6 +424,11 @@ class OcrPipeline:
         ``UnreadableFileError``는 ``OcrError``이기도 해서 순서가 뒤집히면 확정 실패가
         ``terminal=False``로 기록되고, 컨슈머는 즉시 ack 대신 재전달을 반복한다.
 
+        청구에 묶인 문서(``claim_id``+``doc_total``)면 발행이 여기서 바로 일어나지
+        않는다 — 성공·확정 실패 **양쪽 모두** 이 문서의 종결을 청구 카운터에 반영하고
+        (``advance_claim_progress``), 마지막 문서를 끝낸 호출만 청구 대표 ``ReportJob``
+        을 낸다(모듈 docstring의 "청구 fan-in" 절).
+
         Args:
             job: 검증된 ``OcrJob``.
 
@@ -326,9 +442,7 @@ class OcrPipeline:
         try:
             existing = await find_ocr_result(self._pool, job.job_id)
             if existing is not None:
-                ocr_result_id, doc_type, ocr_quality = existing
-                logger.info("job already processed → republish", ocr_result_id=ocr_result_id)
-                await self._publish_report(job, ocr_result_id, doc_type, ocr_quality)
+                await self._replay_processed(job, existing)
             else:
                 await self._process(job)
             # 회복 경로: 이전 시도가 남긴 일시 실패 행을 지운다. 멱등 단락도 "이 작업은
@@ -336,7 +450,16 @@ class OcrPipeline:
             # 실패로 기록된 작업이 재전달로 여기 도달하는 게 정확히 그 경우다.
             await self._clear_failure(job)
         except NonRetryableError as exc:
-            await self._journal_terminal(job, exc)
+            # 저널 기록과 청구 종결 카운트는 **한 트랜잭션**이라 함께 커밋되거나 함께
+            # 롤백된다(``_journal_terminal``). 실패한 문서도 세야 나머지가 멀쩡한 청구가
+            # 영영 pending에 갇히지 않는다 — 무엇이 실제로 인식됐는지는 ocr_results
+            # 재조회가 따로 판정하므로, 실패 문서를 세는 것이 판정을 왜곡하지 않는다.
+            progress = await self._journal_terminal(job, exc)
+            if progress is not None:
+                # 판정·발행은 트랜잭션 **밖**에서 한다(SQS 왕복을 트랜잭션에 담지 않는다).
+                # 여기서 죽어도 멱등 단락이 "다 모였는데 pending"을 보고 재개한다.
+                claim, terminal_count = progress
+                await self._judge_claim(job, claim, terminal_count)
             raise
         except Exception as exc:
             await self._journal_transient(job, exc)
@@ -344,7 +467,62 @@ class OcrPipeline:
         finally:
             clear_context()
 
-    async def _journal_terminal(self, job: OcrJob, exc: Exception) -> None:
+    async def _replay_processed(self, job: OcrJob, existing: tuple[str, DocType, str]) -> None:
+        """이미 저장된 문서가 재전달됐을 때의 처리(멱등 단락 본문).
+
+        **여기서 청구 종결 카운터를 절대 다시 올리지 않는다.** 카운터는 이 문서가
+        *처음* 종결됐을 때(``_process`` 끝 또는 결정적 실패 저널 직후) 딱 한 번
+        오른다. 재전달로 여기 들어온 것은 "이미 세어진 문서를 다시 보는 것"일 뿐이라,
+        한 번 더 세면 아직 문서가 남았는데도 fan-in이 완성돼 미완성 청구로 리포트가
+        나가거나, 반대로 카운트가 doc_total을 넘겨 영영 발행 조건을 못 맞춘다.
+
+        단독 문서(``claim_id`` 없음)는 기존대로 ``ReportJob``을 재발행한다. 청구 문서는
+        진행 상태에 따라 셋으로 갈린다:
+        - ``published``: 발행 후 ack 전에 죽었을 수 있다 → 같은 ``report_id``로 안전망
+          재발행(다운스트림은 ``report_id`` 멱등이라 중복이 무해하다).
+        - **모든 문서가 종결됐는데 아직 ``pending``**: 카운트까지는 커밋됐는데 그 뒤
+          판정·발행 단계에서 죽었다는 뜻이다(예: ``producer.send`` 실패). 상태만 보고
+          "아직 안 됐다"로 넘기면 아무도 다시 판정해 주지 않아 **영구 정지**한다 —
+          카운터는 그대로 두고 판정만 재실행한다.
+        - 그 외(``blocked``, 문서가 남은 ``pending``, 행 없음): 낼 리포트 자체가 아직
+          (또는 영영) 없다 → 조용히 끝낸다.
+        """
+        ocr_result_id, doc_type, ocr_quality = existing
+        logger.info("job already processed → republish", ocr_result_id=ocr_result_id)
+        claim = _claim_context(job)
+        if claim is None:
+            await self._publish_report(job, ocr_result_id, doc_type, ocr_quality)
+            return
+        readiness = await fetch_claim_readiness(self._pool, claim.claim_id)
+        if readiness is None:
+            # 이 문서가 첫 종결이었는데 행이 없다 = 저장과 카운트가 갈라진 상태. 저장과
+            # 카운트를 한 트랜잭션으로 묶은 뒤로는 발생할 수 없다(둘 다 없거나 둘 다 있다).
+            logger.warning("claim_readiness_missing", claim_id=claim.claim_id)
+            return
+        if readiness.status == "published":
+            docs = await fetch_claim_documents(self._pool, claim.claim_id)
+            await self._publish_claim_report(job, docs)
+            return
+        if readiness.status == "pending" and readiness.all_documents_terminal:
+            logger.info(
+                "claim_judgement_resumed",
+                claim_id=claim.claim_id,
+                docs_terminal=readiness.docs_terminal,
+                doc_total=readiness.doc_total,
+            )
+            await self._judge_claim(job, claim, readiness.docs_terminal)
+            return
+        logger.info(
+            "claim_report_not_due",
+            claim_id=claim.claim_id,
+            claim_status=readiness.status,
+            docs_terminal=readiness.docs_terminal,
+            doc_total=readiness.doc_total,
+        )
+
+    async def _journal_terminal(
+        self, job: OcrJob, exc: Exception
+    ) -> tuple[_ClaimContext, int] | None:
         """결정적 실패를 ``terminal=True``로 기록한다. **기록 실패 시 예외를 바꿔 던진다.**
 
         여기서만 저널 실패를 삼키지 않는 이유: 컨슈머는 ``NonRetryableError``를 보면
@@ -359,15 +537,36 @@ class OcrPipeline:
 
         원래 예외는 유실되지 않는다 — 저널 예외가 직접 원인(``__cause__``)이고, 그 저널
         예외가 다시 원래 실패를 ``__context__``로 물고 있어 예외 체인에 둘 다 남는다.
+
+        청구 문서면 종결 카운트를 **같은 트랜잭션에서** 함께 남긴다. 둘이 갈리면
+        "저널엔 확정 실패로 찍혔는데 청구는 그 문서를 못 센" 상태가 되고, 그 문서는
+        컨슈머가 즉시 ack해 사라지므로 카운트를 재시도할 기회가 영영 없다 — 형제 문서가
+        모두 정상이어도 청구가 ``pending``에 갇힌다. 반대로 카운트만 커밋되고 저널이
+        실패하면 무음 실패로 되돌아간다. 둘 다 아니거나 둘 다여야 한다.
+
+        Returns:
+            청구 문서면 ``(청구 컨텍스트, 갱신 후 종결 문서 수)``, 단독 문서면 ``None``.
+            호출측이 이 값으로 트랜잭션 **밖에서** 판정·발행을 이어간다.
         """
+        claim = _claim_context(job)
         try:
-            await record_job_failure(
-                self._pool,
-                job,
-                failure_class=_failure_class(exc),
-                error_type=type(exc).__name__,
-                terminal=True,
-            )
+            async with self._pool.acquire() as conn, conn.transaction():
+                await record_job_failure(
+                    conn,
+                    job,
+                    failure_class=_failure_class(exc),
+                    error_type=type(exc).__name__,
+                    terminal=True,
+                )
+                if claim is None:
+                    return None
+                terminal_count = await record_document_terminal(
+                    conn,
+                    claim_id=claim.claim_id,
+                    job_id=job.job_id,
+                    report_id=claim.report_id,
+                    doc_total=claim.doc_total,
+                )
         except Exception as journal_exc:
             # 예외는 타입만 남긴다(§9) — 원래 예외 타입도 함께 남겨야 무엇을 기록하려다
             # 실패했는지 로그만으로 추적된다.
@@ -377,6 +576,7 @@ class OcrPipeline:
                 original_error_type=type(exc).__name__,
             )
             raise RuntimeError("실패 저널 기록 실패 — 재전달로 재시도") from journal_exc
+        return claim, terminal_count
 
     async def _journal_transient(self, job: OcrJob, exc: Exception) -> None:
         """일시 실패를 ``terminal=False``로 기록한다(기록 실패는 삼킨다).
@@ -486,20 +686,55 @@ class OcrPipeline:
             # 아래 즉시 삭제가 실패하거나 그 전에 crash가 나도 스윕이 이어받는다.
             original_s3_key=job.s3_key,
             original_delete_eligible=track.delete_original,
+            # 청구 컨텍스트(마이그레이션 009) — fan-in이 claim_id로 형제 문서를 되짚는다.
+            claim_id=job.claim_id,
+            report_id=job.report_id,
+            attachment_id=job.attachment_id,
+            doc_index=job.doc_index,
+            doc_total=job.doc_total,
         )
-        ocr_result_id = await save_ocr_result(
-            self._pool,
-            record,
-            # 첫 스윕 인수 시점을 한 주기 미뤄, 아래 즉시 삭제 task가 S3 왕복 중일 때
-            # 스윕이 같은 키를 중복 집행하지 않게 한다(attempts 예산 이중 소모 방지).
-            delete_retry_interval_seconds=self._settings.ocr_delete_retry_interval_seconds,
-        )
-        # 원본 삭제는 **저장 성공 이후**에만 트리거한다. 저장 전에 지우면 일시적 DB 오류로
-        # 인한 인프로세스 재시도가 "원본이 없어 OCR 실패"로 승격돼 복구 불가가 된다.
+        # 저장과 청구 종결 카운트는 **한 트랜잭션**으로 묶는다. 갈라 두면 "저장은 커밋
+        # 됐는데 카운트만 실패"가 생기는데, 그 상태는 스스로 낫지 않는다: 재전달돼도
+        # 진입부 멱등 단락이 저장된 행을 보고 무거운 처리를 건너뛰므로 카운트를 다시
+        # 시도할 지점이 없고, 형제 문서가 전부 정상 종결돼도 doc_total에 영영 못 닿아
+        # 리포트가 나가지 않는다(QA 실측). 한 트랜잭션이면 저장이 실패할 때 아무것도
+        # 남지 않아(재전달 시 _process 전체 재실행 — OCR 재수행 비용은 있지만 정확),
+        # 저장이 성공하면 카운트도 반드시 함께 성공한다.
+        claim = _claim_context(job)
+        async with self._pool.acquire() as conn, conn.transaction():
+            ocr_result_id = await save_ocr_result(
+                conn,
+                record,
+                # 첫 스윕 인수 시점을 한 주기 미뤄, 아래 즉시 삭제 task가 S3 왕복 중일 때
+                # 스윕이 같은 키를 중복 집행하지 않게 한다(attempts 예산 이중 소모 방지).
+                delete_retry_interval_seconds=self._settings.ocr_delete_retry_interval_seconds,
+            )
+            terminal_count = (
+                None
+                if claim is None
+                else await record_document_terminal(
+                    conn,
+                    claim_id=claim.claim_id,
+                    job_id=job.job_id,
+                    report_id=claim.report_id,
+                    doc_total=claim.doc_total,
+                )
+            )
+
+        # 아래는 전부 **커밋 이후**다. 원본 삭제(S3)·발행(SQS) 같은 외부 왕복을 트랜잭션
+        # 안에 담으면 잠금을 네트워크 지연만큼 붙들게 되고, 롤백돼도 되돌릴 수 없다.
+        # 원본 삭제는 저장 성공 이후에만 트리거한다 — 저장 전에 지우면 일시적 DB 오류로
+        # 인한 재전달 재처리가 "원본이 없어 OCR 실패"로 승격돼 복구 불가가 된다.
         # 다만 완료는 기다리지 않는다 — 발행이 S3 왕복 뒤로 밀릴 이유가 없다.
         if track.delete_original:
             self._schedule_original_delete(job, ocr_result_id)
-        await self._publish_report(job, ocr_result_id, analysis.doc_type, ocr_quality)
+        # 청구에 묶인 문서면 곧바로 발행하지 않는다 — 청구의 **모든** 문서가 종결되고
+        # 필수 유형이 다 인식됐을 때 청구당 1건만 나가야 한다(fan-in). 단독 문서는
+        # 기존대로 문서별 즉시 발행(하위 호환).
+        if claim is not None and terminal_count is not None:
+            await self._judge_claim(job, claim, terminal_count)
+        else:
+            await self._publish_report(job, ocr_result_id, analysis.doc_type, ocr_quality)
 
     async def _extract_pages(
         self, images: list[PageImage], result: OcrResult
@@ -897,11 +1132,21 @@ class OcrPipeline:
     ) -> None:
         """``ReportJob``을 ``report-job`` 큐에 발행한다(Standard 큐 — 파티션 키 없음).
 
+        **단독 문서 전용 경로**다. 청구에 묶인 문서는 ``_publish_claim_report``가 청구당
+        1건만 낸다.
+
         ``report_id``는 ``ocr_result_id``에서 결정적으로 파생해 재발행 시 동일하다 —
         report_worker가 ``report_id``/``ocr_result_id`` 어느 쪽으로 멱등 처리해도 안전하다.
         ``claim_id``는 가공 없이 패스스루한다(USER_CLAIMS는 report_worker가 직접 읽음).
         ``ocr_quality``가 ``needs_reupload``면 report_worker가 리포트 생성을 건너뛸 신호다
         (report_worker·게이트웨이 쪽 소비는 이번 범위 밖).
+
+        **크로스팀 확인 필요(파생 report_id)**: report_worker가 결과를 쓸 때
+        ``UPDATE reports ... WHERE id = report_id``로 Spring이 미리 만든 shell 행을
+        갱신한다면, 여기서 파생한 ``report_id``는 그 행과 매칭되지 않아 0건 갱신으로
+        조용히 끝난다. ``OcrJob.report_id``는 이제 **필수 필드**이므로 모든 발행이 그
+        값을 쓰는 게 맞을 수 있는데, 그건 이 경로(문서별 멱등 재발행)의 의미를 바꾸는
+        변경이라 report_worker 담당과 합의가 필요하다 — 이번 범위 밖으로 남긴다.
         """
         report_id = _derive_report_id(ocr_result_id)
         report = ReportJob(
@@ -915,3 +1160,129 @@ class OcrPipeline:
             ocr_quality=ocr_quality,
         )
         await self._producer.send(self._settings.sqs_report_job_queue_url, report)
+
+    async def advance_claim_progress(self, job: OcrJob) -> None:
+        """이 문서의 **종결**을 청구 진행에 반영하고, 마지막이면 fan-in을 판정한다.
+
+        공개 메서드인 이유: 파이프라인 내부(성공·결정적 실패)뿐 아니라 워커 진입점의
+        poison 훅(``__main__._poison_journal``)도 "이 문서는 끝났다"를 알려야 한다 —
+        재시도를 소진해 큐에서 걷힌 문서를 안 세면 그 청구가 영영 ``pending``에 갇힌다.
+
+        **성공·실패를 구분하지 않고 똑같이 호출된다**는 게 이 설계의 핵심이다. 카운터는
+        "몇 건이 끝났나"만 세고, "무엇이 인식됐나"는 ``ai.ocr_results``를 다시 조회해
+        판정한다(성공한 문서만 행이 있다). 그래서 3건 중 2건 성공 + 1건 마스킹 잔류
+        실패로 끝난 청구도, 그 2건이 필수 유형을 채우면 정상적으로 발행된다 — 마지막
+        카운트를 채운 게 실패한 문서였다는 사실은 판정에 아무 영향이 없다.
+
+        카운트는 **문서별 멱등**이라(``record_document_terminal``) 같은 문서로 여러 번
+        불려도 안전하다 — poison 훅이 이미 세어진 문서를 다시 알려도 수가 늘지 않는다.
+
+        Args:
+            job: 방금 종결된 문서의 작업. 청구 컨텍스트가 없으면(단독 문서 또는 발행측
+                계약 이상) 아무 일도 하지 않는다 — 그 경로는 문서별 즉시 발행을 그대로
+                쓴다(하위 호환, ``_claim_context`` 참고).
+        """
+        claim = _claim_context(job)
+        if claim is None:
+            return  # 단독 문서 — fan-in 대상이 아니다
+        terminal_count = await record_document_terminal(
+            self._pool,
+            claim_id=claim.claim_id,
+            job_id=job.job_id,
+            report_id=claim.report_id,
+            doc_total=claim.doc_total,
+        )
+        await self._judge_claim(job, claim, terminal_count)
+
+    async def _judge_claim(self, job: OcrJob, claim: _ClaimContext, terminal_count: int) -> None:
+        """모든 문서가 종결됐으면 필수 유형 충족을 판정해 발행하거나 ``blocked``로 막는다.
+
+        카운트를 올린 트랜잭션 **밖**에서 부른다 — 여기에는 SQS 왕복(발행)이 들어 있어
+        트랜잭션에 담으면 네트워크 지연만큼 행 잠금을 붙들게 되고, 롤백돼도 이미 나간
+        메시지를 되돌릴 수 없다. 그 대신 이 단계에서 죽으면 "모든 문서 종결 + 여전히
+        ``pending``" 상태가 남고, 멱등 단락이 그걸 보고 판정을 재개한다
+        (``_replay_processed``) — 재개 가능성이 트랜잭션 밖으로 뺀 대가를 상쇄한다.
+
+        멱등하다: 재개로 두 번 불려도 ``blocked``는 같은 값으로 다시 찍히고, 발행은 같은
+        ``report_id``라 다운스트림이 중복을 흡수한다.
+        """
+        if terminal_count < claim.doc_total:
+            return  # 아직 종결되지 않은 형제 문서가 있다 — 마지막 문서가 판정한다
+
+        docs = await fetch_claim_documents(self._pool, claim.claim_id)
+        missing = _REQUIRED_DOC_TYPES - {doc.doc_type for doc in docs}
+        if missing:
+            missing_types = sorted(doc_type.value for doc_type in missing)
+            await mark_claim_blocked(
+                self._pool, claim_id=claim.claim_id, missing_doc_types=missing_types
+            )
+            # 운영·사용자 안내 신호: 필수 문서를 "안 올린" 게 아니라 **못 읽은** 상태다
+            # (게이트웨이가 업로드를 강제한다) — 후속 조치는 재촬영이다.
+            logger.warning(
+                "claim_blocked_missing_required_docs",
+                claim_id=claim.claim_id,
+                missing=missing_types,
+                recognized_docs=len(docs),
+                doc_total=claim.doc_total,
+            )
+            return
+
+        # 발행 **전에** 도장을 찍는다 — 발행 후 crash로 ack를 못 하면 재전달되는데,
+        # 그때 멱등 단락이 이 상태를 보고 같은 report_id로 안전망 재발행을 한다.
+        # 순서가 뒤집히면(발행 후 기록) 발행 직후~기록 전에 죽었을 때 상태가 pending으로
+        # 남아 재개 경로가 **한 번 더 발행**하게 되고, 기록이 끝내 실패하면 그 청구는
+        # 재전달마다 리포트를 다시 낸다.
+        await mark_claim_published(self._pool, claim.claim_id)
+        await self._publish_claim_report(job, docs)
+
+    async def _publish_claim_report(self, job: OcrJob, docs: list[ClaimDocument]) -> None:
+        """청구 **전체**를 대표하는 ``ReportJob`` 1건을 발행한다.
+
+        ``ReportJob``은 원래 문서 1건짜리 계약이라 ``ocr_result_id``·``doc_type``이 단일
+        필수값이다. 청구 여러 문서를 대표하려면 값을 골라야 하고, 이건 계약을 아직 안
+        바꾼 데서 오는 **임시방편**이다(정공법은 report_worker가 ``claim_id``로
+        ``ai.ocr_results``를 직접 훑어 전체 문서를 보는 것 — 다른 워커 소관이라 별건):
+        - 대표 문서: 보험증권(``POLICY``) 우선, 없으면 첫 문서(``doc_index`` 순).
+          증권이 계약 조건·보장 범위의 기준 문서라 리포트의 앵커로 가장 적합하다.
+        - ``ocr_quality``: **집계** — 문서 하나라도 ``needs_reupload``면 청구 전체를
+          그렇게 본다. report_worker의 기존 스킵 로직이 청구 단위에서도 그대로 작동해야
+          하고, 저품질 문서 하나가 리포트 전체의 신뢰도를 깎기 때문이다.
+        - ``report_id``: ``job.report_id``(Spring이 청구 전체에 이미 부여한 ``REPORTS.id``)
+          를 그대로 쓴다 — ``_derive_report_id``(문서별 파생)가 아니다. 재발행해도 같은
+          값이라 다운스트림 멱등이 유지된다.
+        - ``job_id``: fan-in을 완성시킨(=마지막으로 종결된) 문서의 작업 id. 청구 전체를
+          가리키는 단일 값이 계약에 없어 추적용으로 그 문서를 남긴다.
+        """
+        if not docs:
+            # 정상 경로에선 도달할 수 없다(문서가 하나도 없으면 필수 유형이 전부 빠져
+            # blocked로 끝난다). 멱등 단락의 안전망 재발행이 데이터 정리 뒤에 들어오는
+            # 등 예외적 경우에만 가능한데, 여기서 IndexError를 내면 무해한 재전달이
+            # 실패 루프로 승격된다.
+            logger.warning("claim_report_skipped", claim_id=job.claim_id, reason="no_documents")
+            return
+        representative = next(
+            (doc for doc in docs if doc.doc_type is DocType.POLICY),
+            docs[0],
+        )
+        ocr_quality = (
+            "needs_reupload" if any(doc.ocr_quality == "needs_reupload" for doc in docs) else "ok"
+        )
+        report = ReportJob(
+            report_id=job.report_id,
+            ocr_result_id=representative.ocr_result_id,
+            job_id=job.job_id,
+            doc_type=representative.doc_type,
+            user_ref=job.user_ref,
+            claim_id=job.claim_id,
+            created_at=datetime.now(UTC),
+            ocr_quality=ocr_quality,
+        )
+        await self._producer.send(self._settings.sqs_report_job_queue_url, report)
+        logger.info(
+            "claim_report_published",
+            claim_id=job.claim_id,
+            report_id=job.report_id,
+            docs=len(docs),
+            doc_type=str(representative.doc_type),
+            ocr_quality=ocr_quality,
+        )

@@ -8,6 +8,9 @@ ack(DeleteMessage)·poison 스킵·프로듀서·마이그레이션·업서트 �
 검증 시나리오(계획 §검증 3·4):
 1. 정상: ``ocr-job-queue``에 ``OcrJob`` 주입 → consume→OCR→마스킹→저장→``report-job``
    발행까지 이어지고, 발행 페이로드가 계약(``ReportJob``)과 일치하는가.
+1b. 청구 fan-in: 한 청구의 문서 2건을 각각 넣으면, 둘 다 종결되고 필수 유형이 다
+   인식됐을 때 ``ReportJob``이 **정확히 1건**만(Spring이 부여한 ``report_id``로) 나가고
+   ``ai.claim_readiness``가 ``published``로 확정되는가.
 2. 멱등: 같은 ``job_id`` 재투입 시 ``ocr_results`` 행은 하나만 유지되고, 결정적
    ``report_id``로 ``ReportJob``만 재발행되는가(무거운 OCR은 1회만).
 3. Poison 스킵(DLQ 대체): 깨진 페이로드가 삭제되지 않아 재전달되다가, 수신 횟수 상한을
@@ -52,6 +55,24 @@ class FakeProcessor:
     ) -> tuple[OcrResult, list[object]]:
         self.calls += 1
         return self._result, [object()]  # 이미지 내용은 페이크 이미지 트랙이 무시
+
+
+class _SequencedProcessor:
+    """S3 키마다 다른 OCR 결과를 돌려주는 프로세서 대역(청구 fan-in 테스트용).
+
+    청구는 서로 다른 유형의 문서로 이루어지므로, 고정 결과 하나로는 필수 유형 충족
+    (증권+진단서)을 재현할 수 없다.
+    """
+
+    def __init__(self, results: dict[str, OcrResult]) -> None:
+        self._results = results
+        self.calls = 0
+
+    async def process_with_images(
+        self, s3_key: str, content_type: str
+    ) -> tuple[OcrResult, list[object]]:
+        self.calls += 1
+        return self._results[s3_key], [object()]
 
 
 async def _fake_image_pipeline(
@@ -172,7 +193,7 @@ async def _run_worker_until(
 
 
 def _pipeline(
-    settings: Settings, pool: asyncpg.Pool, producer: SqsProducer, processor: FakeProcessor
+    settings: Settings, pool: asyncpg.Pool, producer: SqsProducer, processor: Any
 ) -> OcrPipeline:
     """실 pool·producer에 페이크 OCR/이미지 트랙을 배선한 파이프라인을 만든다.
 
@@ -205,10 +226,12 @@ async def test_e2e_consume_ocr_persist_publish(
     processor = FakeProcessor(
         _ocr_result("보험증권", "증권번호 202301-042", "홍길동 901010-1234567")
     )
+    # 청구에 묶이지 않은 **단독 문서**(claim_id 없음) = 문서별 즉시 발행 경로.
+    # 청구 fan-in은 아래 전용 테스트가 따로 덮는다.
     await _send(
         sqs_client,
         e2e_settings.sqs_ocr_job_queue_url,
-        _job(job_id, claim_id="claim-e2e").model_dump_json(),
+        _job(job_id, claim_id=None).model_dump_json(),
     )
 
     # Act: ReportJob이 발행될 때까지(=핸들러 저장·발행 완료) 워커를 돌리며 report 큐를 수거한다.
@@ -244,7 +267,73 @@ async def test_e2e_consume_ocr_persist_publish(
     assert report.job_id == job_id
     assert report.doc_type is DocType.POLICY
     assert report.user_ref == "user-e2e"
-    assert report.claim_id == "claim-e2e"  # 패스스루
+    assert report.claim_id is None
+
+
+# ── 1b. 청구 fan-in(문서 2건 → 리포트 1건) ──────────────────────
+async def test_e2e_claim_fan_in_publishes_one_report_for_all_documents(
+    e2e_settings: Settings, e2e_pool: asyncpg.Pool, sqs_client: Any
+) -> None:
+    # Arrange: 한 청구의 문서 2건(증권·진단서)을 각각 독립 메시지로 넣는다. 예전에는
+    # 문서마다 ReportJob이 나가 청구 1건이 리포트 2건을 만들었다 — 이제 두 문서가 모두
+    # 종결되고 필수 유형(증권+진단서)이 다 인식됐을 때 **정확히 1건**만 나가야 한다.
+    claim_id = f"claim-{uuid.uuid4()}"
+    report_id = str(uuid.uuid4())
+    processor = _SequencedProcessor(
+        {
+            "uploads/policy.pdf": _ocr_result("보험증권", "증권번호 202301-042"),
+            "uploads/diagnosis.pdf": _ocr_result("진단서", "상병명 골절"),
+        }
+    )
+    for index, s3_key in enumerate(("uploads/policy.pdf", "uploads/diagnosis.pdf"), start=1):
+        await _send(
+            sqs_client,
+            e2e_settings.sqs_ocr_job_queue_url,
+            _job(
+                str(uuid.uuid4()),
+                s3_key=s3_key,
+                claim_id=claim_id,
+                report_id=report_id,
+                doc_index=index,
+                doc_total=2,
+            ).model_dump_json(),
+        )
+
+    # Act: 청구 대표 리포트가 나올 때까지 돌린다.
+    collected: list[str] = []
+
+    async def report_arrived() -> bool:
+        collected.extend(await _drain_once(sqs_client, e2e_settings.sqs_report_job_queue_url))
+        return len(collected) >= 1
+
+    producer = SqsProducer(e2e_settings)
+    pipeline = _pipeline(e2e_settings, e2e_pool, producer, processor)
+    await _run_worker_until(e2e_settings, pipeline, report_arrived)
+
+    # Assert(DB): 두 문서가 각각 저장되고, 청구가 published로 확정됐다.
+    saved = await e2e_pool.fetchval(
+        "SELECT count(*) FROM ai.ocr_results WHERE claim_id = $1", claim_id
+    )
+    assert saved == 2
+    readiness = await e2e_pool.fetchrow(
+        "SELECT status, docs_terminal, doc_total FROM ai.claim_readiness WHERE claim_id = $1",
+        claim_id,
+    )
+    assert readiness is not None
+    assert (readiness["status"], readiness["docs_terminal"], readiness["doc_total"]) == (
+        "published",
+        2,
+        2,
+    )
+
+    # Assert(SQS): 문서 2건이 리포트 2건을 만들지 않는다. report_id는 Spring이 청구
+    # 전체에 부여한 값 그대로이고(문서별 파생값이 아니다), 대표 문서는 증권이다.
+    collected.extend(await _drain_once(sqs_client, e2e_settings.sqs_report_job_queue_url))
+    assert len(collected) == 1
+    report = ReportJob.model_validate_json(collected[0])
+    assert report.report_id == report_id
+    assert report.claim_id == claim_id  # 패스스루
+    assert report.doc_type is DocType.POLICY
 
 
 # ── 2. 멱등 재투입 ───────────────────────────────────────────────

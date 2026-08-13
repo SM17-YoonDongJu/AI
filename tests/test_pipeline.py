@@ -20,8 +20,10 @@ SQS·DB·GPU·PIL 없이 경계(프로듀서·풀·OCR 프로세서·이미지 �
 """
 
 import asyncio
+import contextlib
 import json
 import uuid
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Any
 
@@ -37,7 +39,7 @@ from ocr_worker.masking.spans import PiiLabel, Span
 from ocr_worker.masking.verify import MaskingError
 from ocr_worker.ocr import OcrLine, OcrPage, OcrResult
 from ocr_worker.pipeline import ImageTrackResult, OcrPipeline, _derive_report_id
-from ocr_worker.repository import DeleteRetryState, PendingDeletion
+from ocr_worker.repository import ClaimDocument, DeleteRetryState, PendingDeletion
 from ocr_worker.vlm_client import VlmClientError
 
 # 삭제가 다시 블로킹이 되면 테스트가 영원히 멎지 않도록 두는 안전 상한(초).
@@ -60,8 +62,37 @@ class FakeProducer:
         self.published.append((queue_url, message))
 
 
+class _FakeConnection:
+    """``pool.acquire()``가 내주는 커넥션 대역 — 풀과 같은 기록 버퍼를 공유한다.
+
+    파이프라인은 저장+청구 카운트를 한 트랜잭션으로 묶을 때만 커넥션을 쓰므로, 여기서
+    할 일은 "같은 실행기가 두 문에 쓰였다"를 관찰 가능하게 만드는 것뿐이다.
+    """
+
+    def __init__(self, pool: "FakePool") -> None:
+        self.pool = pool
+
+    async def fetchrow(self, sql: str, *args: Any) -> dict[str, Any] | None:
+        return await self.pool.fetchrow(sql, *args)
+
+    async def fetch(self, sql: str, *args: Any) -> list[dict[str, Any]]:
+        return await self.pool.fetch(sql, *args)
+
+    async def execute(self, sql: str, *args: Any) -> None:
+        await self.pool.execute(sql, *args)
+
+    def transaction(self) -> Any:
+        return self.pool.transaction()
+
+
 class FakePool:
-    """asyncpg.Pool 대역 — SELECT(멱등 조회)·INSERT(업서트)·실패 저널 쓰기를 받아 기록한다."""
+    """asyncpg.Pool 대역 — SELECT(멱등 조회)·INSERT(업서트)·실패 저널 쓰기를 받아 기록한다.
+
+    ``acquire()``/``transaction()``도 흉내낸다. 트랜잭션은 **롤백까지 모델링**한다 —
+    진입 시 가변 상태를 스냅샷하고 예외로 빠져나가면 되돌린다. 이게 없으면 "저장은
+    커밋됐는데 청구 카운트만 실패"라는, 이번에 없애려는 바로 그 상태를 테스트가 구분할
+    수 없다(둘 다 그냥 기록으로 남아버린다).
+    """
 
     def __init__(
         self, existing: dict[str, Any] | None = None, *, execute_error: Exception | None = None
@@ -69,12 +100,22 @@ class FakePool:
         self._existing = existing
         self._execute_error = execute_error  # 저널 쓰기(DB) 장애 흉내
         self.calls: list[tuple[str, tuple[Any, ...]]] = []
+        self.saved_job_ids: list[Any] = []  # 커밋된 ocr_results 업서트(롤백 시 되돌린다)
+        self.rollbacks = 0
+        self.acquired = 0
 
     async def fetchrow(self, sql: str, *args: Any) -> dict[str, Any] | None:
+        await asyncio.sleep(0)  # 실제 asyncpg처럼 루프에 양보한다
         self.calls.append((sql, args))
         if sql.lstrip().startswith("SELECT"):
             return self._existing
+        self.saved_job_ids.append(args[0])
         return {"id": _SAVE_ID}  # 업서트 RETURNING id
+
+    async def fetch(self, sql: str, *args: Any) -> list[dict[str, Any]]:
+        await asyncio.sleep(0)
+        self.calls.append((sql, args))
+        return []
 
     async def execute(self, sql: str, *args: Any) -> None:
         # 실제 DB 왕복처럼 루프에 양보한다. 이게 없으면 저널 쓰기를 await하지 않고
@@ -84,15 +125,50 @@ class FakePool:
         if self._execute_error is not None:
             raise self._execute_error
 
+    def acquire(self) -> Any:
+        self.acquired += 1
+        return _acquire_cm(self)
+
+    def transaction(self) -> Any:
+        return _transaction_cm(self)
+
+    def snapshot(self) -> tuple[Any, ...]:
+        """트랜잭션 롤백으로 되돌릴 가변 상태(하위 클래스가 확장한다)."""
+        return (list(self.saved_job_ids),)
+
+    def restore(self, snapshot: tuple[Any, ...]) -> None:
+        self.saved_job_ids = list(snapshot[0])
+
     def insert_calls(self) -> list[tuple[str, tuple[Any, ...]]]:
         """``ocr_results`` 업서트만 추린다(실패 저널 쓰기는 제외 — 별도 테이블·별도 계약)."""
         return [
-            call for call in self.calls if "INSERT" in call[0] and "ocr_job_failures" not in call[0]
+            call
+            for call in self.calls
+            if "INSERT" in call[0]
+            and "ocr_job_failures" not in call[0]
+            and "claim_readiness" not in call[0]
         ]
 
     def journal_calls(self) -> list[tuple[str, tuple[Any, ...]]]:
         """실패 저널(``ai.ocr_job_failures``)로 나간 쓰기만 추린다."""
         return [call for call in self.calls if "ai.ocr_job_failures" in call[0]]
+
+
+@contextlib.asynccontextmanager
+async def _acquire_cm(pool: FakePool) -> AsyncIterator[_FakeConnection]:
+    yield _FakeConnection(pool)
+
+
+@contextlib.asynccontextmanager
+async def _transaction_cm(pool: FakePool) -> AsyncIterator[None]:
+    """롤백을 모델링하는 트랜잭션 대역 — 예외로 빠져나가면 스냅샷으로 되돌린다."""
+    snapshot = pool.snapshot()
+    try:
+        yield
+    except Exception:
+        pool.restore(snapshot)
+        pool.rollbacks += 1
+        raise
 
 
 class _FakeImage:
@@ -203,8 +279,9 @@ async def test_full_flow_masks_persists_and_publishes() -> None:
     processor = FakeProcessor(_result("보험증권", "증권번호 202301-042", "홍길동 901010-1234567"))
     pipeline = _pipeline(pool, producer, processor)
 
-    # Act
-    await pipeline.handle(_job(claim_id="claim-9"))
+    # Act: doc_total 없이 claim_id만 실린 문서 = 청구 fan-in 대상이 아닌 단독 문서다
+    # (fan-in 경로는 아래 "청구 fan-in" 섹션이 따로 다룬다). claim_id는 그대로 패스스루된다.
+    await pipeline.handle(_job(claim_id="claim-9", doc_total=None))
 
     # Assert: 무거운 OCR을 실제로 수행했다.
     assert processor.called is True
@@ -1845,3 +1922,647 @@ async def test_clear_failure_error_does_not_fail_the_job() -> None:
     assert len(producer.published) == 1
     warned = [e for e in logs if e["event"] == "ocr_job_failure_clear_failed"]
     assert [e["error_type"] for e in warned] == ["RuntimeError"]
+
+
+# ── 청구 fan-in(ai.claim_readiness, 마이그레이션 009·010) ────────
+# 예전엔 문서 1건이 성공할 때마다 즉시 ReportJob을 발행해, 문서 N건짜리 청구가 리포트를
+# N건 만들었다. 이제 문서가 **종결**될 때마다 청구 종결 카운터를 올리고, 마지막 문서를
+# 끝낸 워커만 필수 유형(증권+진단서) 충족을 판정해 청구당 1건을 발행한다.
+#
+# 카운팅·순서 테스트는 페이크 async 함수에 **진짜 await point**가 없으면 착시가 생긴다
+# (구현이 순서를 어겨도 끼어들 틈이 없어 늘 통과한다) — 아래 _ClaimPool은 실제 asyncpg
+# 처럼 매 호출에서 루프에 양보한다.
+_CLAIM_ID = "claim-1"
+_CLAIM_REPORT_ID = "cccccccc-0000-0000-0000-000000000001"
+_POLICY_DOC_ID = uuid.UUID("aaaa0000-0000-0000-0000-00000000000a")
+_DIAGNOSIS_DOC_ID = uuid.UUID("bbbb0000-0000-0000-0000-00000000000b")
+_OTHER_DOC_ID = uuid.UUID("cccc0000-0000-0000-0000-00000000000c")
+
+
+def _doc_row(doc_id: uuid.UUID, doc_type: DocType, *, ocr_quality: str = "ok") -> dict[str, Any]:
+    """``ai.ocr_results`` 형제 문서 조회가 돌려주는 행."""
+    return {"id": doc_id, "doc_type": doc_type.value, "ocr_quality": ocr_quality}
+
+
+class _ClaimPool(FakePool):
+    """청구 fan-in용 풀 대역 — 종결 집합을 실제로 관리하고 문서 목록·진행 상태를 돌려준다.
+
+    ``terminal_job_ids``는 **집합**이다(운영 SQL의 ``ARRAY … @>``와 같은 의미). 같은
+    문서가 두 번 종결로 보고되면 개수가 늘어야 하는지 아닌지가 이 섹션의 핵심 관측점이라,
+    페이크도 개수 대신 집합을 들고 있어야 그 차이가 드러난다.
+
+    ``events``는 DB 쓰기와 SQS 발행이 **어떤 순서로** 일어났는지 기록한다 —
+    ``mark_claim_published``가 발행보다 먼저여야 한다는 계약을 잠그는 근거다.
+    """
+
+    def __init__(
+        self,
+        *,
+        docs: list[dict[str, Any]] | None = None,
+        claim_status: str | None = None,
+        existing: dict[str, Any] | None = None,
+        terminal_job_ids: list[str] | None = None,
+        doc_total: int | None = None,
+        execute_error: Exception | None = None,
+        progress_error: Exception | None = None,
+    ) -> None:
+        super().__init__(existing=existing, execute_error=execute_error)
+        self.docs = list(docs or [])
+        self.claim_status = claim_status
+        self.terminal_job_ids: list[str] = list(terminal_job_ids or [])
+        self.readiness_doc_total = doc_total
+        self._progress_error = progress_error  # 청구 카운트 쓰기만 실패시키는 주입점
+        self.blocked: list[tuple[str, list[str]]] = []
+        self.published_marks: list[str] = []
+        self.events: list[str] = []
+
+    @property
+    def docs_terminal(self) -> int:
+        """종결이 보고된 **서로 다른** 문서 수(= 운영 SQL의 생성 컬럼)."""
+        return len(self.terminal_job_ids)
+
+    async def fetchrow(self, sql: str, *args: Any) -> dict[str, Any] | None:
+        # 실제 asyncpg처럼 반드시 루프에 양보한다(동시성 테스트의 인터리빙 근거).
+        await asyncio.sleep(0)
+        self.calls.append((sql, args))
+        if "ai.claim_readiness" in sql:
+            if sql.lstrip().startswith("INSERT"):
+                return self._upsert_progress(args)
+            return self._readiness_row()
+        if sql.lstrip().startswith("SELECT"):
+            return self._existing
+        self.saved_job_ids.append(args[0])
+        self.events.append("save")
+        return {"id": _SAVE_ID}  # ocr_results 업서트 RETURNING id
+
+    def _upsert_progress(self, args: tuple[Any, ...]) -> dict[str, Any]:
+        """``_UPSERT_CLAIM_PROGRESS_SQL`` 흉내 — job_id를 집합에 넣고 크기를 돌려준다.
+
+        읽기~쓰기 사이에 await point를 두지 않는다(운영에서는 단일 문이라 원자적).
+        """
+        if self._progress_error is not None:
+            raise self._progress_error
+        claim_id, _report_id, doc_total, job_id = args
+        if self.readiness_doc_total is None:
+            self.readiness_doc_total = doc_total
+        if job_id not in self.terminal_job_ids:  # ARRAY @> 흉내 — 중복 보고는 무시
+            self.terminal_job_ids.append(job_id)
+        if self.claim_status is None:
+            self.claim_status = "pending"
+        self.events.append(f"count:{claim_id}")
+        return {"docs_terminal": self.docs_terminal}
+
+    def _readiness_row(self) -> dict[str, Any] | None:
+        if self.claim_status is None:
+            return None
+        return {
+            "status": self.claim_status,
+            "docs_terminal": self.docs_terminal,
+            "doc_total": self.readiness_doc_total if self.readiness_doc_total is not None else 0,
+        }
+
+    async def fetch(self, sql: str, *args: Any) -> list[dict[str, Any]]:
+        await asyncio.sleep(0)
+        self.calls.append((sql, args))
+        return list(self.docs)
+
+    async def execute(self, sql: str, *args: Any) -> None:
+        await super().execute(sql, *args)
+        if "status = 'blocked'" in sql:
+            self.blocked.append((args[0], list(args[1])))
+            self.claim_status = "blocked"
+            self.events.append("mark_blocked")
+        elif "status = 'published'" in sql:
+            self.published_marks.append(args[0])
+            self.claim_status = "published"
+            self.events.append("mark_published")
+
+    def snapshot(self) -> tuple[Any, ...]:
+        return (list(self.saved_job_ids), list(self.terminal_job_ids), self.claim_status)
+
+    def restore(self, snapshot: tuple[Any, ...]) -> None:
+        self.saved_job_ids = list(snapshot[0])
+        self.terminal_job_ids = list(snapshot[1])
+        self.claim_status = snapshot[2]
+
+
+class _ClaimProducer(FakeProducer):
+    """발행을 풀의 이벤트 타임라인에 함께 남기는 프로듀서 대역(쓰기 순서 검증용)."""
+
+    def __init__(self, pool: _ClaimPool) -> None:
+        super().__init__()
+        self._pool = pool
+
+    async def send(self, queue_url: str, message: ReportJob) -> None:
+        await asyncio.sleep(0)
+        self._pool.events.append("publish")
+        await super().send(queue_url, message)
+
+
+def _claim_job(doc_index: int, *, doc_total: int = 3, **overrides: Any) -> OcrJob:
+    """청구에 묶인 문서 1건의 작업(문서마다 다른 job_id)."""
+    base: dict[str, Any] = {
+        "job_id": f"00000000-0000-0000-0000-00000000000{doc_index}",
+        "claim_id": _CLAIM_ID,
+        "report_id": _CLAIM_REPORT_ID,
+        "doc_index": doc_index,
+        "doc_total": doc_total,
+    }
+    base.update(overrides)
+    return _job(**base)
+
+
+def _claim_pipeline(pool: _ClaimPool, producer: FakeProducer, *texts: str, **kwargs: Any) -> Any:
+    return _pipeline(pool, producer, FakeProcessor(_result(*texts)), **kwargs)
+
+
+# 1. 단독 문서(하위 호환)
+async def test_standalone_document_keeps_per_document_publish() -> None:
+    # Arrange: claim_id가 없으면 fan-in 대상이 아니다 — 기존 즉시 발행 경로 그대로.
+    pool = _ClaimPool()
+    producer = FakeProducer()
+    pipeline = _claim_pipeline(pool, producer, "보험증권", "증권번호 202301-042")
+
+    # Act
+    await pipeline.handle(_job(claim_id=None))
+
+    # Assert: 청구 카운터를 건드리지 않고, report_id는 ocr_result_id 파생값이다.
+    assert pool.docs_terminal == 0
+    assert not any("ai.claim_readiness" in sql for sql, _ in pool.calls)
+    assert len(producer.published) == 1
+    assert producer.published[0][1].report_id == _derive_report_id(str(_SAVE_ID))
+
+
+@pytest.mark.parametrize(
+    ("overrides", "reason"),
+    [
+        ({"doc_total": None}, "doc_total 없이는 '몇 건이 모여야 끝인가'를 알 수 없다"),
+        ({"report_id": "not-a-uuid"}, "report_id가 UUID가 아니면 청구 행을 만들 수 없다"),
+    ],
+)
+async def test_incomplete_claim_context_falls_back_with_a_warning(
+    overrides: dict[str, Any], reason: str
+) -> None:
+    # Arrange: claim_id는 있는데 fan-in에 필요한 값이 빠진 **발행측 계약 이상**.
+    # 조용히 넘기면 안 된다 — 특히 report_id는, 엄격 변환을 저장 이후 단계에서 하면
+    # 매 재시도마다 같은 지점에서 터져 그 청구가 결정적으로 영구 정지한다.
+    pool = _ClaimPool()
+    producer = FakeProducer()
+    pipeline = _claim_pipeline(pool, producer, "보험증권", "증권번호 202301-042")
+
+    # Act
+    with capture_logs() as logs:
+        await pipeline.handle(_claim_job(1, **overrides))
+
+    # Assert: 예외 없이 문서별 즉시 발행으로 폴백하고, 청구 카운트는 건드리지 않는다.
+    assert pool.docs_terminal == 0, reason
+    assert not any("ai.claim_readiness" in sql for sql, _ in pool.calls)
+    assert len(producer.published) == 1
+    warned = [e for e in logs if e["event"] == "claim_context_incomplete"]
+    assert len(warned) >= 1
+    assert warned[0]["claim_id"] == _CLAIM_ID
+
+
+async def test_claim_context_is_persisted_on_the_result_row() -> None:
+    # fan-in은 저장된 행의 claim_id로 형제 문서를 되짚는다 — 여기 안 남으면 판정 자체가
+    # 불가능하다(마이그레이션 009 컬럼).
+    pool = _ClaimPool(docs=[_doc_row(_POLICY_DOC_ID, DocType.POLICY)])
+    pipeline = _claim_pipeline(pool, FakeProducer(), "보험증권", "증권번호 202301-042")
+
+    await pipeline.handle(_claim_job(2))
+
+    insert_args = pool.insert_calls()[0][1]
+    assert insert_args[12] == _CLAIM_ID
+    assert insert_args[13] == uuid.UUID(_CLAIM_REPORT_ID)
+    assert insert_args[15:] == (2, 3)  # doc_index, doc_total
+
+
+# 2. 아직 문서가 남았으면 발행하지 않는다
+async def test_no_publish_until_every_document_is_terminal() -> None:
+    # Arrange: 3문서짜리 청구에 2건만 도착했다.
+    pool = _ClaimPool(
+        docs=[
+            _doc_row(_POLICY_DOC_ID, DocType.POLICY),
+            _doc_row(_DIAGNOSIS_DOC_ID, DocType.DIAGNOSIS),
+        ]
+    )
+    producer = FakeProducer()
+    pipeline = _claim_pipeline(pool, producer, "보험증권", "증권번호 202301-042")
+
+    # Act
+    await pipeline.handle(_claim_job(1))
+    await pipeline.handle(_claim_job(2))
+
+    # Assert: 필수 유형이 이미 다 모였어도 남은 문서를 기다린다 — 3번째 문서의 내용이
+    # 리포트에 빠지면 안 된다.
+    assert pool.docs_terminal == 2
+    assert producer.published == []
+    assert pool.published_marks == []
+
+
+# 3. 전부 종결 + 필수 유형 충족 → 청구당 1건
+async def test_claim_report_published_once_when_all_documents_terminal() -> None:
+    # Arrange: 증권을 **첫 문서가 아닌** 자리에 둔다 — 대표 선택이 "증권 우선"인지
+    # "그냥 첫 문서"인지가 여기서 갈린다(doc_index 순 첫 문서는 진단서).
+    pool = _ClaimPool(
+        docs=[
+            _doc_row(_DIAGNOSIS_DOC_ID, DocType.DIAGNOSIS),
+            _doc_row(_POLICY_DOC_ID, DocType.POLICY),
+            _doc_row(_OTHER_DOC_ID, DocType.OTHER),
+        ]
+    )
+    producer = FakeProducer()
+    pipeline = _claim_pipeline(pool, producer, "보험증권", "증권번호 202301-042")
+
+    # Act
+    for doc_index in (1, 2, 3):
+        await pipeline.handle(_claim_job(doc_index))
+
+    # Assert: 문서 3건이 리포트 3건을 만들지 않는다.
+    assert pool.docs_terminal == 3
+    assert len(producer.published) == 1
+    _, report = producer.published[0]
+    # report_id는 Spring이 청구 전체에 부여한 값 그대로(문서별 파생값이 아니다).
+    assert report.report_id == _CLAIM_REPORT_ID
+    assert report.report_id != _derive_report_id(str(_SAVE_ID))
+    assert report.claim_id == _CLAIM_ID
+    # 대표 문서 = 보험증권(계약 조건·보장 범위의 기준 문서).
+    assert report.ocr_result_id == str(_POLICY_DOC_ID)
+    assert report.doc_type is DocType.POLICY
+    assert pool.published_marks == [_CLAIM_ID]
+    assert pool.blocked == []
+
+
+async def test_claim_report_falls_back_to_first_document_without_policy_type() -> None:
+    # 증권이 아예 없는 청구는 blocked라 여기 오지 않지만, 대표 선택 규칙 자체(증권 우선,
+    # 없으면 doc_index 순 첫 문서)는 고정해 둔다 — 필수 유형이 바뀌어도 규칙은 남는다.
+    docs = [
+        ClaimDocument(
+            ocr_result_id=str(_DIAGNOSIS_DOC_ID), doc_type=DocType.DIAGNOSIS, ocr_quality="ok"
+        ),
+        ClaimDocument(ocr_result_id=str(_OTHER_DOC_ID), doc_type=DocType.OTHER, ocr_quality="ok"),
+    ]
+    producer = FakeProducer()
+    pipeline = _claim_pipeline(_ClaimPool(), producer, "무시됨")
+
+    await pipeline._publish_claim_report(_claim_job(1), docs)
+
+    assert producer.published[0][1].ocr_result_id == str(_DIAGNOSIS_DOC_ID)
+
+
+async def test_claim_ocr_quality_is_aggregated_across_documents() -> None:
+    # report_worker의 needs_reupload 스킵 로직이 청구 단위에서도 작동해야 한다 —
+    # 문서 하나만 저품질이어도 리포트 전체의 신뢰도가 깎인다.
+    docs = [
+        ClaimDocument(ocr_result_id=str(_POLICY_DOC_ID), doc_type=DocType.POLICY, ocr_quality="ok"),
+        ClaimDocument(
+            ocr_result_id=str(_DIAGNOSIS_DOC_ID),
+            doc_type=DocType.DIAGNOSIS,
+            ocr_quality="needs_reupload",
+        ),
+    ]
+    producer = FakeProducer()
+    pipeline = _claim_pipeline(_ClaimPool(), producer, "무시됨")
+
+    await pipeline._publish_claim_report(_claim_job(1), docs)
+
+    assert producer.published[0][1].ocr_quality == "needs_reupload"
+
+
+# 4. 필수 유형 미충족 → blocked(발행 없음)
+async def test_claim_blocked_when_required_doc_type_was_not_recognized() -> None:
+    # Arrange: 전부 진단서/기타로 잡혔다 = 증권을 **못 읽은** 상태(업로드는 강제되므로
+    # "안 올림"이 아니다) → 사용자에게 필요한 건 재업로드가 아니라 재촬영 안내다.
+    pool = _ClaimPool(
+        docs=[
+            _doc_row(_DIAGNOSIS_DOC_ID, DocType.DIAGNOSIS),
+            _doc_row(_OTHER_DOC_ID, DocType.OTHER),
+        ]
+    )
+    producer = FakeProducer()
+    pipeline = _claim_pipeline(pool, producer, "진단서", "상병명 골절")
+
+    # Act
+    with capture_logs() as logs:
+        for doc_index in (1, 2, 3):
+            await pipeline.handle(_claim_job(doc_index))
+
+    # Assert: 리포트를 만들지 않고 사유만 남긴다.
+    assert producer.published == []
+    assert pool.published_marks == []
+    assert pool.blocked == [(_CLAIM_ID, ["policy"])]
+    warned = [e for e in logs if e["event"] == "claim_blocked_missing_required_docs"]
+    assert len(warned) == 1
+    assert warned[0]["missing"] == ["policy"]
+
+
+async def test_claim_blocked_lists_every_missing_required_type() -> None:
+    # 전부 실패해 저장된 문서가 하나도 없는 청구 — 증권·진단서 둘 다 빠진다.
+    pool = _ClaimPool(docs=[])
+    producer = FakeProducer()
+    pipeline = _claim_pipeline(pool, producer, "보험증권", "증권번호 202301-042")
+
+    for doc_index in (1, 2, 3):
+        await pipeline.handle(_claim_job(doc_index))
+
+    assert producer.published == []
+    assert pool.blocked == [(_CLAIM_ID, ["diagnosis", "policy"])]
+
+
+# 5. 마지막 문서가 **실패**여도 나머지가 필수 유형을 채우면 발행된다(설계의 핵심)
+async def test_claim_publishes_when_last_document_failed_but_required_types_present() -> None:
+    # Arrange: 3문서 중 2건 성공(증권·진단서), 마지막 1건은 마스킹 잔류로 결정적 실패.
+    # 카운터를 마지막으로 채운 게 실패한 문서라도, 이미 인식된 2건이 필수 유형을
+    # 충족하면 리포트는 나가야 한다 — 실패 문서는 ocr_results에 행이 없어 doc_types
+    # 집합에 안 잡힐 뿐이다.
+    pool = _ClaimPool(
+        docs=[
+            _doc_row(_POLICY_DOC_ID, DocType.POLICY),
+            _doc_row(_DIAGNOSIS_DOC_ID, DocType.DIAGNOSIS),
+        ]
+    )
+    producer = FakeProducer()
+    ok_pipeline = _claim_pipeline(pool, producer, "보험증권", "증권번호 202301-042")
+    failing_pipeline = _pipeline(
+        pool,
+        producer,
+        FakeProcessor(_result("홍길동 901010-1234567")),
+        masker=_IdentityMasker(),  # 마스킹 안 함 → 주민번호 잔류 → MaskingError
+    )
+
+    # Act
+    await ok_pipeline.handle(_claim_job(1))
+    await ok_pipeline.handle(_claim_job(2))
+    with pytest.raises(MaskingError):
+        await failing_pipeline.handle(_claim_job(3))
+
+    # Assert: 실패도 **종결**이라 카운트되고, 그 시점에 fan-in이 완성된다.
+    assert pool.docs_terminal == 3
+    assert len(producer.published) == 1
+    assert producer.published[0][1].report_id == _CLAIM_REPORT_ID
+    assert pool.published_marks == [_CLAIM_ID]
+
+
+async def test_failed_document_is_not_counted_when_journal_write_failed() -> None:
+    # 저널 기록이 실패하면 이 문서는 아직 확정 종결이 아니다(재전달돼 다시 시도된다).
+    # 여기서 카운트하면 다음 시도에서 한 번 더 세어져 doc_total을 넘긴다.
+    pool = _ClaimPool(execute_error=RuntimeError("저널 DB 다운"))
+    producer = FakeProducer()
+    pipeline = _pipeline(
+        pool,
+        producer,
+        FakeProcessor(_result("홍길동 901010-1234567")),
+        masker=_IdentityMasker(),
+    )
+
+    with pytest.raises(RuntimeError):
+        await pipeline.handle(_claim_job(3))
+
+    assert pool.docs_terminal == 0
+    assert producer.published == []
+
+
+# 6. 멱등 재전달 — 이미 발행된 청구
+async def test_redelivered_document_republishes_without_recounting() -> None:
+    # Arrange: 발행 직후 crash로 ack를 못 해 재전달된 상황. 낼 리포트는 이미 정해져
+    # 있으니 같은 report_id로 안전망 재발행만 하고, **카운터는 절대 다시 올리지 않는다**.
+    already_counted = [_claim_job(i).job_id for i in (1, 2, 3)]
+    pool = _ClaimPool(
+        existing={"id": _EXISTING_ID, "doc_type": "policy", "ocr_quality": "ok"},
+        claim_status="published",
+        terminal_job_ids=already_counted,
+        doc_total=3,
+        docs=[
+            _doc_row(_POLICY_DOC_ID, DocType.POLICY),
+            _doc_row(_DIAGNOSIS_DOC_ID, DocType.DIAGNOSIS),
+        ],
+    )
+    producer = FakeProducer()
+    processor = FakeProcessor(_result("무시됨"))
+    pipeline = _pipeline(pool, producer, processor)
+
+    # Act
+    await pipeline.handle(_claim_job(1))
+
+    # Assert: 종결 집합이 그대로여야 한다 — 여기서 카운트를 다시 만지면 (문서별 멱등이
+    # 아니었다면) 미완성 청구가 조기 발행되거나 doc_total을 넘겨 영영 못 나간다.
+    assert pool.terminal_job_ids == already_counted
+    assert processor.called is False  # 무거운 OCR도 건너뛴다
+    assert len(producer.published) == 1
+    assert producer.published[0][1].report_id == _CLAIM_REPORT_ID
+    assert pool.published_marks == []  # 이미 찍힌 도장을 다시 찍지 않는다
+
+
+# 7. 멱등 재전달 — 아직 blocked/pending(문서가 남음)
+@pytest.mark.parametrize("claim_status", ["pending", "blocked", None])
+async def test_redelivered_document_publishes_nothing_while_claim_not_published(
+    claim_status: str | None,
+) -> None:
+    # Arrange: 낼 리포트가 아직(또는 영영) 없다 — 조용히 끝내야 한다. pending은 아직
+    # 형제 문서가 남은 상태(1/3)라 판정 재개 대상이 아니다.
+    pool = _ClaimPool(
+        existing={"id": _EXISTING_ID, "doc_type": "policy", "ocr_quality": "ok"},
+        claim_status=claim_status,
+        terminal_job_ids=[_claim_job(1).job_id] if claim_status is not None else [],
+        doc_total=3,
+        docs=[_doc_row(_POLICY_DOC_ID, DocType.POLICY)],
+    )
+    producer = FakeProducer()
+    pipeline = _pipeline(pool, producer, FakeProcessor(_result("무시됨")))
+
+    # Act
+    await pipeline.handle(_claim_job(1))
+
+    # Assert
+    assert producer.published == []
+    assert pool.published_marks == []
+    assert pool.blocked == []
+
+
+# 7b. 멱등 재전달 — 다 모였는데 여전히 pending(판정 도중 죽음) → 판정 재개
+async def test_redelivered_document_resumes_judgement_when_all_terminal_but_pending() -> None:
+    # Arrange: 카운트까지는 커밋됐는데 그 뒤 판정·발행에서 죽었다(예: producer.send 실패).
+    # 상태만 보고 "아직 안 됐다"로 넘기면 아무도 다시 판정해 주지 않아 **영구 정지**한다.
+    counted = [_claim_job(i).job_id for i in (1, 2, 3)]
+    pool = _ClaimPool(
+        existing={"id": _EXISTING_ID, "doc_type": "policy", "ocr_quality": "ok"},
+        claim_status="pending",
+        terminal_job_ids=counted,
+        doc_total=3,
+        docs=[
+            _doc_row(_POLICY_DOC_ID, DocType.POLICY),
+            _doc_row(_DIAGNOSIS_DOC_ID, DocType.DIAGNOSIS),
+        ],
+    )
+    producer = FakeProducer()
+    pipeline = _pipeline(pool, producer, FakeProcessor(_result("무시됨")))
+
+    # Act
+    with capture_logs() as logs:
+        await pipeline.handle(_claim_job(1))
+
+    # Assert: 카운트는 건드리지 않고 판정만 다시 돌려 발행까지 마친다.
+    assert pool.terminal_job_ids == counted
+    assert pool.published_marks == [_CLAIM_ID]
+    assert len(producer.published) == 1
+    assert producer.published[0][1].report_id == _CLAIM_REPORT_ID
+    assert [e["event"] for e in logs if e["event"] == "claim_judgement_resumed"] == [
+        "claim_judgement_resumed"
+    ]
+
+
+async def test_redelivered_document_resumes_into_blocked_when_required_type_missing() -> None:
+    # 판정 재개가 항상 발행으로 끝나는 건 아니다 — 필수 유형이 없으면 blocked로 확정한다.
+    counted = [_claim_job(i).job_id for i in (1, 2, 3)]
+    pool = _ClaimPool(
+        existing={"id": _EXISTING_ID, "doc_type": "diagnosis", "ocr_quality": "ok"},
+        claim_status="pending",
+        terminal_job_ids=counted,
+        doc_total=3,
+        docs=[_doc_row(_DIAGNOSIS_DOC_ID, DocType.DIAGNOSIS)],
+    )
+    producer = FakeProducer()
+    pipeline = _pipeline(pool, producer, FakeProcessor(_result("무시됨")))
+
+    await pipeline.handle(_claim_job(1))
+
+    assert producer.published == []
+    assert pool.blocked == [(_CLAIM_ID, ["policy"])]
+    assert pool.terminal_job_ids == counted
+
+
+# 8. 동시성 — 서로 다른 워커가 마지막 두 문서를 동시에 끝낸다
+async def test_concurrent_last_documents_count_exactly_once_and_publish_once() -> None:
+    # Arrange: 3문서 중 1건은 이미 종결됐고, 남은 2건을 **다른 워커 두 개**가 동시에
+    # 끝낸다. 카운터가 원자적이지 않으면(읽기-수정-쓰기) 증가분이 유실돼 fan-in이 영영
+    # 완성되지 않거나, 반대로 둘 다 doc_total에 닿아 리포트가 2건 나간다.
+    pool = _ClaimPool(
+        terminal_job_ids=[_claim_job(1).job_id],
+        docs=[
+            _doc_row(_POLICY_DOC_ID, DocType.POLICY),
+            _doc_row(_DIAGNOSIS_DOC_ID, DocType.DIAGNOSIS),
+        ],
+    )
+    producer = FakeProducer()
+    worker_a = _claim_pipeline(pool, producer, "보험증권", "증권번호 202301-042")
+    worker_b = _claim_pipeline(pool, producer, "진단서", "상병명 골절")
+
+    # Act: 페이크 풀이 매 호출마다 루프에 양보하므로 두 흐름이 실제로 인터리빙된다.
+    await asyncio.gather(worker_a.handle(_claim_job(2)), worker_b.handle(_claim_job(3)))
+
+    # Assert: 정확히 3까지 오르고, doc_total에 닿은 워커 하나만 발행한다.
+    assert pool.docs_terminal == 3
+    assert len(producer.published) == 1
+    assert pool.published_marks == [_CLAIM_ID]
+
+
+# ── 원자성·과다 카운트·발행 순서(QA 실측 회귀) ───────────────────
+# 아래 셋은 QA가 실 PG로 추적해 확정한 블로커의 반대편을 고정한다. 전부 "설계상 그렇다"가
+# 아니라 실제 예외/중복 전달을 주입해 전 구간을 돌린다.
+async def test_save_is_rolled_back_when_claim_count_fails() -> None:
+    # Arrange: 저장은 성공하는데 청구 카운트 쓰기만 실패한다(커넥션 끊김 등).
+    # 둘이 다른 트랜잭션이면 저장만 커밋돼 "저장은 됐는데 안 세어진" 문서가 남고,
+    # 재전달은 멱등 단락으로 빠져 카운트를 다시 시도하지 않는다 → 그 청구는 영구 정지.
+    pool = _ClaimPool(progress_error=ConnectionError("카운트 커넥션 끊김"))
+    producer = FakeProducer()
+    pipeline = _claim_pipeline(pool, producer, "보험증권", "증권번호 202301-042")
+
+    # Act
+    with pytest.raises(ConnectionError):
+        await pipeline.handle(_claim_job(1))
+
+    # Assert: 저장이 롤백돼 **아무것도 남지 않는다** — 재전달 시 find_ocr_result가 미스라
+    # _process 전체가 다시 돌고, 카운트도 함께 다시 시도된다(스스로 회복되는 방향).
+    assert pool.rollbacks == 1
+    assert pool.saved_job_ids == []
+    assert pool.docs_terminal == 0
+    assert producer.published == []
+    # 저장·카운트가 같은 커넥션(=같은 트랜잭션)에서 실행됐어야 한다.
+    assert pool.acquired == 1
+
+
+async def test_redelivery_after_rollback_reprocesses_and_counts() -> None:
+    # 위 롤백 이후 실제로 회복되는지 — 같은 문서가 재전달되면 처음부터 다시 처리돼
+    # 저장·카운트가 함께 남는다(영구 정지가 아니다).
+    pool = _ClaimPool(progress_error=ConnectionError("카운트 커넥션 끊김"))
+    producer = FakeProducer()
+    pipeline = _claim_pipeline(pool, producer, "보험증권", "증권번호 202301-042")
+    with pytest.raises(ConnectionError):
+        await pipeline.handle(_claim_job(1))
+
+    # Act: DB가 회복된 뒤 재전달.
+    pool._progress_error = None
+    await pipeline.handle(_claim_job(1))
+
+    # Assert
+    assert pool.saved_job_ids != []
+    assert pool.docs_terminal == 1
+
+
+async def test_terminal_failure_journal_and_count_are_atomic() -> None:
+    # 결정적 실패 경로도 대칭이어야 한다 — 저널만 남고 카운트가 빠지면 컨슈머가 즉시
+    # ack해 메시지가 사라지므로 카운트를 재시도할 기회가 영영 없다.
+    pool = _ClaimPool(progress_error=ConnectionError("카운트 커넥션 끊김"))
+    pipeline = _pipeline(
+        pool,
+        FakeProducer(),
+        FakeProcessor(_result("홍길동 901010-1234567")),
+        masker=_IdentityMasker(),
+    )
+
+    # 저널 기록이 롤백됐으므로 **재시도 가능한** 예외로 바뀌어 나가야 한다(즉시 ack 금지).
+    with pytest.raises(RuntimeError) as exc_info:
+        await pipeline.handle(_claim_job(1))
+
+    assert not isinstance(exc_info.value, NonRetryableError)
+    assert pool.rollbacks == 1
+    assert pool.docs_terminal == 0
+
+
+async def test_duplicate_delivery_of_same_document_does_not_inflate_count() -> None:
+    # Arrange(QA 실측 시나리오): 가시성 타임아웃 초과로 1번 문서가 **두 워커에 동시
+    # 전달**된다. 카운트가 문서별 멱등이 아니면 둘 다 +1 해서, 2번 문서 시점에
+    # docs_terminal == doc_total을 만족해 **3번 문서가 처리도 안 됐는데** 불완전한
+    # 리포트가 나간다.
+    pool = _ClaimPool(
+        docs=[
+            _doc_row(_POLICY_DOC_ID, DocType.POLICY),
+            _doc_row(_DIAGNOSIS_DOC_ID, DocType.DIAGNOSIS),
+        ]
+    )
+    producer = FakeProducer()
+    worker_a = _claim_pipeline(pool, producer, "보험증권", "증권번호 202301-042")
+    worker_b = _claim_pipeline(pool, producer, "보험증권", "증권번호 202301-042")
+
+    # Act: 같은 문서(job_id 동일)를 두 워커가 동시에 완주한다.
+    await asyncio.gather(worker_a.handle(_claim_job(1)), worker_b.handle(_claim_job(1)))
+    # 이어서 2번 문서가 정상 처리된다.
+    await worker_a.handle(_claim_job(2))
+
+    # Assert: 문서 2건만 종결됐으므로 3문서 청구는 아직 미완성 — 발행이 없어야 한다.
+    assert pool.docs_terminal == 2
+    assert pool.terminal_job_ids == [_claim_job(1).job_id, _claim_job(2).job_id]
+    assert producer.published == []
+    assert pool.published_marks == []
+
+
+async def test_publish_mark_is_written_before_the_report_is_sent() -> None:
+    # Arrange: 이 순서가 크래시 복구(안전망 재발행)의 유일한 근거다. 뒤집히면 발행
+    # 직후~기록 전에 죽었을 때 상태가 pending으로 남아 재개 경로가 한 번 더 발행하고,
+    # 기록이 끝내 실패하면 그 청구는 재전달마다 리포트를 다시 낸다.
+    pool = _ClaimPool(
+        docs=[
+            _doc_row(_POLICY_DOC_ID, DocType.POLICY),
+            _doc_row(_DIAGNOSIS_DOC_ID, DocType.DIAGNOSIS),
+        ]
+    )
+    producer = _ClaimProducer(pool)
+    pipeline = _claim_pipeline(pool, producer, "보험증권", "증권번호 202301-042")
+
+    # Act
+    for doc_index in (1, 2, 3):
+        await pipeline.handle(_claim_job(doc_index))
+
+    # Assert: 타임라인에서 mark_published가 publish보다 **앞**이어야 한다.
+    assert "mark_published" in pool.events and "publish" in pool.events
+    assert pool.events.index("mark_published") < pool.events.index("publish")

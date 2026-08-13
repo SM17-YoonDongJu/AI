@@ -19,6 +19,12 @@ OCR·분류·추출·마스킹의 산출물을 ``ocr_results``(contracts.md §3)
   남긴다. ``job_id`` 업서트라 반복 실패가 ``attempts``로 쌓이고, 회복하면 파이프라인이
   행을 지운다. ``terminal``은 단방향(false→true) — 확정 실패 판정이 재전달 한 번으로
   되돌아가지 않게 한다. 예외 **메시지는 저장하지 않는다**(클래스명만, §9).
+- **청구 fan-in**(``ai.claim_readiness``, 마이그레이션 010 + ``ocr_results``의 청구
+  컬럼 009): 한 청구는 문서 여러 건인데 워커는 문서 1건씩 독립 메시지로 받는다.
+  종결 카운터를 원자적 업서트(``record_document_terminal``)로 한 행에 모아, 마지막
+  문서를 끝낸 워커만 fan-in을 완성하고 청구당 리포트 1건을 발행하게 한다. "무엇이
+  실제로 인식됐는가"는 카운터가 아니라 ``fetch_claim_documents``로 다시 조회한다 —
+  실패한 문서는 ``ocr_results``에 행이 없으므로 자연히 빠진다.
 """
 
 import json
@@ -40,6 +46,13 @@ from ocr_worker.ocr import OcrResult
 
 logger = get_logger(__name__)
 
+# 풀·커넥션 어느 쪽으로도 실행할 수 있는 실행기. 두 쓰기를 **원자적으로** 묶어야 하는
+# 호출부(``pipeline``의 저장+청구 카운트, 저널+청구 카운트)는 ``pool.acquire()``로 얻은
+# 커넥션을 `conn.transaction()` 안에서 그대로 넘긴다 — 풀에 직접 쏘면 문마다 다른
+# 커넥션(=다른 트랜잭션)이 잡혀, 한쪽만 커밋되고 다른 쪽이 실패하는 부분 성공이 생긴다.
+# asyncpg의 Pool·Connection은 fetch/fetchrow/execute 시그니처가 같아 그대로 대체된다.
+type Executor = asyncpg.Pool | asyncpg.Connection
+
 # 진입부 멱등 단락(#15)용 조회 — 이미 처리된 job_id면 무거운 OCR을 건너뛰고
 # 기존 id·doc_type·ocr_quality로 ReportJob만 재발행한다.
 _SELECT_BY_JOB_SQL = "SELECT id, doc_type, ocr_quality FROM ocr_results WHERE job_id = $1"
@@ -55,13 +68,18 @@ _SELECT_BY_JOB_SQL = "SELECT id, doc_type, ocr_quality FROM ocr_results WHERE jo
 # 창은 즉시 task가 독점하고, 그게 실패하거나 crash로 사라지면 한 주기 뒤 스윕이
 # 인수한다 — crash 복구 근거(행이 pending으로 남음)는 그대로다.
 # attempts는 INSERT 목록에도 충돌 갱신에도 없다(기본값 0 · 재소비가 리셋하지 않음).
+# 청구(claim) 컬럼(마이그레이션 009)은 **목록 맨 뒤**에 붙인다 — 기존 $1~$12의 번호를
+# 그대로 두려는 의도다. 중간에 끼우면 뒤따르는 모든 파라미터 번호가 한 칸씩 밀리고,
+# 그 밀림은 타입이 우연히 맞는 컬럼끼리(text↔text) 조용히 뒤바뀌는 형태로만 드러난다.
 _UPSERT_SQL = """
 INSERT INTO ocr_results (
     job_id, doc_type, doc_type_confidence, ocr_confidence,
     masked_text, masked_lines, entities, masked_image_s3_keys, ocr_quality,
-    original_s3_key, original_delete_status, original_delete_next_attempt_at
+    original_s3_key, original_delete_status, original_delete_next_attempt_at,
+    claim_id, report_id, attachment_id, doc_index, doc_total
 ) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8::jsonb, $9, $10, $11,
-    CASE WHEN $11 = 'pending' THEN now() + make_interval(secs => $12) END)
+    CASE WHEN $11 = 'pending' THEN now() + make_interval(secs => $12) END,
+    $13, $14, $15, $16, $17)
 ON CONFLICT (job_id) DO UPDATE SET
     doc_type = EXCLUDED.doc_type,
     doc_type_confidence = EXCLUDED.doc_type_confidence,
@@ -73,7 +91,12 @@ ON CONFLICT (job_id) DO UPDATE SET
     ocr_quality = EXCLUDED.ocr_quality,
     original_s3_key = EXCLUDED.original_s3_key,
     original_delete_status = EXCLUDED.original_delete_status,
-    original_delete_next_attempt_at = EXCLUDED.original_delete_next_attempt_at
+    original_delete_next_attempt_at = EXCLUDED.original_delete_next_attempt_at,
+    claim_id = EXCLUDED.claim_id,
+    report_id = EXCLUDED.report_id,
+    attachment_id = EXCLUDED.attachment_id,
+    doc_index = EXCLUDED.doc_index,
+    doc_total = EXCLUDED.doc_total
 RETURNING id
 """
 
@@ -127,8 +150,11 @@ FOR UPDATE SKIP LOCKED
 #
 # job_id 업서트라 같은 작업의 반복 실패가 새 행을 만들지 않고 attempts로 쌓인다.
 # ON CONFLICT DO UPDATE의 SET 절에서 **기존 행은 스키마 없는 테이블명**으로 참조한다
-# (`ocr_job_failures.attempts`) — range table 엔트리 이름이 `ocr_job_failures`라
-# `ai.ocr_job_failures.attempts`로 쓰면 "missing FROM-clause entry"가 난다.
+# (`ocr_job_failures.attempts`). 원래 이 주석은 `ai.ocr_job_failures.attempts`로 쓰면
+# "missing FROM-clause entry"가 난다고 적고 있었는데, PG 16 실측으로는 **별칭(AS)을 쓸
+# 때만** 깨진다 — 별칭이 range table 이름이 되어 원래 테이블명·스키마명으로는 찾을 수
+# 없게 되기 때문이다(에러 문구도 다르다). 별칭이 없으면 한정 표기도 정상 동작한다.
+# 그래도 파일 내 표기를 통일해 두는 편이 읽기 쉬워 무한정(unqualified) 표기를 유지한다.
 #
 # terminal은 `EXCLUDED.terminal OR ocr_job_failures.terminal`로 **단방향**(false→true)이다.
 # 확정 실패로 판정된 작업이 뒤늦은 재전달 한 번으로 "아직 진행 중"으로 되돌아가면,
@@ -185,6 +211,74 @@ INSERT INTO ai.ocr_job_failures (message_id, failure_class, attempts, terminal)
 VALUES ($1, 'schema_invalid', $2, true)
 """
 
+# ── 청구 fan-in(ai.claim_readiness, 마이그레이션 010) ────────────
+# 문서 1건이 **종결**(성공·확정 실패 무관)될 때마다 그 ``job_id``를 종결 집합에 넣고
+# 갱신 후 크기(생성 컬럼 ``docs_terminal``)를 돌려받는다.
+#
+# **개수를 +1 하지 않고 집합에 넣는 이유**(QA 실측 회귀): 단순 `docs_terminal + 1`이면
+# 같은 문서가 두 번 종결로 보고될 때 카운트가 실제 종결 문서 수보다 커진다 — SQS
+# 가시성 타임아웃 초과로 같은 메시지가 두 워커에 동시 전달되는 경우, ack 실패 후
+# 재전달로 같은 결정적 실패가 다시 저널되는 경우, poison 훅이 이미 세어진 문서를 또
+# 세는 경우. 그 결과 3문서 청구가 2번째 문서 시점에 doc_total을 만족해 **아직 처리도
+# 안 된 문서를 빼고** 불완전한 리포트를 발행한다. 집합 containment(@>)로 걸러 카운트를
+# **문서별 멱등**으로 만든다.
+#
+# 그러면서도 여전히 단일 INSERT .. ON CONFLICT DO UPDATE(원자적)다 — 읽기-수정-쓰기
+# 경합이 없어, 두 워커가 같은 청구의 **서로 다른** 마지막 두 문서를 동시에 끝내도
+# 증가분이 유실되지 않고 `docs_terminal == doc_total`을 돌려받는 호출자는 하나뿐이다.
+#
+# SET 절의 기존 행 참조는 008과 같이 **스키마 없는 테이블명**(`claim_readiness.…`)이다.
+# 008 주석은 스키마 한정 표기(`ai.…`)가 "missing FROM-clause entry"를 낸다고 적었지만,
+# PG 16 실측으로는 **별칭(AS)을 쓸 때만** 깨진다(별칭이 range table 이름이 되므로).
+# 별칭이 없으면 한정 표기도 정상 동작한다 — 파일 내 표기 통일을 위해 008을 따른다.
+#
+# doc_total·report_id는 충돌 시 **갱신하지 않는다**. 같은 청구의 모든 메시지가 같은 값을
+# 싣고 오므로 갱신할 이유가 없고, 혹시 값이 흔들려도(발행측 버그) 먼저 도착한 값을 유지해
+# 카운트 기준(doc_total)이 진행 도중 바뀌는 일을 막는다.
+_UPSERT_CLAIM_PROGRESS_SQL = """
+INSERT INTO ai.claim_readiness (claim_id, report_id, doc_total, terminal_job_ids)
+VALUES ($1, $2, $3, ARRAY[$4]::text[])
+ON CONFLICT (claim_id) DO UPDATE SET
+    terminal_job_ids = CASE
+        WHEN claim_readiness.terminal_job_ids @> ARRAY[$4]::text[]
+            THEN claim_readiness.terminal_job_ids
+        ELSE claim_readiness.terminal_job_ids || ARRAY[$4]::text[]
+    END
+RETURNING docs_terminal
+"""
+
+# 청구에 속한 **저장된**(=OCR·마스킹까지 성공한) 문서 목록. 실패한 문서는 애초에 행이
+# 없어 여기 나타나지 않는다 — 필수 유형 판정이 "무엇이 실제로 인식됐는가"만 보게 하는
+# 것이 이 조회의 목적이다. doc_index는 nullable이라(단독 문서 호환) NULLS LAST로
+# 뒤로 밀고, 그 안에서는 저장 순서(created_at)로 안정 정렬한다.
+_SELECT_CLAIM_DOCUMENTS_SQL = """
+SELECT id, doc_type, ocr_quality
+FROM ai.ocr_results
+WHERE claim_id = $1
+ORDER BY doc_index NULLS LAST, created_at
+"""
+
+# 필수 문서 유형이 빠진 청구 — 리포트를 만들지 않고 사유(빠진 유형)를 남긴다.
+_MARK_CLAIM_BLOCKED_SQL = """
+UPDATE ai.claim_readiness
+SET status = 'blocked', missing_doc_types = $2, judged_at = now()
+WHERE claim_id = $1
+"""
+
+# 대표 ReportJob 발행 **직전**에 찍는다 — 발행 후 crash로 ack를 못 해 메시지가
+# 재전달돼도, 멱등 단락이 이 상태를 보고 같은 report_id로 안전하게 재발행한다.
+_MARK_CLAIM_PUBLISHED_SQL = """
+UPDATE ai.claim_readiness
+SET status = 'published', judged_at = now()
+WHERE claim_id = $1
+"""
+
+# 판정 재개 근거: 상태만으로는 "아직 문서가 남았다"(pending)와 "다 모였는데 판정 도중
+# 죽었다"(pending인데 docs_terminal >= doc_total)를 구분할 수 없다 — 세 값을 함께 읽는다.
+_SELECT_CLAIM_READINESS_SQL = """
+SELECT status, docs_terminal, doc_total FROM ai.claim_readiness WHERE claim_id = $1
+"""
+
 
 @dataclass(frozen=True, slots=True)
 class OcrResultRecord:
@@ -208,6 +302,13 @@ class OcrResultRecord:
         original_delete_eligible: 이미지 마스킹 검증(5.1+5.2)을 전 페이지가 통과해
             원본을 지워도 되는가. ``True``면 ``original_delete_status='pending'``으로,
             ``False``면 ``'not_eligible'``(스윕 제외)로 저장된다.
+        claim_id: 이 문서가 속한 청구(``OcrJob.claim_id``). 청구 fan-in이 형제 문서를
+            되짚는 키다(마이그레이션 009). 단독 문서면 ``None``.
+        report_id: 청구 전체에 Spring이 부여한 ``REPORTS.id``(``OcrJob.report_id``).
+        attachment_id: ``REPORT_ATTACHMENTS.id``(``OcrJob.attachment_id``).
+        doc_index: 청구 내 문서 순번(1-based). 형제 문서 정렬 기준.
+        doc_total: 청구 총 문서 수. 관측용 스냅샷 — fan-in 판정은
+            ``ai.claim_readiness.doc_total``을 쓴다.
     """
 
     job_id: str
@@ -221,6 +322,51 @@ class OcrResultRecord:
     ocr_quality: str = "ok"
     original_s3_key: str = ""
     original_delete_eligible: bool = False
+    claim_id: str | None = None
+    report_id: str | None = None
+    attachment_id: str | None = None
+    doc_index: int | None = None
+    doc_total: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ClaimDocument:
+    """청구에 속한 **처리 완료된** 문서 1건(``fetch_claim_documents`` 반환).
+
+    실패한 문서는 ``ai.ocr_results``에 행이 없어 목록에 나타나지 않는다 — 필수 유형
+    판정(fan-in)은 "무엇이 실제로 인식됐는가"만 봐야 하므로 이게 의도한 동작이다.
+
+    Attributes:
+        ocr_result_id: ``ocr_results.id``(``ReportJob.ocr_result_id`` 후보).
+        doc_type: 분류된 문서 유형(필수 유형 충족 판정 기준).
+        ocr_quality: 문서별 자동 품질 판정(``ok`` | ``needs_reupload``). 청구 대표값은
+            이 값들의 집계다(하나라도 ``needs_reupload``면 전체가 그렇다).
+    """
+
+    ocr_result_id: str
+    doc_type: DocType
+    ocr_quality: str
+
+
+@dataclass(frozen=True, slots=True)
+class ClaimReadiness:
+    """청구의 fan-in 진행 상태(``fetch_claim_readiness`` 반환).
+
+    Attributes:
+        status: ``pending`` | ``blocked`` | ``published``.
+        docs_terminal: 종결이 보고된 **서로 다른** 문서 수(문서별 멱등 — 중복 보고 제외).
+        doc_total: 청구 총 문서 수. ``docs_terminal >= doc_total``이면 더 기다릴 문서가
+            없다는 뜻이라, ``status``가 아직 ``pending``이면 판정이 중단된 상태다.
+    """
+
+    status: str
+    docs_terminal: int
+    doc_total: int
+
+    @property
+    def all_documents_terminal(self) -> bool:
+        """청구의 모든 문서가 종결됐는가(= 판정을 내릴 수 있는 상태인가)."""
+        return self.docs_terminal >= self.doc_total
 
 
 @dataclass(frozen=True, slots=True)
@@ -299,7 +445,33 @@ def build_masked_lines(result: OcrResult, detect: DetectFn) -> list[dict[str, ob
     return lines
 
 
-async def find_ocr_result(pool: asyncpg.Pool, job_id: str) -> tuple[str, DocType, str] | None:
+def _as_uuid(value: str | None, *, field_name: str) -> uuid.UUID | None:
+    """UUID 문자열을 관대하게 변환한다(빈 값·형식 오류면 ``None``).
+
+    실패 저널은 **다른 실패를 기록하는 마지막 방어선**이라, 여기서 예외를 던지면
+    원래 실패까지 통째로 삼켜 무음 실패가 된다. 식별자 하나가 형식에 안 맞으면
+    그 컬럼만 비우고 나머지는 남긴다 — "일부만 아는 기록"이 "기록 없음"보다 낫다.
+    값 자체는 로그에 남기지 않고 어떤 필드였는지만 남긴다.
+
+    ``job_id``가 UUID가 아니면(``OcrJob.job_id``는 형식 검증 없는 ``str``이라 통과할 수
+    있다) 멱등 키가 NULL이 되고, NULL은 UNIQUE 충돌을 일으키지 않아 재실패마다 행이
+    하나씩 늘어난다(실측). 수신 횟수 상한이 상한선이라 메시지당 몇 행 수준이고, 이를
+    막자고 예외를 던지면 위의 "기록 없음"으로 되돌아간다 — 중복을 감수한다.
+
+    ``ocr_results``의 청구 컨텍스트 컬럼(``report_id``·``attachment_id``, 마이그레이션
+    009)도 같은 이유로 이 관대한 변환을 쓴다 — 부가 컬럼 하나의 형식 오류로 OCR 결과
+    자체를 못 저장하게 되면 재전달해도 같은 값이 다시 와서 영원히 저장되지 않는다.
+    """
+    if not value:
+        return None
+    try:
+        return uuid.UUID(value)
+    except ValueError:
+        logger.warning("ocr_job_failure_invalid_uuid", field=field_name)
+        return None
+
+
+async def find_ocr_result(executor: Executor, job_id: str) -> tuple[str, DocType, str] | None:
     """``job_id``로 이미 저장된 결과의 ``(id, doc_type, ocr_quality)``를 찾는다(없으면 None).
 
     파이프라인(#15)의 진입부 멱등 단락에 쓴다 — at-least-once 재소비로 같은 작업이
@@ -307,25 +479,27 @@ async def find_ocr_result(pool: asyncpg.Pool, job_id: str) -> tuple[str, DocType
     ``ReportJob``만 재발행한다(발행 후 커밋 규약상 crash 시 재발행이 안전).
 
     Args:
-        pool: asyncpg 연결 풀(core.db).
+        executor: asyncpg 연결 풀 또는 커넥션(core.db). 다른 쓰기와 원자적으로
+            묶어야 하면 호출측이 ``pool.acquire()``로 얻은 커넥션을 넘긴다.
         job_id: OCR 작업 식별자(UUID 문자열, 멱등 키).
 
     Returns:
         ``(ocr_results.id, doc_type, ocr_quality)`` 튜플 또는 미존재 시 ``None``.
     """
-    row = await pool.fetchrow(_SELECT_BY_JOB_SQL, uuid.UUID(job_id))
+    row = await executor.fetchrow(_SELECT_BY_JOB_SQL, uuid.UUID(job_id))
     if row is None:
         return None
     return str(row["id"]), DocType(row["doc_type"]), row["ocr_quality"]
 
 
 async def save_ocr_result(
-    pool: asyncpg.Pool, record: OcrResultRecord, *, delete_retry_interval_seconds: float
+    executor: Executor, record: OcrResultRecord, *, delete_retry_interval_seconds: float
 ) -> str:
     """``ocr_results``에 업서트하고 생성/기존 ``id``를 반환한다(job_id 멱등).
 
     Args:
-        pool: asyncpg 연결 풀(core.db).
+        executor: asyncpg 연결 풀 또는 커넥션(core.db). 다른 쓰기와 원자적으로
+            묶어야 하면 호출측이 ``pool.acquire()``로 얻은 커넥션을 넘긴다.
         record: 저장할 행 값.
         delete_retry_interval_seconds: 삭제 outbox의 첫 스윕 인수 시점을 미루는 간격(초).
             호출자가 저장 직후 띄우는 즉시 삭제 task와 스윕이 같은 키를 중복 집행하지
@@ -336,7 +510,7 @@ async def save_ocr_result(
     Returns:
         ``ocr_results.id``(UUID 문자열) — ``ReportJob.ocr_result_id``로 사용.
     """
-    row = await pool.fetchrow(
+    row = await executor.fetchrow(
         _UPSERT_SQL,
         uuid.UUID(record.job_id),  # uuid 컬럼: 명시 변환으로 코덱 모호성 제거
         str(record.doc_type),  # StrEnum → text
@@ -352,6 +526,15 @@ async def save_ocr_result(
         # 집지 않으므로, 검증 실패 원본이 나중에 조용히 지워지는 일이 없다.
         "pending" if record.original_delete_eligible else "not_eligible",
         delete_retry_interval_seconds,
+        # 청구 컨텍스트($13~$17, 마이그레이션 009) — 전부 nullable이라 단독 문서는 NULL.
+        # *_id는 uuid 컬럼이라 변환한다. 형식이 깨졌으면 그 컬럼만 비운다(_as_uuid) —
+        # 여기서 예외를 던지면 정상적으로 OCR·마스킹까지 끝난 결과를 통째로 버리게 되고,
+        # 재전달해도 같은 값이 다시 와서 영원히 저장되지 않는다.
+        record.claim_id,
+        _as_uuid(record.report_id, field_name="report_id"),
+        _as_uuid(record.attachment_id, field_name="attachment_id"),
+        record.doc_index,
+        record.doc_total,
     )
     if row is None:  # RETURNING은 항상 한 행 → 방어적 계약 검증
         raise RuntimeError(f"ocr_results 업서트가 id를 반환하지 않았습니다: job_id={record.job_id}")
@@ -365,21 +548,22 @@ async def save_ocr_result(
     return result_id
 
 
-async def record_delete_success(pool: asyncpg.Pool, ocr_result_id: str) -> None:
+async def record_delete_success(executor: Executor, ocr_result_id: str) -> None:
     """원본 삭제 성공을 outbox에 기록한다(``original_delete_status='deleted'``, 종결).
 
     S3 ``DeleteObject``는 멱등이라, 즉시 삭제와 스윕이 같은 키를 겹쳐 지워도 둘 다
     성공으로 기록될 수 있다 — 같은 종결 상태를 두 번 쓰는 것이라 무해하다.
 
     Args:
-        pool: asyncpg 연결 풀(core.db).
+        executor: asyncpg 연결 풀 또는 커넥션(core.db). 다른 쓰기와 원자적으로
+            묶어야 하면 호출측이 ``pool.acquire()``로 얻은 커넥션을 넘긴다.
         ocr_result_id: 대상 ``ocr_results.id``(UUID 문자열).
     """
-    await pool.execute(_MARK_DELETE_SUCCESS_SQL, uuid.UUID(ocr_result_id))
+    await executor.execute(_MARK_DELETE_SUCCESS_SQL, uuid.UUID(ocr_result_id))
 
 
 async def record_delete_failure(
-    pool: asyncpg.Pool, ocr_result_id: str, max_attempts: int, retry_interval_seconds: float
+    executor: Executor, ocr_result_id: str, max_attempts: int, retry_interval_seconds: float
 ) -> DeleteRetryState | None:
     """원본 삭제 실패를 outbox에 기록하고 **갱신 후 상태**를 돌려준다(attempts++).
 
@@ -389,7 +573,8 @@ async def record_delete_failure(
     라이프사이클 정책이 정리한다(운영 알림 대상).
 
     Args:
-        pool: asyncpg 연결 풀(core.db).
+        executor: asyncpg 연결 풀 또는 커넥션(core.db). 다른 쓰기와 원자적으로
+            묶어야 하면 호출측이 ``pool.acquire()``로 얻은 커넥션을 넘긴다.
         ocr_result_id: 대상 ``ocr_results.id``(UUID 문자열).
         max_attempts: 총 시도 상한(증가 후 값이 이 값 이상이면 ``exhausted``).
         retry_interval_seconds: 다음 시도까지의 간격(초).
@@ -397,7 +582,7 @@ async def record_delete_failure(
     Returns:
         갱신 후 상태. 대상 행이 없으면(있을 수 없지만 방어적으로) ``None``.
     """
-    row = await pool.fetchrow(
+    row = await executor.fetchrow(
         _MARK_DELETE_FAILURE_SQL,
         uuid.UUID(ocr_result_id),
         max_attempts,
@@ -410,7 +595,7 @@ async def record_delete_failure(
     )
 
 
-async def fetch_due_deletions(pool: asyncpg.Pool, limit: int) -> list[PendingDeletion]:
+async def fetch_due_deletions(executor: Executor, limit: int) -> list[PendingDeletion]:
     """재시도할 때가 된 원본 삭제 건을 최대 ``limit``개 가져온다.
 
     ``not_eligible``(검증 실패로 애초에 삭제 대상이 아닌 행)과 종결 상태
@@ -418,13 +603,14 @@ async def fetch_due_deletions(pool: asyncpg.Pool, limit: int) -> list[PendingDel
     ``original_s3_key``가 채워져 있다(``save_ocr_result``가 둘을 한 문에서 쓴다).
 
     Args:
-        pool: asyncpg 연결 풀(core.db).
+        executor: asyncpg 연결 풀 또는 커넥션(core.db). 다른 쓰기와 원자적으로
+            묶어야 하면 호출측이 ``pool.acquire()``로 얻은 커넥션을 넘긴다.
         limit: 한 배치 상한.
 
     Returns:
         시도 대상 목록(가장 오래 기다린 순 — 미시도 행 우선).
     """
-    rows = await pool.fetch(_FETCH_DUE_DELETIONS_SQL, limit)
+    rows = await executor.fetch(_FETCH_DUE_DELETIONS_SQL, limit)
     return [
         PendingDeletion(
             id=str(row["id"]),
@@ -436,30 +622,8 @@ async def fetch_due_deletions(pool: asyncpg.Pool, limit: int) -> list[PendingDel
 
 
 # ── 실패 저널 ────────────────────────────────────────────────────
-def _as_uuid(value: str | None, *, field_name: str) -> uuid.UUID | None:
-    """UUID 문자열을 관대하게 변환한다(빈 값·형식 오류면 ``None``).
-
-    실패 저널은 **다른 실패를 기록하는 마지막 방어선**이라, 여기서 예외를 던지면
-    원래 실패까지 통째로 삼켜 무음 실패가 된다. 식별자 하나가 형식에 안 맞으면
-    그 컬럼만 비우고 나머지는 남긴다 — "일부만 아는 기록"이 "기록 없음"보다 낫다.
-    값 자체는 로그에 남기지 않고 어떤 필드였는지만 남긴다.
-
-    ``job_id``가 UUID가 아니면(``OcrJob.job_id``는 형식 검증 없는 ``str``이라 통과할 수
-    있다) 멱등 키가 NULL이 되고, NULL은 UNIQUE 충돌을 일으키지 않아 재실패마다 행이
-    하나씩 늘어난다(실측). 수신 횟수 상한이 상한선이라 메시지당 몇 행 수준이고, 이를
-    막자고 예외를 던지면 위의 "기록 없음"으로 되돌아간다 — 중복을 감수한다.
-    """
-    if not value:
-        return None
-    try:
-        return uuid.UUID(value)
-    except ValueError:
-        logger.warning("ocr_job_failure_invalid_uuid", field=field_name)
-        return None
-
-
 async def record_job_failure(
-    pool: asyncpg.Pool, job: OcrJob, *, failure_class: str, error_type: str, terminal: bool
+    executor: Executor, job: OcrJob, *, failure_class: str, error_type: str, terminal: bool
 ) -> None:
     """OCR 작업 실패를 ``ai.ocr_job_failures``에 업서트한다(``job_id`` 멱등).
 
@@ -468,14 +632,15 @@ async def record_job_failure(
     기록된 작업은 이후 호출이 ``terminal=False``여도 확정 상태를 유지한다.
 
     Args:
-        pool: asyncpg 연결 풀(core.db).
+        executor: asyncpg 연결 풀 또는 커넥션(core.db). 다른 쓰기와 원자적으로
+            묶어야 하면 호출측이 ``pool.acquire()``로 얻은 커넥션을 넘긴다.
         job: 실패한 작업(식별자·S3 키 등 비-PII 컨텍스트를 함께 남긴다).
         failure_class: 실패 분류(마이그레이션 008의 CHECK 목록 중 하나).
         error_type: 예외 **클래스명만**. 메시지 문자열은 넘기지 않는다(§9) —
             정형화되지 않은 예외 문자열에 OCR 원문 조각이 섞일 수 있다.
         terminal: 확정 실패(사용자 노출 대상)인가.
     """
-    await pool.execute(
+    await executor.execute(
         _UPSERT_JOB_FAILURE_SQL,
         _as_uuid(job.job_id, field_name="job_id"),
         job.s3_key,
@@ -498,7 +663,7 @@ async def record_job_failure(
     )
 
 
-async def clear_job_failure(pool: asyncpg.Pool, job_id: str) -> None:
+async def clear_job_failure(executor: Executor, job_id: str) -> None:
     """회복한 작업의 실패 저널 행을 지운다(없으면 아무 일도 하지 않는다).
 
     일시 실패(``terminal=false``)로 기록됐다가 재전달에서 성공한 작업이 계속
@@ -506,17 +671,18 @@ async def clear_job_failure(pool: asyncpg.Pool, job_id: str) -> None:
     그 경로는 애초에 성공으로 끝나지 않으므로 여기에 도달하지 않는다.
 
     Args:
-        pool: asyncpg 연결 풀(core.db).
+        executor: asyncpg 연결 풀 또는 커넥션(core.db). 다른 쓰기와 원자적으로
+            묶어야 하면 호출측이 ``pool.acquire()``로 얻은 커넥션을 넘긴다.
         job_id: OCR 작업 식별자(UUID 문자열).
     """
     job_uuid = _as_uuid(job_id, field_name="job_id")
     if job_uuid is None:
         return  # 애초에 기록될 수 없는 키 — 지울 행도 없다
-    await pool.execute(_CLEAR_JOB_FAILURE_SQL, job_uuid)
+    await executor.execute(_CLEAR_JOB_FAILURE_SQL, job_uuid)
 
 
 async def mark_failure_terminal(
-    pool: asyncpg.Pool, *, job: OcrJob | None, message_id: str, receive_count: int
+    executor: Executor, *, job: OcrJob | None, message_id: str, receive_count: int
 ) -> None:
     """poison 메시지를 확정 실패로 도장 찍는다(``SqsConsumer.on_poison`` 훅용).
 
@@ -533,18 +699,19 @@ async def mark_failure_terminal(
       ``schema_invalid`` 행을 남긴다.
 
     Args:
-        pool: asyncpg 연결 풀(core.db).
+        executor: asyncpg 연결 풀 또는 커넥션(core.db). 다른 쓰기와 원자적으로
+            묶어야 하면 호출측이 ``pool.acquire()``로 얻은 커넥션을 넘긴다.
         job: 파싱된 작업. 스키마 위반이면 ``None``.
         message_id: SQS MessageId(``job``이 없을 때의 유일한 추적 키).
         receive_count: ``ApproximateReceiveCount``(재전달 횟수).
     """
     if job is None:
-        await pool.execute(_INSERT_UNPARSED_FAILURE_SQL, message_id, receive_count)
+        await executor.execute(_INSERT_UNPARSED_FAILURE_SQL, message_id, receive_count)
         logger.error(
             "ocr_job_failure_terminal", message_id=message_id, failure_class="schema_invalid"
         )
         return
-    await pool.execute(
+    await executor.execute(
         _MARK_JOB_FAILURE_TERMINAL_SQL,
         _as_uuid(job.job_id, field_name="job_id"),
         message_id,
@@ -562,4 +729,138 @@ async def mark_failure_terminal(
         job_id=job.job_id,
         message_id=message_id,
         receive_count=receive_count,
+    )
+
+
+# ── 청구 fan-in ──────────────────────────────────────────────────
+async def record_document_terminal(
+    executor: Executor, *, claim_id: str, job_id: str, report_id: uuid.UUID, doc_total: int
+) -> int:
+    """청구의 문서 1건이 **종결**됐음을 기록하고 갱신 후 종결 문서 수를 돌려준다.
+
+    종결 = 성공(``ocr_results`` 저장) + 확정 실패 + poison 소진. 실패를 세지 않으면
+    문서 하나가 못 읽히는 순간 그 청구의 리포트가 영영 나오지 않는다 — 실제로 무엇이
+    인식됐는지는 이 값이 아니라 ``fetch_claim_documents``가 따로 확인한다.
+
+    **문서별 멱등**이다. 개수를 +1 하는 대신 ``job_id``를 종결 집합에 넣으므로, 같은
+    문서가 여러 번 종결로 보고돼도(동시 중복 전달·ack 실패 후 재전달·poison 중복)
+    수가 늘지 않는다 — 과다 카운트로 미완성 청구가 조기 발행되던 회귀를 구조적으로
+    막는다(마이그레이션 010 주석 참고). 그러면서도 단일 원자적 업서트라, 서로 **다른**
+    문서를 동시에 끝낸 두 워커의 증가분은 유실되지 않고 ``doc_total``에 도달한 값을
+    돌려받는 호출자는 정확히 하나다(발행이 두 번 트리거되지 않는다).
+
+    ``report_id``를 ``uuid.UUID``로 받는 이유: 문자열을 여기서 변환하면 형식이 어긋난
+    값이 **매 재시도마다 같은 지점에서** ``ValueError``를 내 그 청구의 fan-in이 결정적
+    으로 영구 정지한다. 유효성 판정은 호출측(``pipeline._claim_context``)이 진입 시점에
+    한 번 하고, 여기서는 타입으로 보장된 값만 받는다.
+
+    Args:
+        executor: asyncpg 연결 풀 또는 커넥션(core.db). 저장·저널 쓰기와 원자적으로
+            묶어야 하므로 호출측이 보통 ``pool.acquire()``로 얻은 커넥션을 넘긴다.
+        claim_id: 청구 식별자(``OcrJob.claim_id``).
+        job_id: 종결된 문서의 작업 식별자(``OcrJob.job_id``) — 멱등 키.
+        report_id: 청구 전체의 ``REPORTS.id``(행 생성 시에만 쓰인다).
+        doc_total: 청구 총 문서 수(행 생성 시에만 쓰인다 — 아래 SQL 주석 참고).
+
+    Returns:
+        갱신 후 종결 문서 수. ``doc_total`` 이상이면 이 호출이 fan-in을 완성한 것이다.
+
+    Raises:
+        RuntimeError: ``RETURNING``이 행을 돌려주지 않은 경우(있을 수 없는 계약 위반).
+    """
+    row = await executor.fetchrow(
+        _UPSERT_CLAIM_PROGRESS_SQL, claim_id, report_id, doc_total, job_id
+    )
+    if row is None:  # RETURNING은 항상 한 행 → 방어적 계약 검증
+        raise RuntimeError(
+            f"claim_readiness 업서트가 docs_terminal을 반환하지 않았습니다: claim_id={claim_id}"
+        )
+    docs_terminal = int(row["docs_terminal"])
+    logger.info(
+        "claim_document_terminal",
+        claim_id=claim_id,
+        docs_terminal=docs_terminal,
+        doc_total=doc_total,
+    )
+    return docs_terminal
+
+
+async def fetch_claim_documents(executor: Executor, claim_id: str) -> list[ClaimDocument]:
+    """청구에 속한 **저장된** 문서를 문서 순번대로 가져온다(fan-in 판정 입력).
+
+    Args:
+        executor: asyncpg 연결 풀 또는 커넥션(core.db). 다른 쓰기와 원자적으로
+            묶어야 하면 호출측이 ``pool.acquire()``로 얻은 커넥션을 넘긴다.
+        claim_id: 청구 식별자.
+
+    Returns:
+        ``doc_index`` 오름차순(NULL은 뒤) 문서 목록. 전부 실패했으면 빈 목록.
+    """
+    rows = await executor.fetch(_SELECT_CLAIM_DOCUMENTS_SQL, claim_id)
+    return [
+        ClaimDocument(
+            ocr_result_id=str(row["id"]),
+            doc_type=DocType(row["doc_type"]),
+            ocr_quality=row["ocr_quality"],
+        )
+        for row in rows
+    ]
+
+
+async def mark_claim_blocked(
+    executor: Executor, *, claim_id: str, missing_doc_types: list[str]
+) -> None:
+    """필수 문서 유형이 빠진 청구를 ``blocked``로 확정하고 빠진 유형을 남긴다.
+
+    보험증권·진단서는 업로드 자체가 필수라, 여기 걸렸다는 건 사용자가 안 올렸다는 뜻이
+    아니라 **올린 문서를 인식하지 못했다**는 뜻이다(분류 실패 또는 마스킹 잔류 등으로
+    저장 자체가 안 됨). ``missing_doc_types``는 사용자에게 "그 문서를 다시 촬영해
+    달라"고 안내할 근거다.
+
+    Args:
+        executor: asyncpg 연결 풀 또는 커넥션(core.db). 다른 쓰기와 원자적으로
+            묶어야 하면 호출측이 ``pool.acquire()``로 얻은 커넥션을 넘긴다.
+        claim_id: 청구 식별자.
+        missing_doc_types: 인식되지 않은 필수 ``DocType`` 값 목록(정렬된 문자열).
+    """
+    await executor.execute(_MARK_CLAIM_BLOCKED_SQL, claim_id, missing_doc_types)
+
+
+async def mark_claim_published(executor: Executor, claim_id: str) -> None:
+    """청구 대표 ``ReportJob``을 발행했음을 기록한다(발행 **직전**에 호출).
+
+    발행보다 먼저 찍는 이유: 발행 후 crash로 ack를 못 하면 메시지가 재전달되는데,
+    그때 멱등 단락이 이 상태를 보고 같은 ``report_id``로 재발행해 다운스트림이
+    누락 없이 이어받게 하기 위해서다(``report_id`` 멱등이라 중복 발행은 무해하다).
+
+    Args:
+        executor: asyncpg 연결 풀 또는 커넥션(core.db). 다른 쓰기와 원자적으로
+            묶어야 하면 호출측이 ``pool.acquire()``로 얻은 커넥션을 넘긴다.
+        claim_id: 청구 식별자.
+    """
+    await executor.execute(_MARK_CLAIM_PUBLISHED_SQL, claim_id)
+
+
+async def fetch_claim_readiness(executor: Executor, claim_id: str) -> ClaimReadiness | None:
+    """청구의 fan-in 상태와 진행도를 함께 읽는다(멱등 단락의 재개 판정 근거).
+
+    상태만으로는 부족하다: ``pending``에는 "아직 문서가 남았다"와 "다 모였는데 판정
+    도중(발행 직전·직후) 죽었다"가 섞여 있고, 후자는 아무도 다시 판정해 주지 않으면
+    영구 정지한다. 세 값을 함께 돌려줘 호출측이 둘을 구분하게 한다.
+
+    Args:
+        executor: asyncpg 연결 풀 또는 커넥션(core.db). 다른 쓰기와 원자적으로
+            묶어야 하면 호출측이 ``pool.acquire()``로 얻은 커넥션을 넘긴다.
+        claim_id: 청구 식별자.
+
+    Returns:
+        진행 상태. 아직 이 청구의 문서가 하나도 종결되지 않았으면 ``None``.
+    """
+    row = await executor.fetchrow(_SELECT_CLAIM_READINESS_SQL, claim_id)
+    if row is None:
+        return None
+    return ClaimReadiness(
+        status=str(row["status"]),
+        docs_terminal=int(row["docs_terminal"]),
+        doc_total=int(row["doc_total"]),
     )

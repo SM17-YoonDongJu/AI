@@ -12,8 +12,9 @@
   (기록 없이 취소되는지는 ``test_pipeline`` 쪽 스윕 취소 테스트가 본다).
 
 같은 진입점이 배선하는 poison 저널 훅(``_poison_journal``)도 여기서 다룬다 — 컨슈머가
-poison 메시지를 삭제하기 직전의 **마지막 기록 기회**라, 훅이 조용히 실패하면 걷어내기가
-곧 무음 유실이 된다.
+poison 메시지를 삭제하기 직전의 **마지막 기록 기회**이자, 걷힌 문서를 청구 종결 카운트에
+반영하는 유일한 지점이다. 훅이 조용히 실패하면 걷어내기가 곧 무음 유실이 되고, 청구
+진행을 반영하지 않으면 그 청구의 fan-in이 영영 끝나지 않는다.
 """
 
 import asyncio
@@ -21,6 +22,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import pytest
+from structlog.testing import capture_logs
 
 from core.config import Settings
 from core.contracts import OcrJob
@@ -189,7 +191,10 @@ def _run_source() -> str:
 
 # ── poison 저널 훅 ───────────────────────────────────────────────
 # 훅은 컨슈머가 poison 메시지를 **삭제하기 직전**의 마지막 기록 기회다. 얇지만 계약이
-# 둘 있다: (a) 파싱 결과를 그대로 리포지토리에 넘긴다, (b) 예외를 삼키지 않는다.
+# 셋 있다: (a) 파싱 결과를 그대로 리포지토리에 넘긴다, (b) 저널 예외는 삼키지 않는다,
+# (c) 기록에 성공했으면 이 문서를 청구 종결 카운트에도 반영한다(안 세면 그 청구의
+# fan-in이 영영 안 끝난다). 단 (c)의 실패는 삼킨다 — 저널이라는 목적은 이미 달성됐고,
+# 여기서 예외를 올리면 poison 가드가 끊으려던 재전달 루프가 되살아난다.
 class _FakeJournal:
     """``mark_failure_terminal`` 대역 — 호출 인자를 포착하고 선택적으로 실패한다."""
 
@@ -198,28 +203,54 @@ class _FakeJournal:
         self._error = error
 
     async def __call__(self, pool: Any, *, job: Any, message_id: str, receive_count: int) -> None:
+        await asyncio.sleep(0)  # 실제 DB 왕복처럼 루프에 양보한다(호출 순서 착시 방지)
         self.calls.append((job, message_id, receive_count))
         if self._error is not None:
             raise self._error
 
 
-def _job(job_id: str = "11111111-1111-1111-1111-111111111111") -> OcrJob:
-    return OcrJob(
-        job_id=job_id,
-        s3_key="uploads/x.pdf",
-        content_type="application/pdf",
-        user_ref="user-1",
-        report_id="aaaaaaaa-0000-0000-0000-000000000001",
-        attachment_id="aaaaaaaa-0000-0000-0000-000000000002",
-        uploaded_at=datetime(2026, 1, 1, tzinfo=UTC),
-    )
+class _FakeClaimPipeline:
+    """``OcrPipeline.advance_claim_progress``만 흉내내는 파이프라인 대역."""
+
+    def __init__(self, error: Exception | None = None) -> None:
+        self.advanced: list[OcrJob] = []
+        self._error = error
+
+    async def advance_claim_progress(self, job: OcrJob) -> None:
+        await asyncio.sleep(0)
+        self.advanced.append(job)
+        if self._error is not None:
+            raise self._error
+
+
+def _job(job_id: str = "11111111-1111-1111-1111-111111111111", **overrides: Any) -> OcrJob:
+    base: dict[str, Any] = {
+        "job_id": job_id,
+        "s3_key": "uploads/x.pdf",
+        "content_type": "application/pdf",
+        "user_ref": "user-1",
+        "report_id": "aaaaaaaa-0000-0000-0000-000000000001",
+        "attachment_id": "aaaaaaaa-0000-0000-0000-000000000002",
+        "uploaded_at": datetime(2026, 1, 1, tzinfo=UTC),
+    }
+    base.update(overrides)
+    return OcrJob(**base)
+
+
+def _hook(
+    monkeypatch: pytest.MonkeyPatch,
+    journal: _FakeJournal,
+    pipeline: _FakeClaimPipeline | None = None,
+) -> Any:
+    """저널·파이프라인을 페이크로 갈아끼운 poison 훅."""
+    monkeypatch.setattr(ocr_main, "mark_failure_terminal", journal)
+    return ocr_main._poison_journal(object(), pipeline or _FakeClaimPipeline())  # type: ignore[arg-type]
 
 
 async def test_poison_hook_journals_parsed_job(monkeypatch: pytest.MonkeyPatch) -> None:
     # Arrange
     journal = _FakeJournal()
-    monkeypatch.setattr(ocr_main, "mark_failure_terminal", journal)
-    hook = ocr_main._poison_journal(object())  # type: ignore[arg-type]
+    hook = _hook(monkeypatch, journal)
     job = _job()
 
     # Act
@@ -232,8 +263,7 @@ async def test_poison_hook_journals_parsed_job(monkeypatch: pytest.MonkeyPatch) 
 async def test_poison_hook_journals_unparsable_message(monkeypatch: pytest.MonkeyPatch) -> None:
     # 역직렬화조차 실패한 메시지도 message_id로 흔적을 남겨야 한다(job=None 패스스루).
     journal = _FakeJournal()
-    monkeypatch.setattr(ocr_main, "mark_failure_terminal", journal)
-    hook = ocr_main._poison_journal(object())  # type: ignore[arg-type]
+    hook = _hook(monkeypatch, journal)
 
     await hook(None, "m-2", 7)
 
@@ -244,9 +274,69 @@ async def test_poison_hook_propagates_journal_failure(monkeypatch: pytest.Monkey
     # Arrange: 컨슈머는 훅의 성공 여부로 삭제/보류를 정한다. 훅이 예외를 삼키면
     # 컨슈머가 성공으로 오인해 메시지를 지우고, 기록도 메시지도 없는 무음 유실이 된다.
     journal = _FakeJournal(error=RuntimeError("저널 DB 다운"))
-    monkeypatch.setattr(ocr_main, "mark_failure_terminal", journal)
-    hook = ocr_main._poison_journal(object())  # type: ignore[arg-type]
+    hook = _hook(monkeypatch, journal)
 
     # Act / Assert
     with pytest.raises(RuntimeError):
         await hook(_job(), "m-3", 6)
+
+
+async def test_poison_hook_advances_claim_progress_after_journal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 재시도를 소진해 걷힌 문서도 **종결**이다. 안 세면 그 청구의 docs_terminal이 영영
+    # doc_total에 못 미쳐 나머지 문서가 멀쩡해도 리포트가 나오지 않는다.
+    journal = _FakeJournal()
+    pipeline = _FakeClaimPipeline()
+    hook = _hook(monkeypatch, journal, pipeline)
+    job = _job(claim_id="claim-1", doc_index=2, doc_total=3)
+
+    await hook(job, "m-4", 6)
+
+    assert pipeline.advanced == [job]
+
+
+async def test_poison_hook_skips_claim_progress_when_job_unparsable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 알려진 한계: 역직렬화 실패면 claim_id를 알 수 없어 진행 반영이 불가능하다
+    # (그 청구는 pending에 머문다 — 운영 개입이 유일한 복구 수단, MVP 범위 밖).
+    journal = _FakeJournal()
+    pipeline = _FakeClaimPipeline()
+    hook = _hook(monkeypatch, journal, pipeline)
+
+    await hook(None, "m-5", 7)
+
+    assert pipeline.advanced == []
+    assert journal.calls == [(None, "m-5", 7)]  # 저널은 그래도 남는다
+
+
+async def test_poison_hook_does_not_advance_when_journal_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 저널 기록이 실패하면 이 문서는 아직 "확정 종결"이 아니다 — 메시지가 보류돼
+    # 재전달되므로, 여기서 카운트를 올리면 다음 시도에서 한 번 더 세어진다(중복 카운트).
+    journal = _FakeJournal(error=RuntimeError("저널 DB 다운"))
+    pipeline = _FakeClaimPipeline()
+    hook = _hook(monkeypatch, journal, pipeline)
+
+    with pytest.raises(RuntimeError):
+        await hook(_job(claim_id="claim-1", doc_total=3), "m-6", 6)
+
+    assert pipeline.advanced == []
+
+
+async def test_poison_hook_swallows_claim_progress_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 저널은 이미 남았다(훅의 본래 목적 달성). 여기서 예외를 올리면 컨슈머가 메시지를
+    # 못 지워, poison 가드가 끊으려던 큐 보존기간짜리 재전달 루프가 되살아난다.
+    journal = _FakeJournal()
+    pipeline = _FakeClaimPipeline(error=RuntimeError("claim_readiness DB 다운"))
+    hook = _hook(monkeypatch, journal, pipeline)
+
+    with capture_logs() as logs:
+        await hook(_job(claim_id="claim-1", doc_total=3), "m-7", 6)  # 예외 없음
+
+    warned = [entry for entry in logs if entry["event"] == "claim_progress_advance_failed"]
+    assert [entry["error_type"] for entry in warned] == ["RuntimeError"]  # 타입만 남긴다(§9)

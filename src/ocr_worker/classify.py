@@ -13,7 +13,10 @@ OCR로 추출된 **첫 페이지 텍스트(str)** 위에서 동작하는 부수�
   왜곡되지 않게 — 결정적 동작 보장).
 - **불확실성 처리**: 최고 점수가 없거나(단서 0) 1·2위 격차가 작으면(동률/저신뢰)
   ``OTHER``로 폴백한다. ``hint``(OcrJob.doc_type_hint)는 *오직* 이때 타이브레이커로만
-  쓴다 — 본문 단서를 덮어쓰지 않는다.
+  쓴다 — 본문 단서를 덮어쓰지 않는다. 이긴 후보가 불확실으로 판정된 이상 애초에
+  신뢰할 본문 단서가 아니므로, hint 자신에 대한 본문 근거가 전혀 없어도(점수 0)
+  채택한다 — 다만 그땐 "단서가 아예 없음"과 같은 낮은 신뢰도(``HINT_ONLY_CONFIDENCE``)로
+  기록해, hint가 실제로 본문과도 맞아떨어졌던 경우(``TIEBREAK_CONFIDENCE``)와 구분한다.
 """
 
 import re
@@ -164,9 +167,15 @@ def classify(text: str, hint: str | None = None) -> ClassifyResult:
     uncertain = is_tie or confidence < CONFIDENCE_THRESHOLD
 
     if uncertain:
-        # hint가 실제 후보(점수>0) 중 하나면 타이브레이커로 채택.
-        if hint_type is not None and scores.get(hint_type, 0) > 0:
-            return ClassifyResult(hint_type, max(confidence, TIEBREAK_CONFIDENCE))
+        if hint_type is not None:
+            if scores.get(hint_type, 0) > 0:
+                # hint가 실제 후보(점수>0) 중 하나면 타이브레이커로 채택.
+                return ClassifyResult(hint_type, max(confidence, TIEBREAK_CONFIDENCE))
+            # hint 자신에 대한 본문 근거는 없지만, 이긴 후보도 어차피 불확실하다 —
+            # 신뢰 못 할 후보로 OTHER 처리하는 대신 hint를 약하게 채택한다("본문 단서
+            # 없음" 케이스와 같은 신뢰도). 저품질 사진이 엉뚱한 유형으로 약하게 흔들려도
+            # 업로드 슬롯이 확정한 hint가 그보다는 낫다고 본다.
+            return ClassifyResult(hint_type, HINT_ONLY_CONFIDENCE)
         return ClassifyResult(DocType.OTHER, confidence)
 
     return ClassifyResult(best_type, confidence)
