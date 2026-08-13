@@ -13,6 +13,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 
+import asyncpg
+
 from core.config import get_settings
 from core.db import db_pool
 from core.logging import get_logger
@@ -61,7 +63,7 @@ async def run(*, apply: bool) -> None:
                     pool=pool,
                 )
                 succeeded += 1
-            except (BotoCoreError, ClientError) as exc:
+            except (BotoCoreError, ClientError, asyncpg.PostgresError) as exc:
                 # 배치 중 개별 실패로 전체를 멈추지 않는다 — 나머지는 계속 진행하고 사유를 남긴다.
                 failed += 1
                 logger.error("corpus_backfill_item_failed", part_id=item.part_id, error=str(exc))
