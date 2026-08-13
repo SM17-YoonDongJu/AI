@@ -101,7 +101,24 @@ async def test_transcribe_table_sets_zero_temperature() -> None:
     await vlm_client.transcribe_table(_image())
 
     # Assert
-    assert captured["options"] == {"temperature": 0.0}
+    assert captured["options"] == {"temperature": 0.0, "num_ctx": vlm_client.settings.vlm_num_ctx}
+
+
+async def test_transcribe_table_uses_vlm_num_ctx_setting(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 실측 확인: num_ctx를 안 보내면 페이지 이미지 토큰만으로 컨텍스트 대부분이 차
+    # 표 전사 응답이 문장 중간에서 잘렸다 — 반드시 명시해서 보내야 한다.
+    monkeypatch.setattr(vlm_client.settings, "vlm_num_ctx", 8192)
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["options"] = json.loads(request.content)["options"]
+        return httpx.Response(200, json={"response": "ok"})
+
+    _install_mock(handler)
+
+    await vlm_client.transcribe_table(_image())
+
+    assert captured["options"]["num_ctx"] == 8192
 
 
 async def test_transcribe_table_wraps_http_error() -> None:
@@ -190,6 +207,22 @@ async def test_ground_pii_uses_grounding_model_setting(monkeypatch: pytest.Monke
     await vlm_client.ground_pii(_image())
 
     assert captured["model"] == "grounding-model"
+
+
+async def test_ground_pii_uses_vlm_num_ctx_setting(monkeypatch: pytest.MonkeyPatch) -> None:
+    # transcribe_table과 동일한 num_ctx 잘림 위험 방지 — grounding 호출에도 명시해야 한다.
+    monkeypatch.setattr(vlm_client.settings, "vlm_num_ctx", 8192)
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["options"] = json.loads(request.content)["options"]
+        return httpx.Response(200, json={"response": "[]"})
+
+    _install_mock(handler)
+
+    await vlm_client.ground_pii(_image())
+
+    assert captured["options"]["num_ctx"] == 8192
 
 
 async def test_ground_pii_strips_markdown_code_fence() -> None:
