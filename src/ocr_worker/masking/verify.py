@@ -11,11 +11,18 @@ Tier 2(독립 NER/LLM 교차검증)·Tier 3(오프라인 QA)은 별도 트랙이
 
 import re
 
+from core.exceptions import NonRetryableError
 from ocr_worker.masking.spans import PiiLabel, Span
 
 
-class MaskingError(Exception):
-    """마스킹 검증 실패(고민감 PII 잔류 등)."""
+class MaskingError(NonRetryableError):
+    """마스킹 검증 실패(고민감 PII 잔류 등).
+
+    ``NonRetryableError``다 — 같은 OCR 텍스트에 같은 결정적 정규식을 다시 돌려도
+    같은 잔류가 나온다. 재전달해봐야 수신 횟수만 태우므로 컨슈머가 첫 시도에서
+    즉시 ack하고 실패 저널(``ai.ocr_job_failures``, terminal=true)로 종결한다.
+    PII는 그 사이에도 저장되지 않는다(fail-closed).
+    """
 
 
 # 잔류 스캔용 *관대한* 패턴 — 본 디텍터보다 구분자에 느슨하게(OCR 노이즈 대비).

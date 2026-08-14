@@ -23,7 +23,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
-from core.exceptions import OcrError
+from core.exceptions import OcrError, UnreadableFileError
 from core.logging import get_logger
 from ocr_worker.storage import get_object
 
@@ -162,7 +162,8 @@ def render_to_images(data: bytes, content_type: str) -> list[PageImage]:
         페이지 이미지 목록(최소 1장).
 
     Raises:
-        OcrError: 지원하지 않는 content_type 또는 렌더 실패.
+        UnreadableFileError: PDF 렌더·이미지 디코드 실패(결정적 — 재전달 무의미).
+        OcrError: 지원하지 않는 content_type.
     """
     if content_type == _PDF_CONTENT_TYPE:
         return _render_pdf(data)
@@ -192,7 +193,8 @@ def _render_pdf(data: bytes) -> list[PageImage]:
                 pixmap = page.get_pixmap(matrix=matrix)
                 images.append(Image.open(io.BytesIO(pixmap.tobytes("png"))).convert("RGB"))
     except Exception as exc:  # 렌더 실패를 도메인 예외로 변환(컨텍스트 체이닝)
-        raise OcrError("PDF 렌더 실패") from exc
+        # 손상·암호화 PDF 등 — 같은 바이트를 다시 받아도 결과가 같다(재전달 무의미).
+        raise UnreadableFileError("PDF 렌더 실패") from exc
     if not images:
         raise OcrError("PDF에 페이지가 없습니다.")
     return images
@@ -226,7 +228,8 @@ def _render_image(data: bytes) -> list[PageImage]:
     try:
         return [Image.open(io.BytesIO(data)).convert("RGB")]
     except Exception as exc:  # 디코드 실패를 도메인 예외로 변환(컨텍스트 체이닝)
-        raise OcrError("이미지 디코드 실패") from exc
+        # 깨진 바이트·미지원 포맷 등 — 재전달해도 같은 결론이라 첫 시도에서 종결한다.
+        raise UnreadableFileError("이미지 디코드 실패") from exc
 
 
 class OcrProcessor:

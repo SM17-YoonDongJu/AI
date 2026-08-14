@@ -7,25 +7,38 @@
 (앱-DB 시계 스큐를 피하려고 시각도 SQL ``now()`` 기준). 페이크 풀은 SQL을 실행하지
 않으므로 여기서는 "어떤 SQL·인자로 부르는가"를 고정하고, 전이 결과 자체는 실 PG를
 쓰는 통합 테스트가 확인한다.
+
+실패 저널(``ai.ocr_job_failures``, 마이그레이션 008)도 같은 분업이다 — 업서트 전이
+(attempts 증가·terminal 단방향·failure_class 보존)는 SQL 문자열로 고정한다.
 """
 
 import json
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
 
-from core.contracts import DocType
+from core.contracts import DocType, OcrJob
 from ocr_worker.masking.spans import PiiLabel, Span
 from ocr_worker.ocr import OcrLine, OcrPage, OcrResult
 from ocr_worker.repository import (
+    ClaimDocument,
+    ClaimReadiness,
     OcrResultRecord,
     PendingDeletion,
     build_masked_lines,
+    clear_job_failure,
+    fetch_claim_documents,
+    fetch_claim_readiness,
     fetch_due_deletions,
+    mark_claim_blocked,
+    mark_claim_published,
+    mark_failure_terminal,
     record_delete_failure,
     record_delete_success,
+    record_document_terminal,
+    record_job_failure,
     save_ocr_result,
 )
 
@@ -114,6 +127,64 @@ async def test_save_serializes_jsonb_and_uuid() -> None:
     assert json.loads(args[6]) == {"insurer": "현대해상", "product": None}
     assert json.loads(args[7]) == record.masked_image_s3_keys
     assert args[9] == "uploads/x.pdf"  # 삭제 outbox 대상 키(원본)
+
+
+async def test_save_binds_claim_columns_after_existing_params() -> None:
+    # 청구 컬럼(마이그레이션 009)은 파라미터 목록 **맨 뒤**($13~$17)에 붙는다. 중간에
+    # 끼우면 뒤따르는 인자가 한 칸씩 밀리고, 그 밀림은 타입이 우연히 맞는 컬럼끼리
+    # (text↔text) 조용히 뒤바뀌는 형태로만 드러난다 — 기존 $1~$12가 그대로인지까지 본다.
+    pool = FakePool({"id": uuid.uuid4()})
+    report_id = "77777777-7777-7777-7777-777777777777"
+    attachment_id = "88888888-8888-8888-8888-888888888888"
+
+    await _save(
+        pool,
+        _record(
+            claim_id="claim-9",
+            report_id=report_id,
+            attachment_id=attachment_id,
+            doc_index=2,
+            doc_total=3,
+        ),
+    )
+
+    sql, args = pool.calls[0]
+    assert args[9] == "uploads/x.pdf"  # 기존 $10(원본 키)이 밀리지 않았다
+    assert args[10] == "not_eligible"  # 기존 $11(삭제 상태)
+    assert args[11] == _RETRY_INTERVAL  # 기존 $12(재시도 간격)
+    assert args[12:] == (
+        "claim-9",
+        uuid.UUID(report_id),  # uuid 컬럼 → UUID 객체
+        uuid.UUID(attachment_id),
+        2,
+        3,
+    )
+    # 컬럼 목록·VALUES·충돌 갱신 어디에서도 빠지면 안 된다(재소비 시 옛 값에 갇힌다).
+    assert "$13, $14, $15, $16, $17" in sql
+    assert "claim_id = EXCLUDED.claim_id" in sql.split("DO UPDATE SET")[1]
+    assert "doc_total = EXCLUDED.doc_total" in sql.split("DO UPDATE SET")[1]
+
+
+async def test_save_leaves_claim_columns_null_for_standalone_document() -> None:
+    # 청구에 안 묶인 단독 문서(하위 호환) — 전부 NULL로 들어가야 한다.
+    pool = FakePool({"id": uuid.uuid4()})
+
+    await _save(pool, _record())
+
+    _, args = pool.calls[0]
+    assert args[12:] == (None, None, None, None, None)
+
+
+async def test_save_tolerates_malformed_claim_uuids() -> None:
+    # 부가 컬럼 하나의 형식 오류로 OCR·마스킹까지 끝난 결과를 통째로 못 저장하게 되면,
+    # 재전달해도 같은 값이 다시 와서 영원히 저장되지 않는다 → 그 컬럼만 비운다.
+    pool = FakePool({"id": uuid.uuid4()})
+
+    await _save(pool, _record(claim_id="claim-9", report_id="not-a-uuid", attachment_id=""))
+
+    _, args = pool.calls[0]
+    assert args[12] == "claim-9"  # 나머지 컨텍스트는 남는다
+    assert args[13] is None and args[14] is None
 
 
 async def test_save_jsonb_keeps_korean_readable() -> None:
@@ -374,3 +445,346 @@ def test_build_masked_lines_catches_span_split_across_lines() -> None:
 
     assert masked_lines[0]["masked_text"] == "환자성명:"  # 라벨 라인엔 PII 없음 → 원문 유지
     assert masked_lines[1]["masked_text"] == "[이름]"  # 값 라인은 마스킹됨
+
+
+# ── 실패 저널(ai.ocr_job_failures, 마이그레이션 008) ─────────────
+# upsert 전이 자체(attempts 증가·terminal 단방향·failure_class 보존)는 **SQL 안**에서
+# 일어나므로 페이크 풀로는 실행할 수 없다. 여기서는 (a) 어떤 SQL·인자로 부르는가와
+# (b) 그 SQL이 전이 규칙을 실제로 담고 있는가를 문자열로 고정하고, 전이 결과는 실 PG를
+# 쓰는 통합 검증이 확인한다(save_ocr_result의 outbox CASE와 같은 분업).
+_FAILURE_JOB_ID = "44444444-4444-4444-4444-444444444444"
+_FAILURE_REPORT_ID = "55555555-5555-5555-5555-555555555555"
+_FAILURE_ATTACHMENT_ID = "66666666-6666-6666-6666-666666666666"
+
+
+def _job(**overrides: Any) -> OcrJob:
+    base: dict[str, Any] = {
+        "job_id": _FAILURE_JOB_ID,
+        "s3_key": "uploads/x.pdf",
+        "content_type": "application/pdf",
+        "user_ref": "user-1",
+        "doc_type_hint": "diagnosis",
+        "claim_id": "claim-9",
+        "report_id": _FAILURE_REPORT_ID,
+        "attachment_id": _FAILURE_ATTACHMENT_ID,
+        "uploaded_at": datetime(2026, 1, 1, tzinfo=UTC),
+    }
+    base.update(overrides)
+    return OcrJob(**base)
+
+
+async def test_record_job_failure_upserts_with_job_context() -> None:
+    # Arrange
+    pool = FakePool(None)
+
+    # Act
+    await record_job_failure(
+        pool,  # type: ignore[arg-type]
+        _job(),
+        failure_class="masking_residual",
+        error_type="MaskingError",
+        terminal=True,
+    )
+
+    # Assert: 스키마 한정 테이블 + 인자 순서 고정(컬럼 목록과 $n이 어긋나면 조용히 뒤섞인다).
+    sql, args = pool.calls[0]
+    assert "INSERT INTO ai.ocr_job_failures" in sql
+    assert args == (
+        uuid.UUID(_FAILURE_JOB_ID),
+        "uploads/x.pdf",
+        "user-1",
+        "application/pdf",
+        "diagnosis",
+        "claim-9",
+        uuid.UUID(_FAILURE_REPORT_ID),
+        uuid.UUID(_FAILURE_ATTACHMENT_ID),
+        "masking_residual",
+        "MaskingError",
+        True,
+    )
+
+
+async def test_record_job_failure_sql_accumulates_attempts_and_pins_terminal() -> None:
+    # 같은 job의 재실패가 새 행을 만들지 않고 attempts로 쌓여야 하고(멱등), 한 번 확정된
+    # terminal이 뒤늦은 재전달로 false로 되돌아가면 안 된다(단방향).
+    pool = FakePool(None)
+
+    await record_job_failure(
+        pool,  # type: ignore[arg-type]
+        _job(),
+        failure_class="ocr_error",
+        error_type="OcrError",
+        terminal=False,
+    )
+
+    sql = pool.calls[0][0]
+    assert "ON CONFLICT (job_id) DO UPDATE" in sql
+    assert "attempts = ocr_job_failures.attempts + 1" in sql
+    assert "terminal = EXCLUDED.terminal OR ocr_job_failures.terminal" in sql
+    assert "last_failed_at = now()" in sql  # 시각은 앱이 아니라 DB 기준(시계 스큐 회피)
+    # 최초 실패 시각은 불변 — SET에 들어가면 체류 시간 산출 근거가 매 실패마다 리셋된다.
+    assert "first_failed_at =" not in sql
+
+
+async def test_record_job_failure_tolerates_malformed_identifiers() -> None:
+    # 저널은 **다른 실패를 기록하는 마지막 방어선**이라 식별자 하나 때문에 예외를 던지면
+    # 원래 실패까지 통째로 사라진다. 형식이 깨진 UUID는 그 컬럼만 NULL로 비운다.
+    pool = FakePool(None)
+
+    await record_job_failure(
+        pool,  # type: ignore[arg-type]
+        _job(job_id="not-a-uuid", report_id="", attachment_id="also-bad"),
+        failure_class="unknown",
+        error_type="RuntimeError",
+        terminal=False,
+    )
+
+    args = pool.calls[0][1]
+    assert args[0] is None and args[6] is None and args[7] is None
+    assert args[1] == "uploads/x.pdf"  # 나머지 컨텍스트는 그대로 남는다
+
+
+async def test_clear_job_failure_deletes_by_job_id() -> None:
+    pool = FakePool(None)
+
+    await clear_job_failure(pool, _FAILURE_JOB_ID)  # type: ignore[arg-type]
+
+    sql, args = pool.calls[0]
+    assert sql.strip().startswith("DELETE FROM ai.ocr_job_failures")
+    assert args == (uuid.UUID(_FAILURE_JOB_ID),)
+
+
+async def test_clear_job_failure_skips_db_for_malformed_job_id() -> None:
+    # 기록될 수 없었던 키라 지울 행도 없다 — 굳이 왕복하지 않는다(또 예외를 만들지도 않는다).
+    pool = FakePool(None)
+
+    await clear_job_failure(pool, "not-a-uuid")  # type: ignore[arg-type]
+
+    assert pool.calls == []
+
+
+async def test_mark_failure_terminal_preserves_existing_failure_class() -> None:
+    # poison 훅은 "확정" 도장만 찍는다. 파이프라인이 남긴 구체적 분류(ocr_error 등)를
+    # unknown으로 덮으면 왜 실패했는지 알 수 없게 된다 → SET 절에 failure_class가 없어야 한다.
+    pool = FakePool(None)
+
+    await mark_failure_terminal(
+        pool,  # type: ignore[arg-type]
+        job=_job(),
+        message_id="m-1",
+        receive_count=6,
+    )
+
+    sql, args = pool.calls[0]
+    update_clause = sql.split("DO UPDATE SET", 1)[1]
+    assert "failure_class" not in update_clause  # 기존 분류 보존
+    assert "terminal = true" in update_clause
+    assert "'unknown'" in sql.split("ON CONFLICT", 1)[0]  # 신규 행일 때만 unknown
+    # attempts는 뒤로 가지 않는다 — receive_count와 저널 attempts는 세는 대상이 다르다.
+    assert "attempts = GREATEST(ocr_job_failures.attempts, EXCLUDED.attempts)" in update_clause
+    assert args == (
+        uuid.UUID(_FAILURE_JOB_ID),
+        "m-1",
+        "uploads/x.pdf",
+        "user-1",
+        "application/pdf",
+        "diagnosis",
+        "claim-9",
+        uuid.UUID(_FAILURE_REPORT_ID),
+        uuid.UUID(_FAILURE_ATTACHMENT_ID),
+        6,
+    )
+
+
+async def test_mark_failure_terminal_without_job_records_schema_invalid() -> None:
+    # 역직렬화조차 실패한 poison — job_id를 모르니 message_id만으로 추적한다.
+    pool = FakePool(None)
+
+    await mark_failure_terminal(
+        pool,  # type: ignore[arg-type]
+        job=None,
+        message_id="m-2",
+        receive_count=7,
+    )
+
+    sql, args = pool.calls[0]
+    assert "'schema_invalid'" in sql
+    assert "ON CONFLICT" not in sql  # job_id가 NULL이면 UNIQUE가 안 걸려 업서트 불가
+    assert args == ("m-2", 7)
+
+
+# ── 청구 fan-in(ai.claim_readiness, 마이그레이션 010) ────────────
+# 카운터 증가 자체는 SQL 안(ON CONFLICT DO UPDATE)에서 원자적으로 일어나므로 페이크
+# 풀로는 실행할 수 없다. 여기서는 (a) 어떤 SQL·인자로 부르는가와 (b) 그 SQL이 원자적
+# 증가 형태인가를 문자열로 고정하고, 실제 전이는 실 PG 검증이 확인한다.
+_CLAIM_ID = "claim-9"
+_CLAIM_REPORT_ID = "99999999-9999-9999-9999-999999999999"
+_CLAIM_JOB_ID = "aaaaaaaa-1111-2222-3333-444444444444"
+
+
+async def test_record_document_terminal_adds_job_id_to_terminal_set() -> None:
+    # Arrange: 갱신 후 종결 문서 수를 DB가 돌려준다(앱이 세지 않는다).
+    pool = FakePool({"docs_terminal": 2})
+
+    # Act
+    count = await record_document_terminal(
+        pool,  # type: ignore[arg-type]
+        claim_id=_CLAIM_ID,
+        job_id=_CLAIM_JOB_ID,
+        report_id=uuid.UUID(_CLAIM_REPORT_ID),
+        doc_total=3,
+    )
+
+    # Assert
+    assert count == 2
+    sql, args = pool.calls[0]
+    assert "INSERT INTO ai.claim_readiness" in sql
+    assert args == (_CLAIM_ID, uuid.UUID(_CLAIM_REPORT_ID), 3, _CLAIM_JOB_ID)
+    # 여전히 **단일 업서트**여야 한다 — 서로 다른 문서를 동시에 끝낸 두 워커의 증가분이
+    # 유실되지 않고, doc_total에 닿는 호출자가 정확히 하나다.
+    assert "ON CONFLICT (claim_id) DO UPDATE" in sql
+    assert "RETURNING docs_terminal" in sql
+    # 개수 증가(+1)가 아니라 **집합 추가**여야 과다 카운트를 구조적으로 막는다:
+    # 같은 문서가 두 번 종결로 보고돼도(동시 중복 전달·ack 실패 재전달·poison 중복)
+    # containment 검사에 걸려 수가 늘지 않는다.
+    update_clause = sql.split("DO UPDATE SET")[1]
+    assert "terminal_job_ids" in update_clause
+    assert "@> ARRAY[$4]::text[]" in update_clause
+    assert "+ 1" not in update_clause
+    # 진행 중에 기준(doc_total)·발행 키(report_id)가 흔들리면 안 된다 → 충돌 갱신 제외.
+    assert "doc_total" not in update_clause
+    assert "report_id" not in update_clause
+
+
+async def test_record_document_terminal_takes_report_id_as_uuid_object() -> None:
+    # 문자열을 여기서 변환하면 형식이 어긋난 값이 **매 재시도마다 같은 지점에서**
+    # ValueError를 내 그 청구의 fan-in이 결정적으로 영구 정지한다. 유효성 판정은
+    # 호출측(pipeline._claim_context)이 진입 시점에 끝내고, 여기는 타입으로 보장받는다.
+    pool = FakePool({"docs_terminal": 1})
+
+    await record_document_terminal(
+        pool,  # type: ignore[arg-type]
+        claim_id=_CLAIM_ID,
+        job_id=_CLAIM_JOB_ID,
+        report_id=uuid.UUID(_CLAIM_REPORT_ID),
+        doc_total=3,
+    )
+
+    assert isinstance(pool.calls[0][1][1], uuid.UUID)
+
+
+async def test_record_document_terminal_raises_when_no_row_returned() -> None:
+    # RETURNING은 항상 한 행 → 계약 위반이면 조용히 0을 반환하지 말고 터뜨린다
+    # (0을 돌려주면 "아직 문서가 남았다"로 오인해 발행이 영영 안 일어난다).
+    pool = FakePool(None)
+
+    with pytest.raises(RuntimeError, match="docs_terminal"):
+        await record_document_terminal(
+            pool,  # type: ignore[arg-type]
+            claim_id=_CLAIM_ID,
+            job_id=_CLAIM_JOB_ID,
+            report_id=uuid.UUID(_CLAIM_REPORT_ID),
+            doc_total=3,
+        )
+
+
+async def test_fetch_claim_documents_maps_rows_in_doc_index_order() -> None:
+    # Arrange
+    policy_id = uuid.UUID("aaaaaaaa-0000-0000-0000-00000000000a")
+    diagnosis_id = uuid.UUID("bbbbbbbb-0000-0000-0000-00000000000b")
+    pool = FakePool(
+        None,
+        rows=[
+            {"id": policy_id, "doc_type": "policy", "ocr_quality": "ok"},
+            {"id": diagnosis_id, "doc_type": "diagnosis", "ocr_quality": "needs_reupload"},
+        ],
+    )
+
+    # Act
+    docs = await fetch_claim_documents(pool, _CLAIM_ID)  # type: ignore[arg-type]
+
+    # Assert
+    assert docs == [
+        ClaimDocument(ocr_result_id=str(policy_id), doc_type=DocType.POLICY, ocr_quality="ok"),
+        ClaimDocument(
+            ocr_result_id=str(diagnosis_id),
+            doc_type=DocType.DIAGNOSIS,
+            ocr_quality="needs_reupload",
+        ),
+    ]
+    sql, args = pool.calls[0]
+    assert args == (_CLAIM_ID,)
+    assert "FROM ai.ocr_results" in sql
+    # doc_index는 nullable(단독 문서 호환)이라 NULL이 앞으로 튀어나오면 대표 문서 선택이
+    # 뒤집힌다 — 뒤로 밀고 그 안에서는 저장 순서로 안정 정렬한다.
+    assert "ORDER BY doc_index NULLS LAST, created_at" in sql
+
+
+async def test_fetch_claim_documents_returns_empty_when_all_documents_failed() -> None:
+    # 실패한 문서는 ocr_results에 행이 없다 — 필수 유형 판정이 "무엇이 실제로 인식됐나"만
+    # 보게 하는 것이 이 조회의 목적이다.
+    pool = FakePool(None, rows=[])
+
+    assert await fetch_claim_documents(pool, _CLAIM_ID) == []  # type: ignore[arg-type]
+
+
+async def test_mark_claim_blocked_records_missing_types_and_judged_at() -> None:
+    # Arrange
+    pool = FakePool(None)
+
+    # Act
+    await mark_claim_blocked(
+        pool,  # type: ignore[arg-type]
+        claim_id=_CLAIM_ID,
+        missing_doc_types=["diagnosis", "policy"],
+    )
+
+    # Assert: 빠진 유형은 사용자 안내("그 문서를 다시 촬영") 근거라 반드시 남아야 한다.
+    sql, args = pool.calls[0]
+    assert "UPDATE ai.claim_readiness" in sql
+    assert "status = 'blocked'" in sql
+    assert "judged_at = now()" in sql  # 시각은 DB 기준(앱-DB 시계 스큐 회피)
+    assert args == (_CLAIM_ID, ["diagnosis", "policy"])
+
+
+async def test_mark_claim_published_stamps_status() -> None:
+    # Arrange
+    pool = FakePool(None)
+
+    # Act
+    await mark_claim_published(pool, _CLAIM_ID)  # type: ignore[arg-type]
+
+    # Assert
+    sql, args = pool.calls[0]
+    assert "UPDATE ai.claim_readiness" in sql
+    assert "status = 'published'" in sql
+    assert args == (_CLAIM_ID,)
+
+
+async def test_fetch_claim_readiness_returns_status_and_progress() -> None:
+    # Arrange / Act: 상태만으로는 "아직 문서가 남은 pending"과 "다 모였는데 판정 도중
+    # 죽은 pending"을 구분할 수 없다 — 진행도를 함께 읽어야 후자를 재개할 수 있다.
+    pool = FakePool({"status": "pending", "docs_terminal": 3, "doc_total": 3})
+
+    readiness = await fetch_claim_readiness(pool, _CLAIM_ID)  # type: ignore[arg-type]
+
+    # Assert
+    assert readiness == ClaimReadiness(status="pending", docs_terminal=3, doc_total=3)
+    assert readiness is not None and readiness.all_documents_terminal is True
+    sql, args = pool.calls[0]
+    assert "FROM ai.claim_readiness" in sql
+    assert "status, docs_terminal, doc_total" in sql
+    assert args == (_CLAIM_ID,)
+
+
+async def test_fetch_claim_readiness_reports_documents_still_pending() -> None:
+    pool = FakePool({"status": "pending", "docs_terminal": 1, "doc_total": 3})
+
+    readiness = await fetch_claim_readiness(pool, _CLAIM_ID)  # type: ignore[arg-type]
+
+    assert readiness is not None and readiness.all_documents_terminal is False
+
+
+async def test_fetch_claim_readiness_returns_none_when_no_document_terminal_yet() -> None:
+    # 아직 이 청구의 문서가 하나도 종결되지 않았으면 행 자체가 없다.
+    assert await fetch_claim_readiness(FakePool(None), _CLAIM_ID) is None  # type: ignore[arg-type]

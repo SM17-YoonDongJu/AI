@@ -150,6 +150,17 @@ def test_hint_used_when_no_evidence() -> None:
     assert result.confidence == HINT_ONLY_CONFIDENCE
 
 
+def test_hint_promoted_when_winning_candidate_is_uncertain_despite_no_own_evidence() -> None:
+    # Arrange — "처방"(진단서 약한 단서 1점)만 있어 저신뢰 → 불확실. hint(policy)는
+    # 본문에 자기 근거가 전혀 없지만(0점), 이긴 후보(진단서)도 어차피 못 믿긴 마찬가지다.
+    text = "처방 안내"
+    # Act
+    result = classify(text, hint="policy")
+    # Assert — 신뢰 못 할 진단서 대신 hint를 "단서 없음"과 같은 신뢰도로 채택한다.
+    assert result.doc_type is DocType.POLICY
+    assert result.confidence == HINT_ONLY_CONFIDENCE
+
+
 def test_hint_does_not_override_strong_evidence() -> None:
     # Arrange — 본문은 명백한 진단서, hint는 엉뚱한 값
     text = "진단서\n상병명 골절\n진단명 KCD S82.1"
