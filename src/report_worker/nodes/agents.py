@@ -11,7 +11,7 @@ import functools
 import json
 import re
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
 
 import guardrail
@@ -65,6 +65,101 @@ def _as_str_list(v: Any) -> list[str]:
 
 
 # ── load_context: DB 조회로 사고/약관 컨텍스트 조립 ──────────────
+# 청구(claim)에 속한 **처리 완료된** 문서 전부. OCR이 실패한 문서는 애초에 행이 없어
+# 여기 안 나온다(ocr_worker.repository의 fan-in 조회와 같은 전제). 정렬 관례도 그쪽
+# `_SELECT_CLAIM_DOCUMENTS_SQL`과 맞춘다 — doc_index는 nullable(단독 문서 호환)이라
+# NULLS LAST로 뒤로 밀고, 그 안에서는 저장 순서(created_at)로 안정 정렬한다.
+# 스키마 미한정(`FROM ocr_results`)은 이 모듈의 기존 관례(search_path 의존)를 따른다.
+_SELECT_CLAIM_DOCUMENTS_SQL = (
+    "SELECT doc_type, masked_text, entities FROM ocr_results "
+    "WHERE claim_id = $1 ORDER BY doc_index NULLS LAST, created_at"
+)
+_SELECT_OCR_RESULT_SQL = "SELECT masked_text, entities FROM ocr_results WHERE id = $1"
+
+# 문서 경계 표식 — 병합된 텍스트는 그대로 LLM 프롬프트로 들어간다(diagnosis·report_compose).
+# 어느 내용이 어느 문서에서 왔는지 표시해야 진단명을 증권에서 뽑거나 특약을 진단서에서
+# 뽑는 식의 혼선이 없다. 구분자는 ocr_worker의 `_TABLE_PAGE_SEPARATOR`(빈 줄 + ---)와
+# 같은 결로 맞춘다.
+_DOC_HEADER = "--- 문서 {index}: {label} ---"
+_DOC_SEPARATOR = "\n\n"
+# DocType 값 → 한국어 라벨. 프롬프트가 전부 한국어라 enum 값(policy)보다 라벨(보험증권)이
+# 모델에 더 잘 읽힌다. 미지의 값은 그대로 노출한다(계약이 늘어도 죽지 않게).
+_DOC_TYPE_LABELS = {
+    "diagnosis": "진단서",
+    "policy": "보험증권",
+    "payout_notice": "지급결과안내문",
+    "claim": "청구서",
+    "hospitalization_cert": "입퇴원확인서",
+    "medical_receipt": "진료비계산서·영수증",
+    "other": "기타문서",
+}
+
+
+def _parse_entities(raw: Any) -> dict[str, Any]:
+    """`ocr_results.entities`(jsonb) 컬럼 값을 dict로 정규화한다.
+
+    asyncpg는 jsonb 코덱 등록 여부에 따라 dict 또는 JSON 문자열을 준다 — 양쪽을 흡수한다.
+
+    Args:
+        raw: 컬럼 원값(dict | str | None).
+
+    Returns:
+        엔티티 dict. 비었거나 dict가 아니면 빈 dict.
+    """
+    if not raw:
+        return {}
+    parsed = raw if isinstance(raw, dict) else json.loads(raw)
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _merge_claim_texts(docs: Sequence[Any]) -> str:
+    """청구 문서들의 `masked_text`를 문서 경계 표식과 함께 이어붙인다.
+
+    Args:
+        docs: `_SELECT_CLAIM_DOCUMENTS_SQL` 결과 행들(doc_index 순).
+
+    Returns:
+        `--- 문서 1: 보험증권 ---` 헤더가 붙은 문서 본문을 빈 줄로 이은 텍스트.
+    """
+    parts: list[str] = []
+    for index, doc in enumerate(docs, start=1):
+        doc_type = str(doc["doc_type"] or "other")
+        header = _DOC_HEADER.format(index=index, label=_DOC_TYPE_LABELS.get(doc_type, doc_type))
+        parts.append(f"{header}\n{doc['masked_text'] or ''}")
+    return _DOC_SEPARATOR.join(parts)
+
+
+def _merge_claim_entities(docs: Sequence[Any]) -> dict[str, Any]:
+    """청구 문서들의 `entities`를 **평평하게** 하나로 합친다.
+
+    네임스페이스로 나누지 않는 이유: 소비처(`payment_calc`)가 `entities.get("icd")`,
+    `entities.get("admission_days")`, `entities.get("surgery")`처럼 평평하게 읽고,
+    이 키들은 애초에 doc_type별로 서로 겹치지 않는다(`ocr_worker.extract`: icd는
+    진단서, admission_days/surgery는 입퇴원확인서). 즉 doc_type이 이미 키 이름에
+    녹아 있어 네임스페이스를 추가하면 소비처를 전부 고쳐야 하는 값만큼의 이득이 없다.
+    겹치는 키(`insurer`=증권·지급안내문, `payout_amount`=지급안내문·청구서,
+    `table_markdown`=영수증 다건)는 report_worker가 읽지 않으므로 뒤 문서가 덮어써도
+    무해하다 — 덮어쓰기 순서는 doc_index(문서 순)다.
+
+    다만 `None`으로는 덮어쓰지 않는다. `extract`는 추출 실패 필드를 키 삭제가 아니라
+    `None`으로 남기므로, 진단서 2장 중 뒤 장에서 icd 추출이 실패하면 앞 장의 값이
+    조용히 지워질 수 있다.
+
+    Args:
+        docs: `_SELECT_CLAIM_DOCUMENTS_SQL` 결과 행들(doc_index 순).
+
+    Returns:
+        병합된 엔티티 dict.
+    """
+    merged: dict[str, Any] = {}
+    for doc in docs:
+        for key, value in _parse_entities(doc["entities"]).items():
+            if value is None and key in merged:
+                continue  # 뒤 문서의 추출 실패가 앞 문서의 성공값을 지우지 않게
+            merged[key] = value
+    return merged
+
+
 def _decrypt_pii_column(row: Any, table: str, column: str, dek: bytes) -> str | None:
     """행이 있으면 그 행의 PII 컬럼을 복호화해 돌려준다(행 자체가 없으면 None).
 
@@ -197,11 +292,28 @@ async def load_context(state: ReportState) -> dict[str, Any]:
         logger.error("pii dek unavailable", report_id=state.get("report_id"), error=str(e))
         return {"errors": _err(state, f"input_blocked:pii_dek_unavailable:{type(e).__name__}")}
     pool = db.get_pool()
+    claim_id = state.get("claim_id")
     async with pool.acquire() as c:
-        ocr = await c.fetchrow(
-            "SELECT masked_text, entities FROM ocr_results WHERE id = $1",
-            uuid.UUID(state["ocr_result_id"]),
-        )
+        # 청구(claim) 단위 리포트면 대표 문서 하나가 아니라 청구의 **전 문서**를 본다.
+        # ReportJob.ocr_result_id/doc_type은 계약상 단일값이라 ocr_worker가 대표 문서
+        # (증권 우선) 하나만 실어 보내는데, 그것만 읽으면 진단서·영수증 내용이 리포트에
+        # 아예 반영되지 않는다(ocr_worker `_publish_claim_report` 주석의 "정공법"이 이것).
+        docs: list[Any] = []
+        if claim_id:
+            docs = list(await c.fetch(_SELECT_CLAIM_DOCUMENTS_SQL, claim_id))
+        # claim에 안 묶인 리포트(기존 경로) + 청구 조회가 예외적으로 0건인 경우의 안전망.
+        ocr = None
+        if not docs:
+            if claim_id:
+                # fan-in은 문서 행이 전부 저장된 뒤에야 발행하므로 여기 걸리면 데이터가
+                # 어긋난 것이다(claim_id 미기록 등) — 리포트는 대표 문서로 계속 만들되
+                # 원인 추적용 신호를 남긴다.
+                logger.warning(
+                    "claim documents not found, falling back to representative document",
+                    report_id=state.get("report_id"),
+                    claim_id=claim_id,
+                )
+            ocr = await c.fetchrow(_SELECT_OCR_RESULT_SQL, uuid.UUID(state["ocr_result_id"]))
         rep = await c.fetchrow(
             "SELECT accident_type, treatment, offered_amount, question, claim_id "
             "FROM reports WHERE id = $1",
@@ -222,13 +334,26 @@ async def load_context(state: ReportState) -> dict[str, Any]:
         )
 
     errors = list(state.get("errors", []))
-    if not ocr:
-        errors.append("ocr_result_missing")
-    entities = {}
-    if ocr and ocr["entities"]:
-        entities = (
-            ocr["entities"] if isinstance(ocr["entities"], dict) else json.loads(ocr["entities"])
+    if docs:
+        masked_text = _merge_claim_texts(docs)
+        entities = _merge_claim_entities(docs)
+        logger.info(
+            "claim documents loaded",
+            report_id=state.get("report_id"),
+            claim_id=claim_id,
+            doc_count=len(docs),
+            # 어떤 유형이 실제로 리포트에 반영됐는지 남긴다(전부 DocType enum 값 = 비-PII).
+            doc_types=[str(d["doc_type"]) for d in docs],
         )
+    elif ocr:
+        # 단건 경로는 기존 동작을 그대로 둔다 — 문서 헤더도 붙이지 않는다(프롬프트 무변경).
+        masked_text = ocr["masked_text"] or ""
+        entities = _parse_entities(ocr["entities"])
+    else:
+        # 청구 문서 0건 + 대표 문서 행도 없음 = 컨텍스트 없음(worker가 하드 실패로 승격).
+        masked_text = ""
+        entities = {}
+        errors.append("ocr_result_missing")
 
     try:
         case_info = {
@@ -262,7 +387,7 @@ async def load_context(state: ReportState) -> dict[str, Any]:
     # coverage_details는 채우지 않고, payment_calc가 배수 어림 폴백으로 지급액을 산출한다.
     return {
         "case_info": case_info,
-        "masked_text": (ocr["masked_text"] if ocr else ""),
+        "masked_text": masked_text,
         "entities": entities,
         "subscribed_coverages": subscribed_coverages,
         "errors": errors,

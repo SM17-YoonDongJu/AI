@@ -21,6 +21,7 @@ class ReportState(TypedDict, total=False):
     case_info: dict[
         str, Any
     ]  # accident_type, accident_date, diagnosis, offered_amount, question ...
+    # claim_id가 있으면 청구의 전 문서를 병합한 값이다(문서 헤더로 구분 · 엔티티는 평평 병합).
     masked_text: str  # ocr_results.masked_text
     entities: dict[str, Any]  # ocr_results.entities
     subscribed_coverages: list[str]  # 가입 특약명 (user_insurances.coverages)
