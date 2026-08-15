@@ -42,7 +42,10 @@ def safe_node(fn: Callable[[ReportState], Awaitable[dict[str, Any]]]):
         try:
             return await fn(state)
         except Exception as e:
-            return {"errors": _err(state, f"{fn.__name__}_failed:{type(e).__name__}:{e}")}
+            # 예외 메시지는 담지 않는다(타입명만) — errors는 report_compose의
+            # "7_추가확인필요" 섹션에 그대로 join돼 최종 리포트에 노출된다.
+            # 원문 파싱 실패 등의 예외 메시지엔 PII 조각이 섞일 수 있다(§9).
+            return {"errors": _err(state, f"{fn.__name__}_failed:{type(e).__name__}")}
 
     return wrapper
 
