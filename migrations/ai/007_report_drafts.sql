@@ -29,3 +29,15 @@ BEGIN
     END IF;
 END
 $$;
+
+-- Backend가 손해사정사 검수 화면에서 리포트 초안(draft jsonb)을 읽어야 한다 — 읽기 전용
+-- @Subselect 소비(§14, deploy/schema_split.sql과 동일한 SELECT-only 방침). ai_owner가
+-- 자기 소유 테이블에 SELECT만 내주는 self-grant라 별도 권한이 필요 없다 — ocr_worker가
+-- 이 파일을 재실행할 때마다(매 기동) 자동 적용된다. app_owner에는 UPDATE를 주지 않는다.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_owner') THEN
+        EXECUTE 'GRANT SELECT ON ai.report_drafts TO app_owner';
+    END IF;
+END
+$$;
