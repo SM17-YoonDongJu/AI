@@ -59,3 +59,18 @@ BEGIN
     END IF;
 END
 $$;
+
+-- Backend가 분석 실패 알림 계약(ai.ocr_job_failures)을 읽기 전용 @Subselect로 소비한다
+-- (@Table(schema="ai")가 아니라 @Subselect라 이 GRANT가 없어도 앱 부팅은 성공하지만,
+-- 실제 조회(ReportAnalysisStatusQueryService)는 permission denied로 실패한다). ai_owner가
+-- 자기 소유 테이블에 SELECT만 내주는 self-grant라 별도 권한이 필요 없다 — ocr_worker가
+-- 이 파일을 재실행할 때마다(매 기동) 자동으로 적용되므로, deploy/schema_split.sql(수동
+-- 1회성 부트스트랩)의 실행 여부와 무관하게 이 GRANT는 항상 최신 상태로 유지된다.
+-- app_owner는 절대 write하지 않는다(SELECT만 — §14).
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_owner') THEN
+        EXECUTE 'GRANT SELECT ON ai.ocr_job_failures TO app_owner';
+    END IF;
+END
+$$;
