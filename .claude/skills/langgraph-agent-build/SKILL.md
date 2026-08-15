@@ -1,24 +1,26 @@
 ---
 name: langgraph-agent-build
-description: LLM 소비 컴포넌트를 구현할 때 사용. LangGraph 멀티에이전트 리포트 생성(05번, Kafka 워커)과 챗봇(12번, FastAPI WebSocket 직결·비스트리밍)을 다룬다. RAG·가드레일 공용 모듈과 ai_client(Ollama Qwen3 MoE)를 조립한다. LangGraph 그래프·멀티에이전트·리포트 생성·챗봇 WebSocket·세션 작업 시 사용.
+description: LLM 소비 컴포넌트를 구현할 때 사용. LangGraph 멀티에이전트 리포트 생성(05번, SQS 워커)과 챗봇(12번, FastAPI WebSocket 직결·비스트리밍)을 다룬다. RAG·가드레일 공용 모듈과 ai_client(Ollama Qwen3 MoE)를 조립한다. LangGraph 그래프·멀티에이전트·리포트 생성·챗봇 WebSocket·세션 작업 시 사용.
 ---
 
 # LangGraph / Agent Build
 
 RAG·가드레일·ai_client를 **조립**해 사용자 가치를 만드는 두 컴포넌트. 공용 모듈을 재구현하지 않고 `aicore-engineer`의 공개 API를 호출한다.
 
-## A. 리포트 생성 (05번) — Kafka 워커
+## A. 리포트 생성 (05번) — SQS 워커
 `src/report_worker/` (파이프라인 + 진입점 `__main__.py`).
 
-- 진입: `report-job` Kafka 소비(`kafka-worker-patterns` 따름).
+- 진입: `report-job` SQS 소비(`sqs-worker-patterns` 따름).
 - 파이프라인: **입력 가드레일 → LangGraph 멀티에이전트 생성(생성 가드레일 적용) → 출력 가드레일(LLM Judge 포함)**.
-- LLM은 `ai_client`(Qwen3 MoE, 별도 GPU 노드). EXAONE은 라이선스(상업 사용 금지)로 제외.
+- `state.claim_id`가 있으면 `load_context`가 클레임의 문서 전체(`ocr_results`)를 문서 경계 헤더로 병합해 `masked_text`/`entities`를 구성한다(`_merge_claim_texts`/`_merge_claim_entities`) — 대표 문서 1개만 읽지 않는다. 엔티티 병합은 뒤 문서의 추출 실패(`None`)가 앞 문서의 성공값을 지우지 않도록 `None`을 건너뛴다.
+- LLM은 `ai_client`(Qwen3 MoE, 별도 GPU 노드). EXAONE은 라이선스(상업 사용 금지)로 제외. `ai_client.chat()`은 `num_ctx`를 명시하지 않고 서버 기본값에 맡긴다 — 문서를 아주 많이 병합하는 등 프롬프트가 커지는 변경을 할 때는 실측(서버 `num_ctx`, 실제 토큰 소비량)으로 잘림 여부를 확인한다(VLM 표 전사가 #60에서 이 문제로 `vlm_num_ctx`를 명시 고정한 선례가 있다).
+- `pii_dek_unavailable`·`pii_decrypt_failed`·가드레일 입력 차단 시 `reports.status='BLOCKED'`로 종결한다(`persist_blocked`).
 - 결과: AI 리포트 초안 JSONB로 **영구 보존**(손해사정사 검수 근거).
-- **노션 05번이 미작성** — 그래프 노드 구성(에이전트 역할·엣지·상태)을 먼저 `_workspace/`에 설계해 확인받고 구현한다. 추측으로 구현하지 않는다.
+- 그래프 노드 구성(에이전트 역할·엣지·상태)은 `.claude/docs/05_langGraphAgent.md`(Notion 05번 동기화본)와 `src/report_worker/state.py`(`ReportState`) 기준. 구조를 바꿀 때는 먼저 `_workspace/`에 설계해 확인받는다.
 
 LangGraph 원칙:
-- 상태(State)를 명시적 타입으로 정의. 노드는 단일 책임.
-- 노드 실패는 1회 재시도 후 부분 결과 + 실패 섹션 표기로 진행(전체 실패 회피).
+- 상태(State)를 명시적 타입으로 정의(`ReportState` TypedDict). 노드는 단일 책임, `safe_node` 데코레이터로 부분 실패 격리.
+- 노드 실패는 부분 결과 + `errors`에 실패 사유 표기로 진행(전체 실패 회피).
 - 각 사실 주장에 인용을 달도록 생성 가드레일과 맞물린다.
 
 ## B. 챗봇 (12번) — FastAPI WebSocket 직결, 비스트리밍

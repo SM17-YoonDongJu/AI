@@ -5,11 +5,11 @@
 **트리거:** OCR Worker·RAG·LangGraph 리포트·가드레일·챗봇 등 이 프로젝트 기능의 구현/수정/리팩터링 요청 시 `ai-engine-orchestrator` 스킬을 사용하라. 단순 질문이나 단일 파일 수정은 직접 응답 가능.
 
 **아키텍처 요약 (확정):**
-- OCR(02)·리포트(05) = Kafka 워커 — `src/ocr_worker` · `src/report_worker`
+- OCR(02)·리포트(05) = SQS 워커(at-least-once, `src/core/sqs/`) — `src/ocr_worker` · `src/report_worker`
 - 챗봇(12) = FastAPI WebSocket 직결, **비스트리밍**(완성 응답 1회) — `src/chatbot/app.py`
 - RAG(04)·가드레일(06)·`ai_client` = 공용 모듈 — `src/rag` · `src/guardrail` · `src/core/ai_client.py`
-- Spring Boot는 게이트웨이(업로드/JWT/S3/Kafka 발행) — **별도 범위**
-- 노드 간 통신: OCR/리포트=Kafka, 챗봇=FastAPI WS 직결
+- Spring Boot는 게이트웨이(업로드/JWT/S3/SQS 발행) — **별도 범위**
+- 노드 간 통신: OCR/리포트=SQS(`ocr-job-queue`·`report-job`, 로컬은 LocalStack), 챗봇=FastAPI WS 직결
 
 **코드 컨벤션:** 모든 Python 코드는 `.claude/CODE_CONVENTIONS.md`를 따른다.
 
@@ -25,3 +25,4 @@
 | 2026-06-17 | 워커중심 구조로 변경 + 하네스 경로 동기화 | agents·skills·CLAUDE.md | 실제 구조(`src/ocr_worker`·`src/report_worker`·`src/chatbot/app.py`)와 정합 |
 | 2026-06-25 | git-committer 스킬 추가 (변경 분석→한국어 커밋, ruff·시크릿 점검, push 안 함) | `skills/git-committer` | 사용자 요청 — 커밋 메시지 작성·커밋 자동화 |
 | 2026-08-03 | 커밋·PR 스킬에서 AI 서명/트레일러 제거 (`Co-Authored-By`·`Generated with`) | `skills/git-committer`, `skills/pr-writer` | 사용자 요청 — 커밋/PR에 도구 흔적 미표기 |
+| 2026-08-15 | Kafka→SQS 마이그레이션(PR #53) 반영: 전 에이전트·스킬의 Kafka 표기 제거, `kafka-worker-patterns`를 `sqs-worker-patterns`로 재작성(poison 가드·`NonRetryableError`·클레임 fan-in 게이트·실패 저널 신규 문서화). PaddleOCR→surya-ocr, `docker-compose.dev.yml`→`docker-compose.yml` 등 실제 경로 정정. `CODE_CONVENTIONS.md`에 §14(DB 스키마 소유권 경계) 신설 + Executor 합성 트랜잭션·예외 메시지 PII 규칙 보강. `qa-engineer`/`integration-qa`에 뮤테이션 테스트 원칙 추가 | `CLAUDE.md`, `CODE_CONVENTIONS.md`, agents 전체, `skills/sqs-worker-patterns`(신규), `skills/python-worker-scaffolding`, `skills/integration-qa`, `skills/langgraph-agent-build`, `skills/pr-writer` | 사용자 요청 — 하네스 설정 vs 실제 코드 정합성 감사 |
