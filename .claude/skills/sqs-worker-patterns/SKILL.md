@@ -40,8 +40,9 @@ Kafka의 오프셋 커밋과 달리 SQS는 **메시지 단위 삭제(DeleteMessa
 여러 문서가 한 클레임(`claim_id`)에 묶여 각자 별도 SQS 메시지로 도착하는 경우, 문서 하나 처리 완료 = 발행 시점이 아니다. `ocr_worker/pipeline.py`의 `advance_claim_progress`/`_judge_claim`이 이 문제를 푼다:
 
 - **구조적 멱등 카운팅**: `claim_readiness.terminal_job_ids`(text[])에 `job_id`를 조건부 추가(`ON CONFLICT ... WHERE NOT terminal_job_ids @> ARRAY[$1]`)하고, `docs_terminal`은 `GENERATED ALWAYS AS (cardinality(terminal_job_ids)) STORED`로 파생시킨다. 같은 job이 재전달돼 두 번 세어져도(at-least-once) 배열 멤버십 체크가 중복 카운트를 막는다 — 별도 dedup 로직이 필요 없다.
-- **필수 문서 판정**: `_REQUIRED_DOC_TYPES`(보험증권·진단서)가 인식된 문서 유형에 다 있어야 `report-job`을 발행한다. 없으면 아직 대기(`pending`)거나, 클레임의 전 문서가 종결됐는데도 없으면 `claim_readiness.status='blocked'`로 종결하고 report_worker로 넘기지 않는다.
-- **poison과의 연결**: `on_poison` 훅에서도 `advance_claim_progress`를 호출한다 — poison으로 걷힌 문서(=영구히 처리 안 됨)도 "종결"로 카운트해야, 그 문서 하나 때문에 클레임 fan-in이 영원히 멈추지 않는다.
+- **판정은 두 조건의 합집합**(둘 다 걸리면 정상 리포트를 안 낸다): `missing`(`_REQUIRED_DOC_TYPES`(보험증권·진단서)가 성공한 문서들 중에 없음) OR `incomplete`(`len(docs) < doc_total` — 업로드 수보다 성공 수가 적음, 필수·비필수 안 가림). 어느 쪽이든 `claim_readiness.status='blocked'`로 남기되(운영 조회용), **report_worker로도 반드시 넘긴다** — `ocr_quality='needs_reupload'`로 `ReportJob`을 발행해 report_worker의 기존 스킵·통지 로직(`reports.status='NEEDS_REUPLOAD'`)을 그대로 태운다.
+- **워커 경계를 넘는 쓰기는 메시지로, 직접 쓰지 않는다**: 이 상태를 Backend에 알리는 실제 지점(`core.reports` UPDATE)은 report_worker에만 있다. ocr_worker는 별도 컨테이너라 그 코드를 가져다 쓸 수 없다 — 설령 DB role이 같아 권한이 있어도, 이미 그 책임을 가진 워커가 있으면 그 워커의 메시지 인터페이스(SQS)로 넘기지 새 직접 쓰기 경로를 만들지 않는다.
+- **poison과의 연결**: `on_poison` 훅에서도 `advance_claim_progress`를 호출한다 — poison으로 걷힌 문서(=영구히 처리 안 됨)도 "종결"로 카운트해야, 그 문서 하나 때문에 클레임 fan-in이 영원히 멈추지 않는다. `incomplete`로 잡히는 문서는 전부 이 경로(결정적 실패든 poison이든)를 거치므로, `job`이 파싱된 상태에서만 카운트가 오른다 → `ai.ocr_job_failures`에 `attachment_id`가 항상 남아 문서 특정이 가능하다(역직렬화 자체가 실패한 메시지는 카운트가 안 올라 이 체크에 걸리지 않는다 — 그 클레임은 대신 영구 `pending`으로 남는, 별개의 미해결 문제).
 
 ## 결정적 실패 저널 (OCR Worker 전용 패턴)
 사용자에게 "판정 불가/재업로드 필요"를 빠르게 알리기 위해, 결정적 실패(`NonRetryableError`)는 poison 가드의 느린 큐 보존기간 타임아웃을 기다리지 않고 **즉시** `ai.ocr_job_failures`에 기록된다(`record_job_failure`/`mark_failure_terminal`). 원문·예외 메시지는 저장하지 않는다 — `failure_class`(분류값)와 `error_type`(예외 클래스명)만 남긴다(CODE_CONVENTIONS §9).

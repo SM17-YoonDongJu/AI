@@ -15,6 +15,7 @@ RAG·가드레일·ai_client를 **조립**해 사용자 가치를 만드는 두 
 - `state.claim_id`가 있으면 `load_context`가 클레임의 문서 전체(`ocr_results`)를 문서 경계 헤더로 병합해 `masked_text`/`entities`를 구성한다(`_merge_claim_texts`/`_merge_claim_entities`) — 대표 문서 1개만 읽지 않는다. 엔티티 병합은 뒤 문서의 추출 실패(`None`)가 앞 문서의 성공값을 지우지 않도록 `None`을 건너뛴다.
 - LLM은 `ai_client`(Qwen3 MoE, 별도 GPU 노드). EXAONE은 라이선스(상업 사용 금지)로 제외. `ai_client.chat()`은 `num_ctx`를 명시하지 않고 서버 기본값에 맡긴다 — 문서를 아주 많이 병합하는 등 프롬프트가 커지는 변경을 할 때는 실측(서버 `num_ctx`, 실제 토큰 소비량)으로 잘림 여부를 확인한다(VLM 표 전사가 #60에서 이 문제로 `vlm_num_ctx`를 명시 고정한 선례가 있다).
 - `pii_dek_unavailable`·`pii_decrypt_failed`·가드레일 입력 차단 시 `reports.status='BLOCKED'`로 종결한다(`persist_blocked`).
+- `job.ocr_quality=='needs_reupload'`면 그래프에 들어가기 **전에** `worker.handle_job`이 걸러내 `reports.status='NEEDS_REUPLOAD'`로 통지한다(`mark_needs_reupload`) — `ReportState`가 없는 시점이라 그래프 노드가 아니라 순수 함수다. OCR 워커의 문서 품질 게이트와 클레임 fan-in 판정(필수 문서 미인식·비필수 문서 결정적 실패) 전부 이 경로로 수렴한다.
 - 결과: AI 리포트 초안 JSONB로 **영구 보존**(손해사정사 검수 근거).
 - 그래프 노드 구성(에이전트 역할·엣지·상태)은 `.claude/docs/05_langGraphAgent.md`(Notion 05번 동기화본)와 `src/report_worker/state.py`(`ReportState`) 기준. 구조를 바꿀 때는 먼저 `_workspace/`에 설계해 확인받는다.
 
