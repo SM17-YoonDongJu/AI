@@ -2229,7 +2229,7 @@ async def test_claim_ocr_quality_is_aggregated_across_documents() -> None:
     assert producer.published[0][1].ocr_quality == "needs_reupload"
 
 
-# 4. 필수 유형 미충족 → blocked(발행 없음)
+# 4. 필수 유형 미충족 → blocked 기록 + needs_reupload로 발행(정상 리포트는 없음)
 async def test_claim_blocked_when_required_doc_type_was_not_recognized() -> None:
     # Arrange: 전부 진단서/기타로 잡혔다 = 증권을 **못 읽은** 상태(업로드는 강제되므로
     # "안 올림"이 아니다) → 사용자에게 필요한 건 재업로드가 아니라 재촬영 안내다.
@@ -2247,17 +2247,24 @@ async def test_claim_blocked_when_required_doc_type_was_not_recognized() -> None
         for doc_index in (1, 2, 3):
             await pipeline.handle(_claim_job(doc_index))
 
-    # Assert: 리포트를 만들지 않고 사유만 남긴다.
-    assert producer.published == []
+    # Assert: 정상 리포트(published)는 없지만, needs_reupload로는 발행한다 — Backend가
+    # reports.status='NEEDS_REUPLOAD'로 통지받는 유일한 경로다(report_worker가 소비).
     assert pool.published_marks == []
     assert pool.blocked == [(_CLAIM_ID, ["policy"])]
-    warned = [e for e in logs if e["event"] == "claim_blocked_missing_required_docs"]
+    assert len(producer.published) == 1
+    assert producer.published[0][1].ocr_quality == "needs_reupload"
+    assert producer.published[0][1].report_id == _CLAIM_REPORT_ID
+    warned = [e for e in logs if e["event"] == "claim_blocked_needs_reupload"]
     assert len(warned) == 1
     assert warned[0]["missing"] == ["policy"]
+    # 3문서 중 2건만 인식됐으니(진단서·기타) missing과 incomplete가 동시에 참이다 —
+    # 3번째 문서가 통째로 실패했다는 뜻이라 둘 다 같은 사실을 다른 각도에서 본 것.
+    assert warned[0]["incomplete"] is True
 
 
 async def test_claim_blocked_lists_every_missing_required_type() -> None:
-    # 전부 실패해 저장된 문서가 하나도 없는 청구 — 증권·진단서 둘 다 빠진다.
+    # 전부 실패해 저장된 문서가 하나도 없는 청구 — 증권·진단서 둘 다 빠진다. 대표로
+    # 고를 성공 문서가 없으므로 needs_reupload 발행은 job 자체를 placeholder로 쓴다.
     pool = _ClaimPool(docs=[])
     producer = FakeProducer()
     pipeline = _claim_pipeline(pool, producer, "보험증권", "증권번호 202301-042")
@@ -2265,16 +2272,51 @@ async def test_claim_blocked_lists_every_missing_required_type() -> None:
     for doc_index in (1, 2, 3):
         await pipeline.handle(_claim_job(doc_index))
 
-    assert producer.published == []
     assert pool.blocked == [(_CLAIM_ID, ["diagnosis", "policy"])]
+    assert len(producer.published) == 1
+    assert producer.published[0][1].ocr_quality == "needs_reupload"
+
+
+# 4b. 필수 유형은 다 채워졌지만 비필수 문서가 결정적 실패로 사라짐 → 그래도 needs_reupload
+async def test_claim_blocked_when_non_required_document_is_missing() -> None:
+    # Arrange: 3문서(증권·진단서·영수증) 중 영수증(비필수)만 실패했다고 가정 — 성공한
+    # 문서 목록엔 증권·진단서뿐이라 missing은 비지만, 개수(2 < 3)로 잡혀야 한다.
+    pool = _ClaimPool(
+        docs=[
+            _doc_row(_POLICY_DOC_ID, DocType.POLICY),
+            _doc_row(_DIAGNOSIS_DOC_ID, DocType.DIAGNOSIS),
+        ]
+    )
+    producer = FakeProducer()
+    pipeline = _claim_pipeline(pool, producer, "보험증권", "증권번호 202301-042")
+
+    # Act
+    with capture_logs() as logs:
+        for doc_index in (1, 2, 3):
+            await pipeline.handle(_claim_job(doc_index))
+
+    # Assert: 필수 유형은 다 있으니 missing_doc_types는 비지만, incomplete로 잡혀
+    # 여전히 needs_reupload로 발행되고 정상 리포트(published)는 안 나간다.
+    assert pool.published_marks == []
+    assert pool.blocked == [(_CLAIM_ID, [])]
+    assert len(producer.published) == 1
+    assert producer.published[0][1].ocr_quality == "needs_reupload"
+    # 대표 문서는 성공한 문서 중에서 정상 규칙(증권 우선)으로 고른다.
+    assert producer.published[0][1].ocr_result_id == str(_POLICY_DOC_ID)
+    warned = [e for e in logs if e["event"] == "claim_blocked_needs_reupload"]
+    assert len(warned) == 1
+    assert warned[0]["missing"] == []
+    assert warned[0]["incomplete"] is True
 
 
 # 5. 마지막 문서가 **실패**여도 나머지가 필수 유형을 채우면 발행된다(설계의 핵심)
-async def test_claim_publishes_when_last_document_failed_but_required_types_present() -> None:
-    # Arrange: 3문서 중 2건 성공(증권·진단서), 마지막 1건은 마스킹 잔류로 결정적 실패.
-    # 카운터를 마지막으로 채운 게 실패한 문서라도, 이미 인식된 2건이 필수 유형을
-    # 충족하면 리포트는 나가야 한다 — 실패 문서는 ocr_results에 행이 없어 doc_types
-    # 집합에 안 잡힐 뿐이다.
+async def test_claim_needs_reupload_when_last_document_failed_even_if_required_types_present() -> (
+    None
+):
+    # Arrange: 3문서 중 2건 성공(증권·진단서), 마지막 1건(비필수 취급)은 마스킹 잔류로
+    # 결정적 실패. 필수 유형은 이미 채워졌지만, 실패한 문서가 있으면(개수 불일치)
+    # 이제 정상 리포트를 내지 않고 needs_reupload로 발행한다 — "실패한 문서는 조용히
+    # 없는 셈 친다"가 더 이상 이 설계가 아니다(오늘 변경의 핵심).
     pool = _ClaimPool(
         docs=[
             _doc_row(_POLICY_DOC_ID, DocType.POLICY),
@@ -2296,11 +2338,14 @@ async def test_claim_publishes_when_last_document_failed_but_required_types_pres
     with pytest.raises(MaskingError):
         await failing_pipeline.handle(_claim_job(3))
 
-    # Assert: 실패도 **종결**이라 카운트되고, 그 시점에 fan-in이 완성된다.
+    # Assert: 실패도 **종결**이라 카운트되고, 그 시점에 fan-in이 완성된다 — 하지만
+    # 정상 리포트(published)가 아니라 needs_reupload로 발행된다.
     assert pool.docs_terminal == 3
+    assert pool.published_marks == []
+    assert pool.blocked == [(_CLAIM_ID, [])]  # missing은 없다(필수 유형은 다 채워짐)
     assert len(producer.published) == 1
     assert producer.published[0][1].report_id == _CLAIM_REPORT_ID
-    assert pool.published_marks == [_CLAIM_ID]
+    assert producer.published[0][1].ocr_quality == "needs_reupload"
 
 
 async def test_failed_document_is_not_counted_when_journal_write_failed() -> None:
@@ -2353,13 +2398,14 @@ async def test_redelivered_document_republishes_without_recounting() -> None:
     assert pool.published_marks == []  # 이미 찍힌 도장을 다시 찍지 않는다
 
 
-# 7. 멱등 재전달 — 아직 blocked/pending(문서가 남음)
-@pytest.mark.parametrize("claim_status", ["pending", "blocked", None])
+# 7. 멱등 재전달 — 아직 pending(문서가 남음)
+@pytest.mark.parametrize("claim_status", ["pending", None])
 async def test_redelivered_document_publishes_nothing_while_claim_not_published(
     claim_status: str | None,
 ) -> None:
-    # Arrange: 낼 리포트가 아직(또는 영영) 없다 — 조용히 끝내야 한다. pending은 아직
-    # 형제 문서가 남은 상태(1/3)라 판정 재개 대상이 아니다.
+    # Arrange: 낼 리포트가 아직 없다 — 조용히 끝내야 한다. pending은 아직 형제 문서가
+    # 남은 상태(1/3)라 판정 재개 대상이 아니다. blocked는 이제 "낼 게 없는 상태"가
+    # 아니라 needs_reupload 안전망 재발행 대상이라 별도 테스트로 분리했다(아래 7c).
     pool = _ClaimPool(
         existing={"id": _EXISTING_ID, "doc_type": "policy", "ocr_quality": "ok"},
         claim_status=claim_status,
@@ -2379,6 +2425,35 @@ async def test_redelivered_document_publishes_nothing_while_claim_not_published(
     assert pool.blocked == []
 
 
+# 7c. 멱등 재전달 — 이미 blocked(needs_reupload 발행까지 마쳤는지 안전망 재발행)
+async def test_redelivered_document_republishes_needs_reupload_without_recounting() -> None:
+    # Arrange: blocked 도장은 찍혔는데 발행 전에 죽었을 수 있는 상황(마킹 후 발행 순서
+    # — _judge_claim 참고). 재전달되면 같은 report_id로 needs_reupload를 안전망
+    # 재발행해야 한다 — published 경로와 완전히 같은 이유다.
+    already_counted = [_claim_job(i).job_id for i in (1, 2, 3)]
+    pool = _ClaimPool(
+        existing={"id": _EXISTING_ID, "doc_type": "diagnosis", "ocr_quality": "ok"},
+        claim_status="blocked",
+        terminal_job_ids=already_counted,
+        doc_total=3,
+        docs=[_doc_row(_DIAGNOSIS_DOC_ID, DocType.DIAGNOSIS)],
+    )
+    producer = FakeProducer()
+    processor = FakeProcessor(_result("무시됨"))
+    pipeline = _pipeline(pool, producer, processor)
+
+    # Act
+    await pipeline.handle(_claim_job(1))
+
+    # Assert: 종결 집합·blocked 기록은 그대로, needs_reupload만 안전망 재발행된다.
+    assert pool.terminal_job_ids == already_counted
+    assert processor.called is False  # 무거운 OCR도 건너뛴다
+    assert pool.blocked == []  # 이미 찍힌 도장을 다시 찍지 않는다(재마킹 안 함)
+    assert len(producer.published) == 1
+    assert producer.published[0][1].report_id == _CLAIM_REPORT_ID
+    assert producer.published[0][1].ocr_quality == "needs_reupload"
+
+
 # 7b. 멱등 재전달 — 다 모였는데 여전히 pending(판정 도중 죽음) → 판정 재개
 async def test_redelivered_document_resumes_judgement_when_all_terminal_but_pending() -> None:
     # Arrange: 카운트까지는 커밋됐는데 그 뒤 판정·발행에서 죽었다(예: producer.send 실패).
@@ -2392,6 +2467,7 @@ async def test_redelivered_document_resumes_judgement_when_all_terminal_but_pend
         docs=[
             _doc_row(_POLICY_DOC_ID, DocType.POLICY),
             _doc_row(_DIAGNOSIS_DOC_ID, DocType.DIAGNOSIS),
+            _doc_row(_OTHER_DOC_ID, DocType.OTHER),  # 3건 다 성공 — incomplete가 아니다
         ],
     )
     producer = FakeProducer()
@@ -2412,7 +2488,8 @@ async def test_redelivered_document_resumes_judgement_when_all_terminal_but_pend
 
 
 async def test_redelivered_document_resumes_into_blocked_when_required_type_missing() -> None:
-    # 판정 재개가 항상 발행으로 끝나는 건 아니다 — 필수 유형이 없으면 blocked로 확정한다.
+    # 판정 재개가 정상 리포트로 끝나는 건 아니다 — 필수 유형이 없으면 blocked로
+    # 확정하고 needs_reupload로 발행한다(정상 발행이 아니다).
     counted = [_claim_job(i).job_id for i in (1, 2, 3)]
     pool = _ClaimPool(
         existing={"id": _EXISTING_ID, "doc_type": "diagnosis", "ocr_quality": "ok"},
@@ -2426,9 +2503,11 @@ async def test_redelivered_document_resumes_into_blocked_when_required_type_miss
 
     await pipeline.handle(_claim_job(1))
 
-    assert producer.published == []
+    assert pool.published_marks == []
     assert pool.blocked == [(_CLAIM_ID, ["policy"])]
     assert pool.terminal_job_ids == counted
+    assert len(producer.published) == 1
+    assert producer.published[0][1].ocr_quality == "needs_reupload"
 
 
 # 8. 동시성 — 서로 다른 워커가 마지막 두 문서를 동시에 끝낸다
@@ -2441,6 +2520,7 @@ async def test_concurrent_last_documents_count_exactly_once_and_publish_once() -
         docs=[
             _doc_row(_POLICY_DOC_ID, DocType.POLICY),
             _doc_row(_DIAGNOSIS_DOC_ID, DocType.DIAGNOSIS),
+            _doc_row(_OTHER_DOC_ID, DocType.OTHER),  # 3건 다 성공 — incomplete가 아니다
         ],
     )
     producer = FakeProducer()
@@ -2554,6 +2634,7 @@ async def test_publish_mark_is_written_before_the_report_is_sent() -> None:
         docs=[
             _doc_row(_POLICY_DOC_ID, DocType.POLICY),
             _doc_row(_DIAGNOSIS_DOC_ID, DocType.DIAGNOSIS),
+            _doc_row(_OTHER_DOC_ID, DocType.OTHER),  # 3건 다 성공 — incomplete가 아니다
         ]
     )
     producer = _ClaimProducer(pool)

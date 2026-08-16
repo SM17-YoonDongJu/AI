@@ -477,15 +477,18 @@ class OcrPipeline:
         나가거나, 반대로 카운트가 doc_total을 넘겨 영영 발행 조건을 못 맞춘다.
 
         단독 문서(``claim_id`` 없음)는 기존대로 ``ReportJob``을 재발행한다. 청구 문서는
-        진행 상태에 따라 셋으로 갈린다:
+        진행 상태에 따라 넷으로 갈린다:
         - ``published``: 발행 후 ack 전에 죽었을 수 있다 → 같은 ``report_id``로 안전망
           재발행(다운스트림은 ``report_id`` 멱등이라 중복이 무해하다).
+        - ``blocked``: ``published``와 같은 이유로 안전망 재발행이 필요하다 — 이제
+          ``blocked``도 ``_publish_needs_reupload``로 ``ReportJob``을 낸다(마킹 후
+          발행 순서라 마킹만 되고 발행 전에 죽는 경우가 있을 수 있다).
         - **모든 문서가 종결됐는데 아직 ``pending``**: 카운트까지는 커밋됐는데 그 뒤
           판정·발행 단계에서 죽었다는 뜻이다(예: ``producer.send`` 실패). 상태만 보고
           "아직 안 됐다"로 넘기면 아무도 다시 판정해 주지 않아 **영구 정지**한다 —
           카운터는 그대로 두고 판정만 재실행한다.
-        - 그 외(``blocked``, 문서가 남은 ``pending``, 행 없음): 낼 리포트 자체가 아직
-          (또는 영영) 없다 → 조용히 끝낸다.
+        - 그 외(문서가 남은 ``pending``, 행 없음): 낼 리포트 자체가 아직(또는 영영)
+          없다 → 조용히 끝낸다.
         """
         ocr_result_id, doc_type, ocr_quality = existing
         logger.info("job already processed → republish", ocr_result_id=ocr_result_id)
@@ -502,6 +505,10 @@ class OcrPipeline:
         if readiness.status == "published":
             docs = await fetch_claim_documents(self._pool, claim.claim_id)
             await self._publish_claim_report(job, docs)
+            return
+        if readiness.status == "blocked":
+            docs = await fetch_claim_documents(self._pool, claim.claim_id)
+            await self._publish_needs_reupload(job, claim, docs)
             return
         if readiness.status == "pending" and readiness.all_documents_terminal:
             logger.info(
@@ -1195,7 +1202,7 @@ class OcrPipeline:
         await self._judge_claim(job, claim, terminal_count)
 
     async def _judge_claim(self, job: OcrJob, claim: _ClaimContext, terminal_count: int) -> None:
-        """모든 문서가 종결됐으면 필수 유형 충족을 판정해 발행하거나 ``blocked``로 막는다.
+        """모든 문서가 종결됐으면 필수 유형 충족·문서 손실 여부를 판정해 발행한다.
 
         카운트를 올린 트랜잭션 **밖**에서 부른다 — 여기에는 SQS 왕복(발행)이 들어 있어
         트랜잭션에 담으면 네트워크 지연만큼 행 잠금을 붙들게 되고, 롤백돼도 이미 나간
@@ -1203,28 +1210,49 @@ class OcrPipeline:
         ``pending``" 상태가 남고, 멱등 단락이 그걸 보고 판정을 재개한다
         (``_replay_processed``) — 재개 가능성이 트랜잭션 밖으로 뺀 대가를 상쇄한다.
 
-        멱등하다: 재개로 두 번 불려도 ``blocked``는 같은 값으로 다시 찍히고, 발행은 같은
-        ``report_id``라 다운스트림이 중복을 흡수한다.
+        막히는 조건은 둘이다(합집합):
+        - ``missing``: 필수 유형(보험증권·진단서)이 성공한 문서들 중에 없다. 오분류일
+          수도, 그 유형의 문서가 아래 ``incomplete``로 실패한 것일 수도 있다 — 여기선
+          구분하지 않는다(``fetch_claim_documents``는 doc_type만 보고, 실패 원인은
+          ``ai.ocr_job_failures``가 별도로 갖고 있다).
+        - ``incomplete``(``len(docs) < doc_total``): 업로드된 문서 수보다 성공한 문서
+          수가 적다 — 필수·비필수 안 가리고, 하나라도 결정적 실패(또는 재시도 소진)로
+          결과를 못 냈다는 뜻이다(``_process``/``_journal_terminal``/poison 훅 중
+          하나가 이 문서의 종결을 카운트에 반영했는데 ``ai.ocr_results``엔 행이 없다 —
+          그 셋 다 실패 저널에 ``attachment_id``를 남기므로 문서 특정은 항상 가능하다).
+
+        둘 중 하나라도 걸리면 정상 리포트를 내는 대신 ``ocr_quality='needs_reupload'``로
+        발행한다(``_publish_needs_reupload``) — report_worker의 기존 스킵·통지 로직
+        (``reports.status='NEEDS_REUPLOAD'``)을 그대로 태운다. ``claim_readiness``에
+        ``blocked``로 남기는 건 운영 조회용 기록이지 더 이상 "발행 안 함"을 뜻하지 않는다.
+
+        멱등하다: 재개로 두 번 불려도 ``blocked``/``published``는 같은 값으로 다시
+        찍히고, 발행은 같은 ``report_id``라 다운스트림이 중복을 흡수한다.
         """
         if terminal_count < claim.doc_total:
             return  # 아직 종결되지 않은 형제 문서가 있다 — 마지막 문서가 판정한다
 
         docs = await fetch_claim_documents(self._pool, claim.claim_id)
         missing = _REQUIRED_DOC_TYPES - {doc.doc_type for doc in docs}
-        if missing:
+        incomplete = len(docs) < claim.doc_total
+        if missing or incomplete:
             missing_types = sorted(doc_type.value for doc_type in missing)
+            # 발행 **전에** 도장을 찍는다 — published 경로와 같은 이유(아래 참고).
             await mark_claim_blocked(
                 self._pool, claim_id=claim.claim_id, missing_doc_types=missing_types
             )
-            # 운영·사용자 안내 신호: 필수 문서를 "안 올린" 게 아니라 **못 읽은** 상태다
-            # (게이트웨이가 업로드를 강제한다) — 후속 조치는 재촬영이다.
+            # 운영·사용자 안내 신호: 필수 문서를 "안 올린" 게 아니라 **못 읽은** 상태거나
+            # (missing), 업로드된 문서 중 일부가 결정적 실패로 사라진 상태다(incomplete).
+            # 후속 조치는 둘 다 재촬영/재업로드다.
             logger.warning(
-                "claim_blocked_missing_required_docs",
+                "claim_blocked_needs_reupload",
                 claim_id=claim.claim_id,
                 missing=missing_types,
+                incomplete=incomplete,
                 recognized_docs=len(docs),
                 doc_total=claim.doc_total,
             )
+            await self._publish_needs_reupload(job, claim, docs)
             return
 
         # 발행 **전에** 도장을 찍는다 — 발행 후 crash로 ack를 못 하면 재전달되는데,
@@ -1234,6 +1262,45 @@ class OcrPipeline:
         # 재전달마다 리포트를 다시 낸다.
         await mark_claim_published(self._pool, claim.claim_id)
         await self._publish_claim_report(job, docs)
+
+    async def _publish_needs_reupload(
+        self, job: OcrJob, claim: _ClaimContext, docs: list[ClaimDocument]
+    ) -> None:
+        """청구를 막은 사실을 ``ocr_quality='needs_reupload'``로 report_worker에 알린다.
+
+        report_worker의 ``mark_needs_reupload``(``reports.status='NEEDS_REUPLOAD'``)가
+        이 경로의 실제 Backend 통지 지점이다. ocr_worker는 그 코드를 가져다 쓸 수
+        없으므로(별도 컨테이너·의존성) 이미 배포된 그 경로를 ``ReportJob`` 발행으로
+        재사용한다 — ``core.reports``를 여기서 직접 쓰지 않는다.
+
+        대표 문서는 성공한 문서 중에서 고른다(``_publish_claim_report``와 같은 규칙).
+        **성공한 문서가 하나도 없으면**(전부 실패) 고를 게 없으므로 ``job``(이 판정을
+        트리거한, 방금 종결된 문서) 자체를 대표로 쓴다 — ``ocr_quality='needs_reupload'``
+        경로는 report_worker가 ``ocr_result_id``/``doc_type`` 값을 아예 읽지 않으므로
+        (즉시 스킵), 실재하지 않는 placeholder 값이어도 무해하다.
+        """
+        representative = next(
+            (doc for doc in docs if doc.doc_type is DocType.POLICY),
+            docs[0] if docs else None,
+        )
+        report = ReportJob(
+            report_id=job.report_id,
+            ocr_result_id=representative.ocr_result_id if representative else job.job_id,
+            job_id=job.job_id,
+            doc_type=representative.doc_type if representative else DocType.OTHER,
+            user_ref=job.user_ref,
+            claim_id=job.claim_id,
+            created_at=datetime.now(UTC),
+            ocr_quality="needs_reupload",
+        )
+        await self._producer.send(self._settings.sqs_report_job_queue_url, report)
+        logger.info(
+            "claim_needs_reupload_published",
+            claim_id=claim.claim_id,
+            report_id=job.report_id,
+            docs=len(docs),
+            doc_total=claim.doc_total,
+        )
 
     async def _publish_claim_report(self, job: OcrJob, docs: list[ClaimDocument]) -> None:
         """청구 **전체**를 대표하는 ``ReportJob`` 1건을 발행한다.

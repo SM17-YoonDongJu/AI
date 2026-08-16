@@ -810,18 +810,25 @@ async def fetch_claim_documents(executor: Executor, claim_id: str) -> list[Claim
 async def mark_claim_blocked(
     executor: Executor, *, claim_id: str, missing_doc_types: list[str]
 ) -> None:
-    """필수 문서 유형이 빠진 청구를 ``blocked``로 확정하고 빠진 유형을 남긴다.
+    """정상 리포트를 낼 수 없는 청구를 ``blocked``로 확정한다(운영 조회용 기록).
 
-    보험증권·진단서는 업로드 자체가 필수라, 여기 걸렸다는 건 사용자가 안 올렸다는 뜻이
-    아니라 **올린 문서를 인식하지 못했다**는 뜻이다(분류 실패 또는 마스킹 잔류 등으로
-    저장 자체가 안 됨). ``missing_doc_types``는 사용자에게 "그 문서를 다시 촬영해
-    달라"고 안내할 근거다.
+    두 사유가 있고 겹칠 수 있다: (a) 필수 문서 유형(보험증권·진단서)이 성공한 문서들
+    중에 없음 — ``missing_doc_types``에 남긴다. 업로드 자체가 필수라 사용자가 안
+    올렸다는 뜻이 아니라 **올린 문서를 인식하지 못했다**는 뜻이다(분류 실패 등).
+    (b) 업로드된 문서 수보다 성공한 문서 수가 적음(``pipeline._judge_claim``의
+    ``incomplete``) — 필수·비필수 안 가리고 하나 이상 결정적 실패했다는 뜻이다. 이
+    경우 ``missing_doc_types``는 비어 있을 수 있다(필수 유형은 다 채워졌으니까).
+
+    이 함수 자체는 Backend에 아무것도 알리지 않는다 — 실제 통지는 호출측
+    (``_judge_claim``)이 뒤이어 ``ocr_quality='needs_reupload'``로 ``ReportJob``을
+    발행해 report_worker의 ``reports.status='NEEDS_REUPLOAD'`` 경로를 태우는 것이다.
 
     Args:
         executor: asyncpg 연결 풀 또는 커넥션(core.db). 다른 쓰기와 원자적으로
             묶어야 하면 호출측이 ``pool.acquire()``로 얻은 커넥션을 넘긴다.
         claim_id: 청구 식별자.
         missing_doc_types: 인식되지 않은 필수 ``DocType`` 값 목록(정렬된 문자열).
+            incomplete만으로 막힌 경우 빈 리스트일 수 있다.
     """
     await executor.execute(_MARK_CLAIM_BLOCKED_SQL, claim_id, missing_doc_types)
 
