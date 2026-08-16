@@ -10,6 +10,7 @@ from __future__ import annotations
 from core.contracts import ReportJob
 from core.logging import bind_context, clear_context, get_logger
 from report_worker.graph import build_graph
+from report_worker.nodes.agents import mark_needs_reupload
 
 logger = get_logger(__name__)
 
@@ -35,9 +36,11 @@ async def handle_job(job: ReportJob) -> None:
     bind_context(report_id=job.report_id, job_id=job.job_id)
     try:
         if job.ocr_quality == "needs_reupload":
-            # OCR 품질 미달 신호 — 리포트를 생성하지 않는다(계약: contracts.ReportJob.ocr_quality,
-            # 사용자 재업로드 안내는 게이트웨이 몫). 재시도해도 결과가 같으므로 조용히 반환해 커밋.
+            # OCR 품질 미달 신호 — 리포트를 생성하지 않는다(계약: contracts.ReportJob.ocr_quality).
+            # reports.status='NEEDS_REUPLOAD'로 Backend에 알린다(mark_needs_reupload가
+            # DB 쓰기 실패를 삼키지 않고 올리므로, 실패하면 그대로 재전달된다).
             logger.info("report skipped: ocr needs_reupload", report_id=job.report_id)
+            await mark_needs_reupload(job.report_id)
             return
         state = {
             "report_id": job.report_id,
