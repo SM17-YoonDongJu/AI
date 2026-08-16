@@ -1233,10 +1233,7 @@ async def persist_blocked(state: ReportState) -> dict[str, Any]:
 
     차단은 내용이 없으므로 report_drafts는 만들지 않고, 사유는 로그로만 남긴다(state.errors의
     'input_blocked:...' 항목). 이 노드가 없으면 status가 영원히 갱신되지 않아 Spring/사용자
-    쪽에서 리포트가 처리중으로 보인다.
-
-    TODO(spring-contract): reports.status enum에 'BLOCKED'를 추가해 정렬해야 한다
-    (현재 계약: AWAITING_INSPECTION|AWAITING_ADOPTION|...). BLOCKED는 여기서 신설한 값이다.
+    쪽에서 리포트가 처리중으로 보인다. 'BLOCKED'는 spring-contract에 반영 완료됨(#63 이후).
     """
     reasons = [str(e) for e in state.get("errors", []) if str(e).startswith("input_blocked")]
     # 사유는 초안이 아니라 로그로만 보존한다(초안 = 내용물이므로 차단 시 미생성).
@@ -1252,3 +1249,23 @@ async def persist_blocked(state: ReportState) -> dict[str, Any]:
             rid,
         )
     return {"errors": state.get("errors", [])}
+
+
+# ── OCR 품질 미달 경로 저장 (초안 없음, reports.status만 갱신) ───
+async def mark_needs_reupload(report_id: str) -> None:
+    """OCR 품질 미달로 리포트 생성을 건너뛴 사실을 reports.status에 남긴다(초안 없음).
+
+    persist_blocked과 같은 모양이다 — 다만 이 경로는 그래프에 진입하기 **전에**
+    worker.handle_job이 걸러내므로(ReportJob.ocr_quality) ReportState도 safe_node도
+    없다. DB 쓰기 실패는 여기서 삼키지 않는다 — 호출부(worker.handle_job)가 그대로
+    올려 SQS 재전달에 맡긴다. 삼키면 report_id가 영원히 이전 상태에 멈춘 채 아무
+    신호도 안 남는, 애초에 이 함수로 고치려던 무음 실패 그대로가 된다. 재전달돼도
+    같은 UPDATE를 다시 시도할 뿐이라 멱등하다.
+    """
+    rid = uuid.UUID(report_id)
+    pool = db.get_pool()
+    async with pool.acquire() as c:
+        await c.execute(
+            "UPDATE reports SET status = 'NEEDS_REUPLOAD', updated_at = now() WHERE id = $1",
+            rid,
+        )
