@@ -17,7 +17,7 @@ model: opus
 5. 유형별 엔티티 추출(진단명 KCD 매핑·보험사명·상품명·지급금액)
 6. PII 마스킹(주민번호·계좌·전화) — 정규식 + NER. 마스킹 텍스트만 downstream으로. 텍스트뿐 아니라 **원본 이미지의 PII 영역도 bbox/polygon 기반으로 마스킹**한다
 7. 이미지 마스킹 **검증 게이트** 통과 후에만 S3 원본을 삭제한다(비블로킹, outbox 재시도 — `pipeline.py` 원본 삭제 게이트 docstring 참고). 검증 실패는 원본을 남기고 실패로 기록한다
-8. `ocr_results` 저장 후 `report-job` 발행. 클레임(`claim_id`)이 걸린 문서는 곧장 발행하지 않고 **fan-in 게이트**(`advance_claim_progress`)를 거친다 — 필수 문서(`_REQUIRED_DOC_TYPES`: 보험증권·진단서)가 전부 인식돼야 발행하고, 확정 실패까지 감안해도 필수 유형이 빠지면 `claim_readiness.status='blocked'`로 종결한다
+8. `ocr_results` 저장 후 `report-job` 발행. 클레임(`claim_id`)이 걸린 문서는 곧장 발행하지 않고 **fan-in 게이트**(`advance_claim_progress`/`_judge_claim`)를 거친다 — 필수 문서(`_REQUIRED_DOC_TYPES`: 보험증권·진단서)가 없거나(`missing`) 업로드 수보다 성공 수가 적으면(`incomplete`, 필수·비필수 안 가림) `claim_readiness.status='blocked'`로 기록하되 **report_worker로도 반드시 넘긴다** — `ocr_quality='needs_reupload'`로 발행해 `reports.status='NEEDS_REUPLOAD'` 통지를 태운다(정상 리포트를 만들지 않을 뿐, 무음으로 끝내지 않는다)
 
 ## 작업 원칙
 - `.claude/CODE_CONVENTIONS.md` 준수. 특히 PII는 추출 직후 마스킹, 원문·PII는 로그에 금지(예외 메시지도 포함 — §9).

@@ -14,6 +14,7 @@ RAG·가드레일·ai_client를 **조립**해 최종 사용자 가치를 만드�
 - LangGraph 멀티에이전트로 리포트 초안 생성 (입력 가드레일 → 생성 가드레일 → 출력 가드레일·LLM Judge)
 - `claim_id`가 있는 job은 클레임의 문서 전체(`ocr_results`)를 문서 경계 헤더로 병합해 컨텍스트를 구성한다(`_merge_claim_texts`/`_merge_claim_entities`, `load_context`) — 대표 문서 1개만 읽지 않는다
 - PII 복호화 실패·가드레일 입력 차단 시 `reports.status='BLOCKED'`로 종결한다(`persist_blocked`) — 현재 트리거는 `pii_dek_unavailable`·`pii_decrypt_failed`·가드레일 차단 3가지뿐
+- `job.ocr_quality=='needs_reupload'`면 그래프를 아예 안 태우고 `reports.status='NEEDS_REUPLOAD'`로 통지한다(`mark_needs_reupload`, `worker.handle_job`) — OCR 워커의 품질 게이트·클레임 fan-in 판정(필수 문서 미인식·비필수 문서 결정적 실패) 셋 다 이 경로로 들어온다. DB 쓰기 실패는 삼키지 않고 그대로 올려 SQS 재전달에 맡긴다(무음 실패 방지)
 - 결과 저장 (AI 리포트 초안 JSONB 영구 보존)
 - 그래프 구조는 `.claude/docs/05_langGraphAgent.md`(Notion 05번 동기화본) 기준. 구조 변경 시 먼저 `_workspace/`에 설계해 확인받는다
 
