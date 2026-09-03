@@ -95,8 +95,114 @@ services:
       options: { max-size: "10m", max-file: "3" }
     networks: [ocr-net]
 
+  # ── 관측성 에이전트: 중앙 모니터링 인스턴스(brbs-monitoring, 10.0.11.48)가 원격 수집 ──
+  # prometheus·grafana·loki·tempo는 그 모니터링 인스턴스에 상주한다(백엔드 레포 docker-compose.monitoring.yml).
+  # 아래 넷은 "이 호스트(g6=brbs-ai)"를 감시/수집하는 에이전트라 여기 상주하며, 모니터링 인스턴스가
+  # 원격으로 스크랩(node·cadvisor·dcgm)·수신(alloy→loki)한다. 노출은 보안그룹으로만 좁힌다
+  # (모니터링 인스턴스 private IP發 인바운드만 허용, 외부 미노출). 0.0.0.0 게시라도 SG로 차단하는 게 팀 규약.
+  # ⚠️ CD는 ocr-worker만 bounce(up -d --no-deps ocr-worker) → 이 에이전트들은 최초 1회 full `up -d` 필요(ollama와 동일).
+
+  # 시스템 메트릭(CPU·메모리·디스크·네트워크). 모니터링 인스턴스가 9100으로 원격 스크랩.
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    container_name: brbs-node-exporter
+    restart: unless-stopped
+    ports:
+      - "9100:9100"
+    command:
+      - "--path.procfs=/host/proc"
+      - "--path.sysfs=/host/sys"
+      - "--path.rootfs=/rootfs"
+      - "--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    mem_limit: 128m
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+    networks: [ocr-net]
+
+  # 컨테이너 메트릭. 모니터링 인스턴스가 8080으로 원격 스크랩(prometheus.yml g6 스텁이 8080을 가리킴).
+  # t3는 8080이 앱과 충돌해 8082를 쓰지만, g6엔 8080이 비어 있어 스텁대로 8080에 게시한다(의도된 분기).
+  # v0.55.1: containerd 이미지 스토어(overlayfs) 호환 — 구버전 v0.49.x는 컨테이너 등록이 전멸한다.
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.55.1
+    container_name: brbs-cadvisor
+    restart: unless-stopped
+    privileged: true
+    ports:
+      - "8080:8080"
+    devices:
+      - /dev/kmsg
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    mem_limit: 256m
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+    networks: [ocr-net]
+
+  # GPU 메트릭(VRAM·util·온도·전력·SM clock). ollama/ocr-worker와 같은 GPU를 읽기전용으로 계측한다.
+  # 모니터링 인스턴스가 9400으로 원격 스크랩. DCGM_FI_DEV_FB_USED/FREE 등으로 VRAM/OOM·스로틀링을 본다.
+  # 드라이버 호환 문제 시 utkuozdemir/nvidia_gpu_exporter(nvidia-smi 기반, :9835)로 대체 가능(prometheus job 포트만 교체).
+  # 멀티 GPU 박스면 count: 1 → count: all.
+  dcgm-exporter:
+    image: nvcr.io/nvidia/k8s/dcgm-exporter:3.3.9-3.6.1-ubuntu22.04
+    container_name: brbs-dcgm-exporter
+    restart: unless-stopped
+    ports:
+      - "9400:9400"
+    cap_add:
+      - SYS_ADMIN
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu, utility]
+    mem_limit: 256m
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+    networks: [ocr-net]
+
+  # 로그 수집: 이 호스트 전 컨테이너(ollama·ocr-worker·에이전트) stdout → 원격 Loki(모니터링 인스턴스)로 push.
+  # docker.sock을 read-only로 마운트해 컨테이너를 발견하고 로그 스트림을 읽는다. config는 ./monitoring/alloy/config.alloy
+  # (compose와 같은 디렉터리 기준 → 호스트 /opt/ocr/monitoring/alloy/config.alloy에 배치). 12345(자체 상태)도
+  # 모니터링 인스턴스 Prometheus가 alloy job으로 원격 스크랩한다.
+  # ⚠️ docker.sock을 이미지 기본 사용자로 못 읽으면 `user: root` 또는 `group_add: [docker]` 추가.
+  alloy:
+    image: grafana/alloy:v1.5.1
+    container_name: brbs-alloy
+    restart: unless-stopped
+    ports:
+      - "12345:12345"
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+      - /etc/alloy/config.alloy
+    volumes:
+      - ./monitoring/alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - alloy-data:/var/lib/alloy/data
+    mem_limit: 128m
+    mem_reservation: 64m
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+    networks: [ocr-net]
+
 volumes:
   ollama-models:
+  alloy-data:
 
 networks:
   ocr-net:
