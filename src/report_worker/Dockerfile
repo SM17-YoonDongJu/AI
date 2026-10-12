@@ -15,6 +15,10 @@ ENV PYTHONUNBUFFERED=1 \
 COPY --from=builder /app/.venv /app/.venv
 COPY src ./src
 
+# 빌드 커밋 — deploy.yml이 build-args로 넘긴다. 부팅 로그에 찍어 Argo CD 반영 후 새 이미지인지 확인한다.
+ARG GIT_COMMIT=unknown
+ENV GIT_COMMIT=${GIT_COMMIT}
+
 # report-worker 서비스명 (관측성 로그/메트릭 라벨). SQS 큐 URL·리전은 런타임 env로 주입.
 ENV SERVICE_NAME=report-worker
 

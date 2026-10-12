@@ -14,6 +14,10 @@ ENV PYTHONUNBUFFERED=1 \
     PATH="/app/.venv/bin:$PATH"
 COPY --from=builder /app/.venv /app/.venv
 COPY src ./src
+
+# 빌드 커밋 — deploy.yml이 build-args로 넘긴다. 부팅 로그에 찍어 Argo CD 반영 후 새 이미지인지 확인한다.
+ARG GIT_COMMIT=unknown
+ENV GIT_COMMIT=${GIT_COMMIT}
 EXPOSE 8000
 
 # 엔트리포인트(chatbot/app.py:app)는 구현 단계에서 추가.

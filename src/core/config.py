@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     log_level: str = ""  # 빈값이면 환경별 결정(local=DEBUG, 그 외=INFO)
     service_name: str = "ai-engine"  # 워커별 env(SERVICE_NAME)로 덮어씀
     instance_id: str = ""  # 인스턴스/Pod 식별자(비면 hostname)
+    git_commit: str = "unknown"  # 이미지 빌드 커밋(Dockerfile ARG→ENV GIT_COMMIT). 배포 반영 확인용
 
     # --- Database (AWS RDS PostgreSQL / 로컬 PG) ---
     database_url: str = "postgresql://postgres:postgres@localhost:5432/ai_engine"
