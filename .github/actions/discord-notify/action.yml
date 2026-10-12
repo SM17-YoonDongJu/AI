@@ -21,6 +21,10 @@ inputs:
     description: 배포된 이미지 태그(있으면 표시)
     required: false
     default: ""
+  success_label:
+    description: 성공 시 상태 라벨 대체 문구(비면 "성공"). 예) Argo CD 경로의 "매니페스트 커밋 완료(Argo CD 반영 대기)"
+    required: false
+    default: ""
   failed_step:
     description: 실패 스텝 이름(실패 시)
     required: false
@@ -39,6 +43,9 @@ runs:
           cancelled) COLOR=9807270;  ICON="⚠️"; STATUS_KO="취소" ;;
           *)         COLOR=8421504;  ICON="ℹ️"; STATUS_KO="알림" ;;
         esac
+        if [ "${{ inputs.status }}" = "success" ] && [ -n "${{ inputs.success_label }}" ]; then
+          STATUS_KO="${{ inputs.success_label }}"
+        fi
         if [ -n "${{ inputs.image_tag }}" ]; then KIND="배포"; else KIND="CI"; fi
         TITLE="$ICON AI $KIND $STATUS_KO"
 

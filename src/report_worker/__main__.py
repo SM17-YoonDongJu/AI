@@ -29,7 +29,11 @@ async def main() -> None:
         consumer = SqsConsumer(
             settings.sqs_report_job_queue_url, ReportJob, handle_job, settings=settings
         )
-        logger.info("report-worker starting", queue_url=settings.sqs_report_job_queue_url)
+        logger.info(
+            "report-worker starting",
+            queue_url=settings.sqs_report_job_queue_url,
+            git_commit=settings.git_commit,
+        )
         await consumer.run()
     finally:
         await close_pool()
