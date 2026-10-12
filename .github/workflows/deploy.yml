@@ -259,13 +259,13 @@ jobs:
             exit 1
           fi
 
+      # Argo CD 경로(report·chatbot)는 실패할 때만 알린다. 이 잡의 성공은 매니페스트 커밋까지라서,
+      # 실제 반영 결과(배포 완료·Sync 실패·Degraded)는 Argo CD가 DEPLOYMENT 채널로 보낸다(K8s-manifests PR #11).
       - name: Notify deploy result
-        if: always()
+        if: always() && (matrix.manifest == '' || job.status != 'success')
         uses: ./.github/actions/discord-notify
         with:
           webhook_url: ${{ job.status == 'success' && secrets.DISCORD_WEBHOOK_DEPLOYMENT || secrets.DISCORD_WEBHOOK_CI_FAILURES }}
           status: ${{ job.status }}
           service: ${{ matrix.service }}
-          # Argo CD 경로의 "성공"은 서버 반영이 아니라 매니페스트 커밋 완료다(반영은 Argo CD UI에서 확인).
           image_tag: ${{ matrix.manifest != '' && format('{0}:{1}', matrix.repo, steps.v.outputs.sha7) || format('{0}:{1}', matrix.repo, matrix.tag) }}
-          success_label: ${{ matrix.manifest != '' && '매니페스트 커밋 완료(Argo CD 반영 대기)' || '' }}
