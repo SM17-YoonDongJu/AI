@@ -115,7 +115,11 @@ docker image prune -f
 - `docker-compose.ocr.yml` — 이 레포 `deploy/docker-compose.ocr.yml`이 정본
 - `.env.ocr` — 실제 값(시크릿 포함, git 미커밋). 템플릿: `deploy/.env.ocr.example`
 - `certs/rds-global-bundle.pem` — RDS SSL CA 번들 (아래 참고)
+- `monitoring/alloy/config.alloy` — 이 레포 `deploy/monitoring/alloy/config.alloy`가 정본. compose가
+  `./monitoring/alloy/config.alloy` 상대경로로 마운트하므로 `/opt/ocr/monitoring/alloy/config.alloy`에 배치.
 - NVIDIA 드라이버 + nvidia-container-toolkit, SSM Agent
+- 관측성 에이전트(node-exporter·cadvisor·dcgm-exporter·alloy)는 최초 1회 full `up -d`로 함께 기동한다(§10).
+  CD는 ocr-worker만 bounce하므로 에이전트는 건드리지 않는다(인프라 ollama와 동일).
 
 ### backend EC2 (`/home/ubuntu/backend/`)
 - `docker-compose.yml`(report·chatbot 서비스 포함) + `.env.dev` — **backend팀이 관리**
@@ -169,9 +173,47 @@ docker image prune -f
 
 ---
 
+## 10. 관측성 에이전트 (g6 GPU 인스턴스 → 중앙 모니터링)
+
+GPU EC2(g6=brbs-ai, `10.0.11.93`)를 **기존 중앙 모니터링 인스턴스**(brbs-monitoring, `10.0.11.48`:
+Prometheus·Grafana·Loki·Tempo)에 편입한다. 별도 스택을 이 박스에 세우지 않고, "이 호스트를 감시/수집하는
+에이전트"만 상주시켜 중앙이 원격으로 스크랩(pull)·수신(push)한다. UI 접근은 모니터링 인스턴스에서 SSM 포워딩.
+
+| 에이전트 | 포트 | 역할 | 중앙 수집 |
+|----------|------|------|-----------|
+| `node-exporter` | 9100 | 시스템(CPU·메모리·디스크·네트워크) | Prometheus 원격 스크랩 |
+| `cadvisor` | 8080 | 컨테이너별 리소스(ollama·ocr-worker 등) | Prometheus 원격 스크랩 |
+| `dcgm-exporter` | 9400 | **GPU**(VRAM·util·온도·전력·클럭) — OOM/스로틀링 | Prometheus 원격 스크랩 |
+| `alloy` | 12345 | 전 컨테이너 stdout → Loki push(자체 상태는 스크랩) | Loki 원격 수신 + Prometheus 스크랩 |
+
+- **로그 push 대상**은 `monitoring/alloy/config.alloy`에 하드코딩(`http://10.0.11.48:3100`, 백엔드 config.alloy와 동일 관례).
+  이 레포 워커는 structlog라 레벨 필드가 `severity`(백엔드는 `level`) — config가 그 차이를 흡수해 공통 `level` 라벨로 통일한다.
+- **보안그룹**(private만, 외부 미노출):
+  - 모니터링 인스턴스(`10.0.11.48`) → g6(`10.0.11.93`) 인바운드: `9100`·`8080`·`9400`
+  - g6(`10.0.11.93`) → 모니터링 인스턴스(`10.0.11.48`) 인바운드: `3100`(alloy→loki push)
+- **중앙(백엔드 레포 `deploy/monitoring/`) 측**은 별도 PR로: `prometheus.yml` g6 타깃(node/cadvisor/dcgm) 활성 +
+  `grafana/dashboards/gpu-dcgm.json` + `alerting/rules.yml`에 GPU/ollama 룰(GpuVramHigh·GpuTempHigh·OllamaDown).
+  `TargetDown`은 `up` 전체를 커버하므로 타깃 추가 즉시 다운 감지가 붙는다.
+
+**기동 (호스트에서 복붙):**
+```bash
+# 에이전트 포함 전체 기동(최초 1회). 이후 CD는 ocr-worker만 bounce.
+docker compose -f docker-compose.ocr.yml --env-file .env.ocr up -d
+# 로컬 확인
+curl -s localhost:9100/metrics | head                       # node
+curl -s localhost:8080/metrics | head                       # cadvisor
+curl -s localhost:9400/metrics | grep DCGM_FI_DEV_FB_USED   # GPU VRAM
+docker logs --tail 50 brbs-alloy                            # loki push 에러 없나
+```
+검증(중앙): 모니터링 인스턴스에서 Prometheus `/targets`의 `node-gpu`·`cadvisor-gpu`·`dcgm-gpu` UP,
+Grafana Explore(Loki) `{service="brbs-ollama"}`·`{service="brbs-ocr-worker"}` 조회.
+
+---
+
 ## 관련 파일
 
 - `.github/workflows/ci.yml` — 파이프라인 정의
 - `.github/actions/discord-notify/` — 알림 액션
 - `deploy/docker-compose.ocr.yml`, `deploy/.env.ocr.example` — GPU EC2 배포 정본
+- `deploy/monitoring/alloy/config.alloy` — g6 로그 수집(Alloy) 정본 → 중앙 Loki push
 - `migrations/ai/*.sql`, `migrations/corpus/*.sql` — DB 스키마(확장·테이블, role별 소유 스키마로 분리 — `migrations/README.md` 참고)

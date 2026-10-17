@@ -1,0 +1,76 @@
+// Grafana Alloy 설정 (g6=brbs-ai) — Docker 데몬의 모든 컨테이너 stdout을 수집해 (원격) Loki로 push.
+// brbs-ollama·brbs-ocr-worker + 관측성 에이전트 로그가 한 번에 딸려 들어온다.
+// docker.sock을 read-only로 마운트해 컨테이너 목록·로그 스트림을 읽는다.
+// alloy는 g6에 상주하고 Loki는 모니터링 인스턴스(10.0.11.48)에 있다 — push는 원격이다.
+//
+// 백엔드(t3) config.alloy와 딱 한 곳만 다르다: 이 레포 워커는 structlog(OTel 정렬)라 레벨 필드가
+// `level`이 아니라 `severity`다(core/logging.py). 그 필드를 뽑아 백엔드와 같은 `level` 라벨로 통일한다.
+
+logging {
+  level  = "warn"
+  format = "logfmt"
+}
+
+// 살아있는 컨테이너를 발견(30초 주기).
+discovery.docker "containers" {
+  host             = "unix:///var/run/docker.sock"
+  refresh_interval = "30s"
+}
+
+// 라벨 정리: Loki 라벨을 저(低)카디널리티로만 유지한다.
+//  - service = 컨테이너 이름(brbs-ollama·brbs-ocr-worker 등). 조회 시 {service="brbs-ollama"}로 필터.
+//  - trace_id 같은 고(高)카디널리티 값은 절대 라벨로 승격하지 않는다(로그 본문에 남긴다).
+discovery.relabel "containers" {
+  targets = discovery.docker.containers.targets
+
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "service"
+  }
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+}
+
+loki.source.docker "containers" {
+  host          = "unix:///var/run/docker.sock"
+  targets       = discovery.relabel.containers.output
+  relabel_rules = discovery.relabel.containers.rules
+  labels        = { job = "docker" }
+  forward_to    = [loki.process.parse.receiver]
+}
+
+// ocr-worker 로그는 구조화 JSON(structlog) → severity만 라벨(level)로 승격해 필터 편의를 준다.
+// JSON이 아닌 라인(ollama 서버 평문 로그 등)은 stage.json이 조용히 통과시킨다.
+loki.process "parse" {
+  forward_to = [loki.write.default.receiver]
+
+  // 7일(=Loki 보관/거부 기준)을 넘은 로그는 에이전트에서 드롭한다. 오래 떠 있던 컨테이너의
+  // docker json-file 백로그가 Alloy 재시작 시 재생되면 Loki가 "entry too old" 400으로 무더기 거부한다 —
+  // 어차피 못 담을 오래된 로그를 여기서 버려 그 폭탄을 없앤다.
+  stage.drop {
+    older_than          = "168h"
+    drop_counter_reason = "too_old"
+  }
+
+  // 백엔드는 `level`, 이 레포 워커(structlog)는 `severity`. severity 값을 뽑아 공통 `level` 라벨로 쓴다.
+  stage.json {
+    expressions = {
+      level = "severity",
+    }
+  }
+  stage.labels {
+    values = { level = "" }
+  }
+}
+
+// 모니터링 인스턴스(10.0.11.48). 보안그룹: g6 → 모니터링 인스턴스 3100 인바운드 허용.
+// (IP는 백엔드 config.alloy와 동일한 팀 관례대로 하드코딩 — 인프라 상수라 시크릿 아님.)
+loki.write "default" {
+  endpoint {
+    url = "http://10.0.11.48:3100/loki/api/v1/push"
+  }
+}
