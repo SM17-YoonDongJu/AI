@@ -23,16 +23,16 @@ Frontend ──WS 직결(/ws/chat)──────────▶  chatbot    
 - **LLM·임베딩** = 외부 GPU 노드의 **OpenAI 호환 서버(Ollama/vLLM)** HTTP 호출. **모델 미정** → `ai_client`가 config(`base_url`/`model`)로만 다룸
 - **관리형**: DB = AWS RDS(PostgreSQL + pgvector), 메시지 큐 = AWS SQS, Redis = ElastiCache
 
-## 패키지 구조 & 담당
+## 패키지 구조
 
-| 패키지 | 역할 | 노드 | 담당 | 상세 |
+| 패키지 | 역할 | 노드 | 상세 |
 |---|---|---|---|---|
-| `src/core` | 공용 인프라(설정·**계약**·sqs·db·ai_client·로깅) | — | _TBD_ | [README](src/core/README.md) |
-| `src/rag` | Hybrid RAG 검색 (04) | (호출자에 포함) | _TBD_ | [README](src/rag/README.md) |
-| `src/guardrail` | 입력/생성/출력 가드레일 (06) | (호출자에 포함) | _TBD_ | [README](src/guardrail/README.md) |
-| `src/ocr_worker` | OCR SQS 워커 (02) | **GPU** | _TBD_ | [README](src/ocr_worker/README.md) |
-| `src/report_worker` | LangGraph 리포트 워커 (05) | 범용 | _TBD_ | [README](src/report_worker/README.md) |
-| `src/chatbot` | 챗봇 FastAPI WS (12) | 범용 | _TBD_ | [README](src/chatbot/README.md) |
+| `src/core` | 공용 인프라(설정·**계약**·sqs·db·ai_client·로깅) | — | [README](src/core/README.md) |
+| `src/rag` | Hybrid RAG 검색 (04) | (호출자에 포함) | [README](src/rag/README.md) |
+| `src/guardrail` | 입력/생성/출력 가드레일 (06) | (호출자에 포함) | [README](src/guardrail/README.md) |
+| `src/ocr_worker` | OCR SQS 워커 (02) | **GPU** | [README](src/ocr_worker/README.md) |
+| `src/report_worker` | LangGraph 리포트 워커 (05) | 범용 | [README](src/report_worker/README.md) |
+| `src/chatbot` | 챗봇 FastAPI WS (12) | 범용 | [README](src/chatbot/README.md) |
 
 ## 기술 스택
 
