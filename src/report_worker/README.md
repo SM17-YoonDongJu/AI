@@ -1,40 +1,79 @@
 # report_worker — 리포트 생성 SQS 워커 (05)
 
-`report-job` SQS 메시지를 소비해 **LangGraph 멀티에이전트**로 손해사정 리포트 초안을 생성·저장하는 워커. LLM은 외부 GPU 노드(Ollama/vLLM)를 HTTP 호출하므로 **범용 노드**에 배포한다.
+`report-job` SQS 메시지를 소비해 **LangGraph 멀티에이전트**로 손해사정 리포트 초안을 만들고 저장하는 워커다. LLM은 외부 GPU 노드(Ollama/vLLM)를 HTTP로 호출하므로 **범용 노드**에 배포한다.
 
 ## 실행
 
 ```bash
-uv run python -m report_worker          # report-job 컨슈머 기동
-# uv 없이:  PYTHONPATH=src python -m report_worker
+uv sync --extra report               # langgraph·langchain-core·boto3
+uv run python -m report_worker       # uv 없이: PYTHONPATH=src python -m report_worker
 ```
-- 진입점 `__main__.py`: `configure_logging` → `init_pool` → `SqsConsumer(sqs_report_job_queue_url, ReportJob, handle_job).run()`.
-- 소비→검증→ack(DeleteMessage)→실패=삭제 안 함(재전달)→poison 스킵·우아한 종료는 `core.sqs.SqsConsumer`가 담당.
-- **큐 URL**: `SQS_REPORT_JOB_QUEUE_URL`(전체 URL)로 주입. 자격증명은 워커 IAM Role(로컬은 LocalStack + 더미 키). DLQ 미도입 — poison은 수신 횟수 상한(`SQS_MAX_RECEIVE_COUNT`)으로 스킵.
 
-## 처리 흐름
+- 진입점 `__main__.py`: `configure_logging` → `init_pool` → `SqsConsumer(SQS_REPORT_JOB_QUEUE_URL, ReportJob, handle_job).run()`
+- 소비·검증·ack·재전달·poison 스킵·우아한 종료는 `core.sqs.SqsConsumer`가 맡는다.
+- 이 워커는 **마이그레이션을 실행하지 않는다**. `ai.*`는 `ocr_worker`가, `core.*`(`reports` 등)는 backend Flyway가 관리한다.
 
-1. `report-job` 소비 (`core.contracts.ReportJob`)
-2. `worker.handle_job` — `ReportJob`을 그래프 초기 state로 매핑 → `build_graph().ainvoke(...)`
-3. 리포트 초안을 `report_drafts`(JSONB, 영구 보존) + `reports`에 저장. **`report_id`로 멱등**(ON CONFLICT 업서트).
-4. **하드 실패**(load_context/persist)만 예외로 승격 → 재전달(visibility timeout)·poison 스킵. 소프트 에러(rag_empty·input_blocked 등)는 부분결과로 커밋.
+## 처리 흐름 (`worker.handle_job`)
 
-## 그래프 (순차 + 조건 분기)
+1. `ReportJob.ocr_quality == "needs_reupload"`이면 그래프를 돌리지 않는다. `reports.status = 'NEEDS_REUPLOAD'`만 기록하고 끝낸다.
+2. 그 외에는 `ReportJob`을 초기 state로 매핑해 `graph.ainvoke()`를 실행한다. 그래프는 import 시점에 1회 컴파일해 재사용한다.
+3. 실행 결과의 `errors`로 하드 실패인지 판정한다(아래 표).
+
+| 실패 종류 | 예 | 처리 |
+|---|---|---|
+| **하드 실패** | `load_context_failed`, `persist_failed`, `ocr_result_missing` | `ReportWorkerError`를 던져 재전달. 상한을 넘기면 poison 스킵 |
+| 소프트 실패 | `rag_empty`, `input_blocked`, `*_llm_failed` | 부분 결과로 저장하고 ack |
+| 차단 기록 실패 | `persist_blocked_failed` | 하드 실패로 올리지 않는다. 재처리해도 같은 차단이 반복될 뿐이다 |
+
+## 그래프 (`graph.py`)
 
 ```
-load_context → input_guardrail ─[차단?]→ END
- → diagnosis ─[약관 DB 有無]→ terms_parse / coverage_parse
- → coverage_analysis → case_search
- ─[후유장해 검토?]→ disability_rag → disability_calc ─┐
- └────────(아니면)────────────────────────────────────┴→ payment_calc
- → report_compose → output_guardrail(고지문 + LLM Judge) → persist → END
+load_context → input_guardrail ─┬─▶ persist_blocked → END                    (1)
+                                └─▶ diagnosis ─┬─▶ terms_parse ─┐            (2)
+                                               └────────────────┴─▶ coverage_parse
+ → coverage_analysis → case_search ─┬─▶ disability_rag → disability_verify → disability_calc ─┐
+                                    └───────────────────────────────────────────────────────┤  (3)
+ payment_calc ◀─────────────────────────────────────────────────────────────────────────────┘
+ → report_compose → output_guardrail → persist → END
 ```
-- 노드: `nodes/agents.py` · 조립: `graph.py` · 상태: `state.py` · 장해 합산(순수): `disability_rules.py`.
-- RAG: `rag/hybrid.py`(BM25+pgvector+RRF, insurer/product 필터) · 가드레일: `guardrail`(공용) · LLM: `core.ai_client`.
 
-## 의존
-`core.sqs`·`core.db`·`core.ai_client`·`core.contracts`·`core.logging` · `guardrail` · RAG(현재는 로컬 `rag/hybrid`, 추후 `src/rag` 통합). `.[report]` extra(langgraph·langchain-core·boto3).
+1. 입력 가드레일이 차단하면(보험·법률 외 질문, 또는 `load_context`의 PII 복호화 실패) 초안 없이 `reports.status = 'BLOCKED'`만 기록한다.
+2. 가입 약관이 `policy_chunks`에 없을 때만 런타임 파싱(`terms_parse`)을 거친다.
+3. 후유장해 검토가 필요하면 장해 서브그래프를 거친다. 지급률 합산은 LLM이 아니라 `disability_rules.py`의 **순수 함수**가 한다.
+
+| 파일 | 역할 |
+|---|---|
+| `nodes/agents.py` | 노드 구현과 분기 함수 |
+| `state.py` | `ReportState` 정의 |
+| `disability_rules.py` | 장해 지급률 결정론 합산(순수 함수) |
+| `rag/hybrid.py` | `src/rag.search()` 어댑터. `RagResult`를 노드용 dict와 인용 문자열로 변환 |
+
+## 저장 (`persist`, 한 트랜잭션)
+
+| 테이블 | 내용 |
+|---|---|
+| `report_drafts` | 초안 전체(JSONB, 영구 보존). `report_id`로 `ON CONFLICT` 업서트 → **멱등** |
+| `reports` | 적용 담보, 누락 특약, 근거 약관·판례, 예상 금액 범위. `status = 'AWAITING_ADOPTION'` |
+| `report_issues` | 쟁점 목록. 해당 리포트의 기존 행을 지운 뒤 다시 넣는다 |
+
+`reports.status`는 이 워커에서 `AWAITING_ADOPTION`·`BLOCKED`·`NEEDS_REUPLOAD` 셋 중 하나로 바뀐다.
+
+## 입력 / 출력 (계약)
+
+- **입력**: `core.contracts.ReportJob` (`report-job`)
+- **출력**: 위 3개 테이블. 다음 단계로 메시지를 발행하지 않는다.
+
+## 의존 / 배포
+
+- `core`(sqs·db·ai_client·contracts·logging·crypto) · `rag` · `guardrail`
+- 배포: `src/report_worker/Dockerfile`(slim) → ECR → K8s-manifests `envs/dev/report.values.yaml`의 이미지 태그 커밋 → **Argo CD**
+- `src/report_worker/**`, `src/rag/**`, `src/guardrail/**`, 공용 코드가 바뀌면 재배포된다.
 
 ## dev 하네스 (배포 제외)
-- `scripts/battery.py` — 검색 배터리 + e2e 시나리오 A~G. `PYTHONPATH=src python scripts/battery.py` (tempVectorDB + Ollama 필요).
-- `scripts/trace_state.py` — 노드별 state 델타 추적.
+
+- `scripts/battery.py`: 검색 배터리와 e2e 시나리오 A~G. `PYTHONPATH=src python scripts/battery.py` (tempVectorDB와 Ollama 필요)
+- `scripts/trace_state.py`: 노드별 state 변화 추적
+
+## 참고
+
+- [Notion 05 LangGraph](../../.claude/docs/05_langGraphAgent.md) · [아키텍처: langgraph](../../docs/architecture/langgraph.md) · [report-worker 문서](../../docs/report-worker/README.md)(후유장해 파이프라인·알려진 이슈) · [컨벤션](../../.claude/CODE_CONVENTIONS.md)
