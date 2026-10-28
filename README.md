@@ -118,6 +118,5 @@ uv run pytest                                  # 테스트
 ## 문서
 
 - **인터페이스 계약(워커 간)**: **[.claude/docs/contracts.md](.claude/docs/contracts.md)** ← 병렬 개발 기준
-- **챗봇 이벤트 명세**: **[.claude/docs/chatbot-events.md](.claude/docs/chatbot-events.md)**
 - 시스템 아키텍처(Notion 미러): **[.claude/docs](.claude/docs)** (02 OCR / 04 RAG / 05 리포트 / 06 가드레일 / 12 챗봇)
 - 코드 컨벤션: **[.claude/CODE_CONVENTIONS.md](.claude/CODE_CONVENTIONS.md)**
