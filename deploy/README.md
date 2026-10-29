@@ -33,15 +33,19 @@ dev push
 
 ## 2. 서비스 ↔ ECR ↔ 배포 대상
 
-| 서비스 | Dockerfile | ECR 저장소 | 배포 대상 EC2 | 호스트 compose |
-|--------|-----------|-----------|--------------|----------------|
-| **ocr** | `src/ocr_worker/Dockerfile` | `soma/ocr` | GPU EC2 (`OCR_EC2_INSTANCE_ID`) | `/opt/ocr/docker-compose.ocr.yml` |
-| **report** | `src/report_worker/Dockerfile` | `soma/report` | backend EC2 (`BACKEND_EC2_INSTANCE_ID`) | `/home/ubuntu/backend/docker-compose.yml` |
-| **chatbot** | `src/chatbot/Dockerfile` | `soma/chatbot` | backend EC2 (동일) | 동일 |
+| 서비스 | Dockerfile | ECR 저장소 | 배포 경로 | 대상 |
+|--------|-----------|-----------|----------|------|
+| **ocr** | `src/ocr_worker/Dockerfile` | `brbs/ocr` | SSM | GPU EC2 (`OCR_EC2_INSTANCE_ID`) → `/opt/ocr/docker-compose.ocr.yml` |
+| **corpus** | `src/corpus_worker/Dockerfile` | `brbs/corpus` | Argo CD | `envs/dev/etl-corpus.values.yaml` |
+| **report** | `src/report_worker/Dockerfile` | `brbs/report` | Argo CD | `envs/dev/report.values.yaml` |
+| **chatbot** | `src/chatbot/Dockerfile` | `brbs/chatbot` | Argo CD | `envs/dev/chatbot.values.yaml` |
 
-- **3개 서비스 모두 이 레포 CI가 직접 SSM으로 배포**한다(별도 dispatch 없음).
-- `matrix.target`으로 대상만 분기한다: `ocr` → GPU EC2, `backend` → backend EC2.
-- 이미지 태그: `:dev`(가변, 호스트가 pull) + `:<sha7>`(불변, 감사·롤백용) 두 개를 push한다.
+- 배포 경로는 `matrix.manifest`로 갈린다. 값이 있으면 **K8s-manifests의 `image.tag`를 sha7로
+  커밋**하고 끝낸다(반영은 Argo CD가 한다 — CI는 클러스터에 접속하지 않는다). 비어 있으면 SSM.
+- 이미지 태그: `:dev`(가변) + `:<sha7>`(불변) 두 개를 push한다. **Argo CD 경로는 `:<sha7>`만 쓴다** —
+  `:dev`는 문자열이 그대로여서 매니페스트가 안 바뀌고, Argo CD가 아무 일도 하지 않는다.
+- `OCR_EC2_INSTANCE_ID`가 비어 있으면 ocr은 **이미지만 올리고 SSM 배포를 건너뛴다**
+  (계정 이전 직후처럼 호스트가 아직 없는 구간).
 
 ---
 
@@ -51,14 +55,26 @@ dev push
 
 | 필터 | 경로 | 트리거되는 서비스 |
 |------|------|------------------|
-| `shared` | `pyproject.toml`, `uv.lock`, `src/core/**` | ocr · report · chatbot **전부** |
-| `ocr` | `src/ocr_worker/**` | ocr |
+| `shared` | `pyproject.toml`, `uv.lock`, `src/core/**` | ocr · corpus · report · chatbot **전부** |
+| `ocr` | `src/ocr_worker/**`, `migrations/ai/**` | ocr |
+| `corpus` | `src/corpus_worker/**`, `migrations/corpus/**` | corpus |
 | `report` | `src/report_worker/**`, `src/rag/**`, `src/guardrail/**` | report |
 | `chatbot` | `src/chatbot/**`, `src/rag/**`, `src/guardrail/**` | chatbot |
 
-- 공용 코드(`src/core` 등)를 바꾸면 3개가 전부 재빌드된다.
+- 공용 코드(`src/core` 등)를 바꾸면 4개가 전부 재빌드된다.
 - 워크플로 파일(`.github/**`)만 바꾼 push는 어떤 필터에도 안 걸려 **deploy가 skip**된다.
-  (배포까지 테스트하려면 서비스 코드나 `src/core`를 건드려야 한다.)
+
+### 코드 변경 없이 다시 올리기 (`workflow_dispatch`)
+
+ECR을 새로 만들었거나 계정을 옮겼을 때처럼 **코드는 그대로인데 레지스트리가 비어 있는** 경우,
+paths-filter로는 아무것도 걸리지 않는다. 이때는 Actions → Deploy → Run workflow로 돌린다.
+
+```bash
+gh workflow run deploy.yml --ref dev                      # 4개 전부
+gh workflow run deploy.yml --ref dev -f services=report,chatbot   # 골라서
+```
+
+`services`를 비우면 전부 빌드한다. 테스트 게이트(`ci.yml`)는 수동 실행에서도 그대로 돈다.
 
 ---
 
@@ -94,13 +110,14 @@ docker image prune -f
 | `DISCORD_WEBHOOK_CI_FAILURES` | CI/배포 실패 알림 |
 | `DISCORD_WEBHOOK_CI_BUILDS` | CI 성공 알림 |
 | `DISCORD_WEBHOOK_DEPLOYMENT` | 배포 성공 알림 |
+| `MANIFESTS_CI_APP_PRIVATE_KEY` | `brbs-manifests-ci` GitHub App 개인키 (K8s-manifests 태그 커밋) |
 
 **Variables**
 
 | 이름 | 용도 |
 |------|------|
-| `OCR_EC2_INSTANCE_ID` | GPU EC2 인스턴스 ID |
-| `BACKEND_EC2_INSTANCE_ID` | backend EC2 인스턴스 ID |
+| `OCR_EC2_INSTANCE_ID` | GPU EC2 인스턴스 ID. **비우면 ocr의 SSM 배포를 건너뛴다**(이미지 push는 수행) |
+| `MANIFESTS_CI_CLIENT_ID` | `brbs-manifests-ci` GitHub App 클라이언트 ID (Argo CD 경로의 태그 커밋용) |
 
 **AWS 권한(OIDC 역할)**: `ecr:*`(push), `ssm:SendCommand`·`ssm:GetCommandInvocation`
 (대상: OCR·backend 두 EC2). 각 EC2 인스턴스 롤에는 ECR pull 권한이 있어야 한다.

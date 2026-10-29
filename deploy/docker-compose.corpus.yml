@@ -8,7 +8,7 @@ name: brbs-corpus
 
 services:
   corpus-worker:
-    image: ${ECR_REGISTRY}/soma/corpus:${CORPUS_TAG:-dev}
+    image: ${ECR_REGISTRY}/brbs/corpus:${CORPUS_TAG:-dev}
     container_name: brbs-corpus-worker
     restart: unless-stopped
     environment:
