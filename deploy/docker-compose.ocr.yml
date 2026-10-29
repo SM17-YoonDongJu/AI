@@ -37,7 +37,7 @@ services:
 
   # OCR Worker(surya, in-process PyTorch). SQS ocr-job-queue 소비 → 결과 저장 → 리포트 이벤트 발행.
   ocr-worker:
-    image: ${ECR_REGISTRY}/soma/ocr:${OCR_TAG:-dev}
+    image: ${ECR_REGISTRY}/brbs/ocr:${OCR_TAG:-dev}
     container_name: brbs-ocr-worker
     restart: unless-stopped
     environment:

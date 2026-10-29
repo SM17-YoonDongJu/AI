@@ -1,8 +1,9 @@
 # Deploy — dev push(=병합) 시 테스트 통과 후 변경된 서비스만 ECR 빌드→push→배포.
 # 배포 경로는 서비스별로 갈린다:
-#   - report·chatbot: k8s(soma-k8s) — K8s-manifests의 image.tag를 이번 커밋 sha7로 커밋하면
+#   - report·chatbot·corpus: k8s — K8s-manifests의 image.tag를 이번 커밋 sha7로 커밋하면
 #     Argo CD가 감지해 롤링 업데이트한다. CI는 클러스터·서버에 접속하지 않는다.
-#   - ocr(GPU EC2)·corpus(brbs-etl): SSM으로 호스트 compose를 재시작한다.
+#   - ocr(GPU EC2): SSM으로 호스트 compose를 재시작한다. 대상 인스턴스 변수가 비어 있으면
+#     빌드만 하고 배포를 건너뛴다(계정 이전 직후처럼 호스트가 아직 없는 구간).
 # 테스트는 ci.yml을 workflow_call로 재사용해 게이팅한다(needs: test). 워크플로 간 needs는
 # 불가하므로 "재사용 호출"로 잇는다. push 직접 트리거라 workflow_run의 기본브랜치 제약도 없다.
 #
@@ -13,6 +14,14 @@ name: Deploy
 on:
   push:
     branches: [dev]
+  # paths-filter와 무관하게 이미지를 다시 올려야 할 때 쓴다(ECR 재구축·계정 이전처럼
+  # 코드는 그대로인데 레지스트리가 비어 있는 경우). 빌드 대상은 services 입력으로 고른다.
+  workflow_dispatch:
+    inputs:
+      services:
+        description: "빌드할 서비스(쉼표 구분: ocr,corpus,report,chatbot). 비우면 전부."
+        required: false
+        default: ""
 
 jobs:
   # 1) 테스트 게이트 — ci.yml 재사용. 실패하면 아래 잡들은 시작되지 않는다.
@@ -32,6 +41,7 @@ jobs:
         with: { fetch-depth: 0 }
       - uses: dorny/paths-filter@v3
         id: filter
+        if: github.event_name == 'push'
         with:
           # 현재 브랜치의 "이 push 이전 커밋"과 비교한다(dev push↔dev, main push↔main).
           # base 미지정 시 기본 브랜치(main)와 비교돼 dev의 거의 모든 파일이 변경으로 잡힌다.
@@ -45,18 +55,31 @@ jobs:
       - id: set
         shell: bash
         run: |
-          shared='${{ steps.filter.outputs.shared }}'
+          # 빌드 대상 판정 — 양쪽 경로를 "쉼표로 구분한 서비스 목록"(sel) 하나로 모으고,
+          # pick이 그 목록만 본다. 수동 실행은 services 입력, push는 paths-filter 결과를 쓴다.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            sel=$(echo "${{ inputs.services }}" | tr -d ' ')
+            [ -n "$sel" ] || sel="ocr,corpus,report,chatbot"
+          else
+            # paths-filter의 changes는 걸린 필터 이름 배열이다(예: ["shared","report"]).
+            sel=$(echo '${{ steps.filter.outputs.changes }}' | tr -d '[]" ')
+            # 공용 코드가 걸리면 서비스 필터와 무관하게 전부 다시 빌드한다.
+            case ",$sel," in *,shared,*) sel="ocr,corpus,report,chatbot" ;; esac
+          fi
+          echo "selected: ${sel:-<none>}"
+          pick() { case ",$sel," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
+
           items=()
           add() { items+=("$1"); }
           # entry: service|dockerfile|repo|tag|target|svc|compose_src|manifest
-          # 서비스별 전용 저장소(soma/ocr·soma/report·soma/chatbot)에 :dev·:<sha7> 태그로 push한다.
+          # 서비스별 전용 저장소(brbs/ocr·brbs/corpus·brbs/report·brbs/chatbot)에 :dev·:<sha7> 태그로 push한다.
           # manifest: K8s-manifests의 값 파일 경로. 비어 있지 않으면 Argo CD 경로(매니페스트 태그 커밋),
-          #   비어 있으면 SSM 경로(target=ocr: GPU EC2 / target=corpus: brbs-etl)로 배포한다.
+          #   비어 있으면 SSM 경로(target=ocr: GPU EC2)로 배포한다.
           # compose_src: SSM 배포 시 호스트에 기록할 "레포 내" compose(우리 소유라 코드 기반).
-          [ "$shared" = "true" ] || [ "${{ steps.filter.outputs.ocr }}" = "true" ]     && add '{"service":"ocr","dockerfile":"src/ocr_worker/Dockerfile","repo":"soma/ocr","tag":"dev","target":"ocr","svc":"ocr-worker","compose_src":"deploy/docker-compose.ocr.yml","manifest":""}'
-          [ "$shared" = "true" ] || [ "${{ steps.filter.outputs.corpus }}" = "true" ]  && add '{"service":"corpus","dockerfile":"src/corpus_worker/Dockerfile","repo":"soma/corpus","tag":"dev","target":"corpus","svc":"corpus-worker","compose_src":"deploy/docker-compose.corpus.yml","manifest":""}'
-          [ "$shared" = "true" ] || [ "${{ steps.filter.outputs.report }}" = "true" ]  && add '{"service":"report","dockerfile":"src/report_worker/Dockerfile","repo":"soma/report","tag":"dev","target":"k8s","svc":"report","compose_src":"","manifest":"envs/dev/report.values.yaml"}'
-          [ "$shared" = "true" ] || [ "${{ steps.filter.outputs.chatbot }}" = "true" ] && add '{"service":"chatbot","dockerfile":"src/chatbot/Dockerfile","repo":"soma/chatbot","tag":"dev","target":"k8s","svc":"chatbot","compose_src":"","manifest":"envs/dev/chatbot.values.yaml"}'
+          pick ocr     && add '{"service":"ocr","dockerfile":"src/ocr_worker/Dockerfile","repo":"brbs/ocr","tag":"dev","target":"ocr","svc":"ocr-worker","compose_src":"deploy/docker-compose.ocr.yml","manifest":""}'
+          pick corpus  && add '{"service":"corpus","dockerfile":"src/corpus_worker/Dockerfile","repo":"brbs/corpus","tag":"dev","target":"k8s","svc":"corpus-worker","compose_src":"","manifest":"envs/dev/etl-corpus.values.yaml"}'
+          pick report  && add '{"service":"report","dockerfile":"src/report_worker/Dockerfile","repo":"brbs/report","tag":"dev","target":"k8s","svc":"report","compose_src":"","manifest":"envs/dev/report.values.yaml"}'
+          pick chatbot && add '{"service":"chatbot","dockerfile":"src/chatbot/Dockerfile","repo":"brbs/chatbot","tag":"dev","target":"k8s","svc":"chatbot","compose_src":"","manifest":"envs/dev/chatbot.values.yaml"}'
           json=$(IFS=,; echo "[${items[*]}]")
           echo "matrix={\"include\":$json}" >> "$GITHUB_OUTPUT"
           echo "will build: $json"
@@ -173,33 +196,34 @@ jobs:
           echo "::error::K8s-manifests main에 push하지 못했습니다."
           exit 1
 
-      # ── SSM 경로 (ocr·corpus) ──────────────────────────────────────────────────────
-      # 대상 EC2/compose 경로를 target에 따라 결정. ocr=GPU EC2 / corpus=경량 EC2(brbs-etl), 모두 SSM 직접 배포.
-      # corpus는 brbs-etl 워크로드가 k8s로 옮겨지면(Backend #338) matrix.manifest를 채워 Argo CD 경로로 바꾼다.
+      # ── SSM 경로 (ocr) ─────────────────────────────────────────────────────────────
+      # ocr만 호스트 compose다(GPU EC2). 나머지는 위 Argo CD 경로로 끝난다.
       - name: Resolve deploy target
         id: t
         if: matrix.manifest == ''
         shell: bash
         run: |
-          if [ "${{ matrix.target }}" = "ocr" ]; then
-            echo "instance=${{ vars.OCR_EC2_INSTANCE_ID }}" >> "$GITHUB_OUTPUT"
-            echo "compose=/opt/ocr/docker-compose.ocr.yml" >> "$GITHUB_OUTPUT"
-            echo "envfile=/opt/ocr/.env.ocr" >> "$GITHUB_OUTPUT"
-          elif [ "${{ matrix.target }}" = "corpus" ]; then
-            # GPU·Kafka·ollama 불필요한 경량 워커라 OCR과 분리된 EC2(brbs-etl)에 둔다.
-            echo "instance=${{ vars.CORPUS_EC2_INSTANCE_ID }}" >> "$GITHUB_OUTPUT"
-            echo "compose=/opt/corpus/docker-compose.corpus.yml" >> "$GITHUB_OUTPUT"
-            echo "envfile=/opt/corpus/.env.corpus" >> "$GITHUB_OUTPUT"
-          else
+          if [ "${{ matrix.target }}" != "ocr" ]; then
             echo "::error::SSM 배포 대상이 아닌 target입니다: ${{ matrix.target }}"
             exit 1
           fi
+          # 대상 호스트가 아직 없는 구간(계정 이전 직후 등)에는 이미지만 올리고 배포를 건너뛴다.
+          # 변수를 비워두는 것이 "호스트 미구축" 신호다 — 빈 instance-ids로 send-command를
+          # 호출하면 알아보기 어려운 ValidationException으로 죽는다.
+          if [ -z "${{ vars.OCR_EC2_INSTANCE_ID }}" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::vars.OCR_EC2_INSTANCE_ID가 비어 있어 SSM 배포를 건너뜁니다(이미지 push는 완료)."
+            exit 0
+          fi
+          echo "instance=${{ vars.OCR_EC2_INSTANCE_ID }}" >> "$GITHUB_OUTPUT"
+          echo "compose=/opt/ocr/docker-compose.ocr.yml" >> "$GITHUB_OUTPUT"
+          echo "envfile=/opt/ocr/.env.ocr" >> "$GITHUB_OUTPUT"
 
       # 레포의 compose를 base64로 인코딩(있을 때만). SSM으로 호스트 파일을 이 내용으로 덮는다.
       # compose_src가 비면 건너뛴다 → 호스트 파일 그대로 사용.
       - name: Encode compose from repo
         id: cmp
-        if: matrix.manifest == ''
+        if: matrix.manifest == '' && steps.t.outputs.skip != 'true'
         shell: bash
         run: |
           src="${{ matrix.compose_src }}"
@@ -210,7 +234,7 @@ jobs:
           fi
 
       - name: Deploy via SSM (${{ matrix.svc }})
-        if: matrix.manifest == ''
+        if: matrix.manifest == '' && steps.t.outputs.skip != 'true'
         shell: bash
         run: |
           CMD=$(cat <<EOF
