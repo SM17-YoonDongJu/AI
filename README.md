@@ -57,7 +57,7 @@ Ollama / vLLM  — 외부 GPU 노드: LLM · 임베딩 · VLM
 | OCR·리포트 | SQS 워커 (at-least-once) | `job_id`/`report_id` 멱등, poison 가드, 결정적 실패 즉시 종결 |
 | RAG·가드레일 | 공용 Python 모듈 | 워커가 import해서 조립 |
 | LLM·임베딩 | 외부 Ollama/vLLM HTTP 호출 | 모델은 config(`LLM_MODEL`·`EMBEDDING_MODEL`)로만 지정 |
-| 인프라 | RDS(PostgreSQL+pgvector) · SQS · ElastiCache · S3 | 로컬은 docker-compose(LocalStack·pgvector·Redis) |
+| 인프라 | RDS(PostgreSQL+pgvector) · SQS · S3 | 로컬은 docker-compose(LocalStack·pgvector) |
 
 > 돈에 직결되는 숫자(장해 지급률·예상 보상금)는 LLM이 아니라 **정해진 계산 규칙(순수 함수)** 이 만든다. LLM은 분류·해석만 맡는다.
 
@@ -102,7 +102,7 @@ uv sync                          # base + dev
 uv sync --extra report           # 리포트 워커
 uv sync --extra ocr              # OCR 워커 (GPU 노드)
 
-# 2) 로컬 백킹 서비스 — LocalStack(SQS, 큐 자동 생성) · PostgreSQL+pgvector · Redis
+# 2) 로컬 백킹 서비스 — LocalStack(SQS, 큐 자동 생성) · PostgreSQL+pgvector
 docker compose up -d
 
 # 3) 환경변수

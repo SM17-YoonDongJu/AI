@@ -5,7 +5,7 @@ description: Hybrid RAG 검색 파이프라인(04번)을 구현할 때 사용. �
 
 # Hybrid RAG Build
 
-노션 04번 파이프라인. 리포트(05)·챗봇(12)이 **함수 호출**로 쓰는 공용 모듈(`src/rag/`). 순수 함수형 인터페이스(in/out 명확)로 만들어 호출자가 조립하기 쉽게 한다. DB는 `core/db.py`, 임베딩은 `core/ai_client.py`를 쓴다.
+노션 04번 파이프라인. 리포트(05)가 **함수 호출**로 쓰는 공용 모듈(`src/rag/`). 순수 함수형 인터페이스(in/out 명확)로 만들어 호출자가 조립하기 쉽게 한다. DB는 `core/db.py`, 임베딩은 `core/ai_client.py`를 쓴다.
 
 ## 파이프라인 (순서)
 1. **쿼리 라우터** — 쿼리 + 보험 유형 힌트로 검색할 namespace 조합과 top-k 결정. namespace: `terms`(약관)·`level`(후유장해 분류표)·`case`(분쟁·판례)·`medical`(HIRA 수가·KCD). 비신체보험(자동차·화재 등)은 범위 외 안내.

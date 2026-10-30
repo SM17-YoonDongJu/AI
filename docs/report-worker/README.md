@@ -24,7 +24,7 @@
 - **입력:** Kafka `report-job` 토픽의 `ReportJob` 메시지 (ID만 실림)
 - **출력:** `report_drafts`(초안 JSON) + `reports`(요약 컬럼 갱신) + `report_issues`(쟁점)
 - **멱등성:** `report_id` 기준. `persist`가 `ON CONFLICT (report_id)` 업서트
-- **비스트리밍:** 완성된 초안을 1회 저장 (챗봇과 달리 실시간 스트림 아님)
+- **비스트리밍:** 완성된 초안을 1회 저장
 
 ### 메시지 계약 (`src/core/contracts.py:77`)
 
@@ -188,7 +188,7 @@ src/report_worker/
 └── rag/
     └── hybrid.py          src/rag 어댑터 (RagResult → 노드용 dict 변환)
 
-src/rag/                   공용 Hybrid RAG (report_worker·chatbot 공유)
+src/rag/                   공용 Hybrid RAG (report_worker 사용)
 ├── router.py              쿼리 라우터(namespace 조합)
 ├── typo.py                pg_trgm 오타보정
 ├── search.py              tsvector+pgvector+RRF, 버전 필터(_version_filter)

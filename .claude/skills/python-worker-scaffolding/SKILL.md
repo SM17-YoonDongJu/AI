@@ -1,6 +1,6 @@
 ---
 name: python-worker-scaffolding
-description: 보험·법률 AI 엔진 Python 프로젝트의 토대를 세울 때 사용. uv 초기화, src 레이아웃, pyproject.toml(의존성 그룹 분리), ruff 설정, core/(config·sqs·db·ai_client·contracts·logging), docker-compose(LocalStack SQS·PG+pgvector·Redis), 마이그레이션 골격을 만든다. 프로젝트 초기 구성·스캐폴딩·"환경 구축"·core 모듈 작업 시 반드시 사용.
+description: 보험·법률 AI 엔진 Python 프로젝트의 토대를 세울 때 사용. uv 초기화, src 레이아웃, pyproject.toml(의존성 그룹 분리), ruff 설정, core/(config·sqs·db·ai_client·contracts·logging), docker-compose(LocalStack SQS·PG+pgvector), 마이그레이션 골격을 만든다. 프로젝트 초기 구성·스캐폴딩·"환경 구축"·core 모듈 작업 시 반드시 사용.
 ---
 
 # Python Worker Scaffolding
@@ -14,24 +14,22 @@ description: 보험·법률 AI 엔진 Python 프로젝트의 토대를 세울 �
 
 ## 1. 프로젝트 골격
 - `uv init` 기반, `pyproject.toml`만 사용(`setup.py` 금지), `uv.lock` 커밋.
-- `src/` 레이아웃(워커중심): `src/core`, `src/rag`, `src/guardrail`, `src/ocr_worker`, `src/report_worker`, `src/chatbot`, `tests/`. 워커 진입점은 각 패키지의 `__main__.py`(챗봇은 `app.py`).
+- `src/` 레이아웃(워커중심): `src/core`, `src/rag`, `src/guardrail`, `src/ocr_worker`, `src/report_worker`, `tests/`. 워커 진입점은 각 패키지의 `__main__.py`.
 - 의존성 **그룹 분리** — 워커별 슬림 배포를 위해:
   - 기본: pydantic, pydantic-settings, asyncpg, httpx(ai_client), structlog
   - `ocr`(optional): surya-ocr, transformers, pillow, boto3(S3·SQS)
   - `report`(optional): langgraph, langchain-core, boto3(SQS)
-  - `chatbot`(optional): fastapi, uvicorn, websockets, python-jose(JWT), redis
   - `dev`: ruff, pytest, pytest-asyncio
 - `ruff.toml`: line-length 100, target py312, isort 활성.
 
 ## 2. config — `src/core/config.py`
 - `pydantic-settings`의 `BaseSettings`. 모든 환경값을 한 곳에. `os.getenv` 산재 금지.
-- 그룹: SQS(큐 URL·`sqs_endpoint_url`·`sqs_max_receive_count`·`sqs_visibility_timeout` 등), DB(dsn·pool size), Ollama(base_url·임베딩/LLM 모델명·`num_ctx` — VLM 등 프롬프트가 커질 수 있는 호출은 명시적으로 지정), Redis, JWT(공개키), S3.
+- 그룹: SQS(큐 URL·`sqs_endpoint_url`·`sqs_max_receive_count`·`sqs_visibility_timeout` 등), DB(dsn·pool size), Ollama(base_url·임베딩/LLM 모델명·`num_ctx` — VLM 등 프롬프트가 커질 수 있는 호출은 명시적으로 지정), S3.
 
 ## 3. contracts — `src/core/contracts.py` (가장 중요)
 Spring과의 인터페이스 계약. 전부 pydantic v2 `BaseModel`. 확정 즉시 팀에 공유한다.
 - `OcrJob` (consume `ocr-job-queue`): job_id, s3_key, doc_type_hint, claim_id, uploaded_at …
 - `ReportJob` (produce/consume `report-job`): report_id, ocr_result_id, claim_id, user_ref …
-- WebSocket 메시지: `ChatClientMessage`(session_id, text), `ChatServerMessage`(type="message", text, citations) — **비스트리밍**(stream/done 없음).
 - 큐 URL 관련 상수는 config에서, 메시지 스키마는 여기서 export.
 
 ## 4. 인프라 래퍼 — `src/core/`
@@ -42,8 +40,8 @@ Spring과의 인터페이스 계약. 전부 pydantic v2 `BaseModel`. 확정 즉�
 - `logging.py`: structlog 구조적 로깅, job_id/session_id/correlation_id 바인딩, **PII 로깅 금지**(예외 메시지 본문도 포함 — 타입명만 로깅).
 
 ## 5. 로컬 환경 + 마이그레이션
-- `docker-compose.yml`: LocalStack(SQS)·postgres(pgvector 이미지)·redis. Ollama는 GPU가 필요해 로컬 compose에 없다(별도 기동 또는 원격 GPU 노드 접속). Spring 없이 워커 단독 테스트용.
-- `migrations/{ai,core,corpus}/`: 스키마 소유자별 분리(CODE_CONVENTIONS §14) — 자기 소유 스키마만 DDL을 낸다. `ocr_results`, `claim_readiness`, `ocr_job_failures`, `search_terms`(pg_trgm 인덱스), 청크 테이블(tsvector 인덱스 + `embedding vector(1024)` HNSW), 대화 이력.
+- `docker-compose.yml`: LocalStack(SQS)·postgres(pgvector 이미지). Ollama는 GPU가 필요해 로컬 compose에 없다(별도 기동 또는 원격 GPU 노드 접속). Spring 없이 워커 단독 테스트용.
+- `migrations/{ai,core,corpus}/`: 스키마 소유자별 분리(CODE_CONVENTIONS §14) — 자기 소유 스키마만 DDL을 낸다. `ocr_results`, `claim_readiness`, `ocr_job_failures`, `search_terms`(pg_trgm 인덱스), 청크 테이블(tsvector 인덱스 + `embedding vector(1024)` HNSW).
 
 ## 검증
 - `uv run python -c "import core.contracts"` 스모크 통과 (PYTHONPATH=src).

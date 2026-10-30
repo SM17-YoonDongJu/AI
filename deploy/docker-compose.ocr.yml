@@ -7,7 +7,7 @@
 name: brbs-ocr
 
 services:
-  # 로컬 LLM/임베딩 서빙. backend EC2의 report/chatbot이 GPU_PRIVATE_IP:11434로 호출.
+  # 로컬 LLM/임베딩 서빙. backend EC2의 report가 GPU_PRIVATE_IP:11434로 호출.
   ollama:
     image: ollama/ollama:latest
     container_name: brbs-ollama

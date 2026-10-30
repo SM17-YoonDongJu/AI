@@ -26,7 +26,7 @@ CI 배포 필터(`.github/workflows/deploy.yml`)도 `migrations/ai/**` → ocr �
 이미지 재빌드가 필요하다(재빌드 없인 컨테이너 재시작해도 옛 마이그레이션 그대로 — 자동으로
 안 되면 `src/core/config.py`의 "CD 스모크... 재트리거" 카운터를 올려 강제 재배포).
 
-report_worker·chatbot은 마이그레이션을 실행하지 않는다(`run_migrations()` 호출 없음) —
+report_worker는 마이그레이션을 실행하지 않는다(`run_migrations()` 호출 없음) —
 `core` 스키마는 backend Flyway가, `ai`/`corpus`는 위 두 워커만 관리한다.
 
 ## `ai/` 적용 순서 (ai_owner)
@@ -58,7 +58,7 @@ report_worker·chatbot은 마이그레이션을 실행하지 않는다(`run_migr
 
 `namespace`는 물리 컬럼이 아니라 검색한 소스 테이블로 부여하는 파생값이다
 (`policy_chunks` -> `terms`, `case_chunks` -> `case`, `schedule_chunks` -> `level`).
-report_worker·chatbot(`ai_owner`)이 RAG 검색 시 이 4개 테이블을 읽는다 — 각 파일 끝의
+report_worker(`ai_owner`)가 RAG 검색 시 이 4개 테이블을 읽는다 — 각 파일 끝의
 `GRANT SELECT ... TO ai_owner`(role 존재 체크 포함, corpus_owner가 자기 소유 오브젝트에
 직접 부여하므로 권한 문제 없음)가 이를 보장한다.
 

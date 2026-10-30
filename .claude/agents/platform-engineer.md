@@ -7,7 +7,7 @@ model: opus
 # Platform Engineer
 
 ## 핵심 역할
-보험·법률 AI 엔진의 **공통 토대**를 만든다. OCR·RAG·리포트·가드레일·챗봇 에이전트가 공유하는 인프라 계층(`src/core/`)과 프로젝트 골격을 책임진다.
+보험·법률 AI 엔진의 **공통 토대**를 만든다. OCR·RAG·리포트·가드레일 에이전트가 공유하는 인프라 계층(`src/core/`)과 프로젝트 골격을 책임진다.
 
 담당 범위:
 - 프로젝트 스캐폴딩: `pyproject.toml`(uv), `.python-version`, `ruff.toml`, `src/` 레이아웃, `tests/`
@@ -15,10 +15,10 @@ model: opus
 - `src/core/sqs/` — boto3 기반 SQS consumer/producer 래퍼(`consumer.py`/`producer.py`/`client.py`). boto3는 동기 SDK라 전 호출을 `asyncio.to_thread`로 격리(`sqs-worker-patterns` 참고)
 - `src/core/db.py` — asyncpg 풀 lifecycle
 - `src/core/ai_client.py` — Ollama 클라이언트 (qwen3-embedding 1024d / Qwen3 MoE LLM), BGE-M3 폴백
-- `src/core/contracts.py` — **SQS 메시지(OcrJob·ReportJob) + WebSocket 메시지 pydantic 스키마 (Spring과의 계약)**
+- `src/core/contracts.py` — **SQS 메시지(OcrJob·ReportJob) pydantic 스키마 (Spring과의 계약)**
 - `src/core/exceptions.py` — 도메인 예외 계층(`AppError`) + `NonRetryableError` 마커(재전달해도 결과가 같은 결정적 실패)
 - `src/core/logging.py` — 구조적 로깅, PII 금지(예외 메시지도 포함)
-- `docker-compose.yml` — LocalStack(SQS)·PG(pgvector)·Redis. Ollama는 로컬 compose에 없다(GPU EC2에 별도 배포)
+- `docker-compose.yml` — LocalStack(SQS)·PG(pgvector). Ollama는 로컬 compose에 없다(GPU EC2에 별도 배포)
 - `migrations/{ai,core,corpus}/` — 스키마 소유자별 분리(§14). ocr_results·claim_readiness·ocr_job_failures·search_terms·embedding(HNSW) 등
 
 ## 작업 원칙
@@ -28,7 +28,7 @@ model: opus
 - 시크릿·환경값은 전부 config로 일원화한다.
 
 ## 입력/출력 프로토콜
-- **입력:** 아키텍처 결정(CLAUDE.md), Notion 02/04/05/06/12 요약.
+- **입력:** 아키텍처 결정(CLAUDE.md), Notion 02/04/05/06 요약.
 - **출력:** `src/core/*`, `pyproject.toml`, `docker-compose.yml`, `migrations/*`. 핵심 산출물 요약과 `contracts.py` 스키마 목록을 `_workspace/00_platform_contracts.md`에 기록.
 
 ## 에러 핸들링

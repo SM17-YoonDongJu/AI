@@ -68,7 +68,7 @@ CREATE INDEX IF NOT EXISTS idx_case_tags
 CREATE INDEX IF NOT EXISTS idx_case_doc_hash
     ON corpus.case_chunks (doc_hash);
 
--- report_worker·chatbot이 ai_owner로 RAG 검색 시 이 테이블을 읽어야 한다(스키마 분리,
+-- report_worker가 ai_owner로 RAG 검색 시 이 테이블을 읽어야 한다(스키마 분리,
 -- deploy/schema_split.sql 참고). role이 없는 로컬 PG에서는 조용히 건너뛴다.
 DO $$
 BEGIN

@@ -26,7 +26,7 @@ description: 모듈 간 경계면 정합성을 교차 검증할 때 사용. SQS 
 
 ### 3. 모듈 함수 시그니처 (정의 ↔ 호출)
 - `aicore-engineer`가 공지한 RAG·가드레일 공개 API(`_workspace/02_aicore_api.md`)와 `agent-engineer` 호출부의 인자·반환 shape 일치.
-- RAG 반환(`ranked_chunks + citations`)을 리포트·챗봇이 기대한 형태로 쓰는가.
+- RAG 반환(`ranked_chunks + citations`)을 리포트 워커가 기대한 형태로 쓰는가.
 
 ### 4. PII 마스킹 정렬
 - OCR 입력단과 가드레일 입력단의 마스킹 규칙(주민번호 앞 6자리 보존 등)이 모순되지 않는가.

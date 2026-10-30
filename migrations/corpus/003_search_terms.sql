@@ -14,7 +14,7 @@ CREATE TABLE IF NOT EXISTS corpus.search_terms (
 CREATE INDEX IF NOT EXISTS idx_search_terms_term_trgm
     ON corpus.search_terms USING gin (term gin_trgm_ops);
 
--- report_worker·chatbot이 ai_owner로 오타보정 시 이 테이블을 읽어야 한다(스키마 분리,
+-- report_worker가 ai_owner로 오타보정 시 이 테이블을 읽어야 한다(스키마 분리,
 -- deploy/schema_split.sql 참고). role이 없는 로컬 PG에서는 조용히 건너뛴다.
 DO $$
 BEGIN

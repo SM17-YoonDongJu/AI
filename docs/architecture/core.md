@@ -7,9 +7,9 @@
 > 모든 워커와 공용 모듈이 함께 쓰는 여섯 개의 밑바탕 부품(AI 호출·환경설정·DB 연결·Kafka 소비/발행·로깅)이 각각 무엇을 하고 어떻게 동작하는지를 코드 근거와 함께 설명하는 문서다.
 
 > 🌱 **쉽게 말하면**
-> `src/core`는 건물로 치면 전기·수도·가스 같은 **기본 배관**이다. OCR 워커든 리포트 워커든 챗봇이든, 방(기능)마다 따로 우물을 파지 않고 이 공용 배관에서 물을 끌어 쓴다. 이 배관에는 여섯 개의 관이 있다 — AI 모델에게 말을 거는 관(`ai_client`), 설정값을 한곳에 모아두는 관(`config`), 데이터베이스와 연결을 유지하는 관(`db`), 일감을 받아오는 관(Kafka `consumer`), 결과를 내보내는 관(Kafka `producer`), 무슨 일이 있었는지 기록하는 관(`logging`)이다. 이 관들이 튼튼해야 위층의 모든 기능이 안정적으로 돈다. 그래서 "다른 모두가 여기에 의존하니 가장 먼저 튼튼하게 만든다"는 원칙이 붙어 있다.
+> `src/core`는 건물로 치면 전기·수도·가스 같은 **기본 배관**이다. OCR 워커든 리포트 워커든, 방(기능)마다 따로 우물을 파지 않고 이 공용 배관에서 물을 끌어 쓴다. 이 배관에는 여섯 개의 관이 있다 — AI 모델에게 말을 거는 관(`ai_client`), 설정값을 한곳에 모아두는 관(`config`), 데이터베이스와 연결을 유지하는 관(`db`), 일감을 받아오는 관(Kafka `consumer`), 결과를 내보내는 관(Kafka `producer`), 무슨 일이 있었는지 기록하는 관(`logging`)이다. 이 관들이 튼튼해야 위층의 모든 기능이 안정적으로 돈다. 그래서 "다른 모두가 여기에 의존하니 가장 먼저 튼튼하게 만든다"는 원칙이 붙어 있다.
 
-`src/core`는 모든 워커(`ocr_worker`·`report_worker`·`chatbot`)와 공용 모듈(`rag`·`guardrail`)이 의존하는 **토대**다. `README.md`가 명시하듯 "다른 모두가 여기에 의존하므로 가장 먼저 안정화"하는 계층이며(`src/core/README.md:3`), 담당하는 모듈은 `config`(환경설정 단일 출처)·`contracts`(메시지 계약)·`kafka/`(consumer/producer)·`db`(asyncpg 풀)·`ai_client`(OpenAI 호환 추론)·`logging`(구조적 로깅)이다(`src/core/README.md:7-14`).
+`src/core`는 모든 워커(`ocr_worker`·`report_worker`)와 공용 모듈(`rag`·`guardrail`)이 의존하는 **토대**다. `README.md`가 명시하듯 "다른 모두가 여기에 의존하므로 가장 먼저 안정화"하는 계층이며(`src/core/README.md:3`), 담당하는 모듈은 `config`(환경설정 단일 출처)·`contracts`(메시지 계약)·`kafka/`(consumer/producer)·`db`(asyncpg 풀)·`ai_client`(OpenAI 호환 추론)·`logging`(구조적 로깅)이다(`src/core/README.md:7-14`).
 
 아래는 각 모듈이 **무엇을 하고, 무슨 설정을 참조하고, 어떻게 동작하며, 상태가 어떻게 바뀌는지**를 코드 근거와 함께 정리한 것이다.
 
@@ -127,7 +127,7 @@ except (KeyError, IndexError, TypeError) as exc:
 
 핵심 사항:
 - 모델은 `opts["model"]`로 호출할 때마다 바꿔 끼울(오버라이드) 수 있고, 안 주면 `settings.llm_model`(예: EXAONE 계열)이 기본값이 된다.
-- **항상 `stream: False`** — 챗봇도 비스트리밍(완성 응답 1회)이라는 아키텍처와 딱 맞는다.
+- **항상 `stream: False`** — 비스트리밍(완성 응답 1회) 아키텍처와 딱 맞는다.
 - `**opts`로 `temperature`(답의 무작위성·창의성 정도) 등 임의의 OpenAI 호환 파라미터를 그대로 실어 보낸다.
 - POST 경로는 `/chat/completions`이고, 여기에 `base_url`(`settings.ai_base_url`, 기본 `http://localhost:11434/v1`)이 앞에 붙어 완전한 주소가 된다.
 - HTTP 오류(`httpx.HTTPError`, `raise_for_status()` 포함)는 `AiClientError("chat 호출 실패")`로, 응답 구조 파싱 실패(`KeyError`/`IndexError`/`TypeError`)는 `AiClientError("chat 응답 형식이 올바르지 않음")`으로 감싸서 던진다. 원인이 된 예외는 `from exc`로 함께 매달아(체이닝) 남긴다.
@@ -142,7 +142,7 @@ except (KeyError, IndexError, TypeError) as exc:
 
 시그니처: `async def chat_json(messages: list[dict[str, str]], **opts: Any) -> Any`(`src/core/ai_client.py:101`).
 
-docstring이 밝히듯 "리포트·챗봇·가드레일이 공유하는 JSON 모드 헬퍼"로, LLM이 ```` ```json ```` 코드펜스나 잡음을 섞어도 관용적으로 파싱한다(`src/core/ai_client.py:102-117`). 동작(`src/core/ai_client.py:118-132`):
+docstring이 밝히듯 "리포트·가드레일이 공유하는 JSON 모드 헬퍼"로, LLM이 ```` ```json ```` 코드펜스나 잡음을 섞어도 관용적으로 파싱한다(`src/core/ai_client.py:102-117`). 동작(`src/core/ai_client.py:118-132`):
 
 ```python
 raw = await chat(messages, **opts)
@@ -258,7 +258,6 @@ database_url: str = "postgresql://postgres:postgres@localhost:5432/ai_engine"
 db_pool_min_size: int = 2
 db_pool_max_size: int = 10
 rds_ca_path: str | None = None  # RDS TLS CA 번들 경로. 로컬 PG면 비움(SSL 끔)
-redis_url: str = "redis://localhost:6379/0"
 ```
 
 **Kafka**(`src/core/config.py:42-49`):

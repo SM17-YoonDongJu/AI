@@ -38,7 +38,6 @@ URL 형태는 `https://app.notion.com/p/<slug>-<32hexId>` 또는 `.../p/<32hexId
 - `04_hybridRag.md` → 37530798f08f81c0b591c210c3f46212
 - `05_langGraphAgent.md` → (링크 없음/빈 파일 — 건너뜀)
 - `06_guardrail.md` → 37530798f08f81768a47fb1e04f447fe
-- `12_chatbot.md` → 37530798f08f81e8af55c6c27fd144f0
 
 ## 검증
 - 각 docs 파일 상단 링크 라인이 보존됐는가.
