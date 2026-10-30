@@ -1,6 +1,6 @@
 ---
 name: ai-engine-orchestrator
-description: 보험·법률 AI Python 엔진(OCR Worker·Hybrid RAG·LangGraph 리포트·가드레일·챗봇)의 구축·확장·수정을 조율하는 오케스트레이터. 에이전트 팀(platform/ocr/aicore/agent/qa)을 구성해 파운데이션→팬아웃→점진 QA로 진행한다. 이 프로젝트 기능 구현/수정/리팩터링, "다시 실행/재실행/업데이트/보완", "OCR/RAG/리포트/가드레일/챗봇 부분만" 등의 요청 시 사용.
+description: 보험·법률 AI Python 엔진(OCR Worker·Hybrid RAG·LangGraph 리포트·가드레일)의 구축·확장·수정을 조율하는 오케스트레이터. 에이전트 팀(platform/ocr/aicore/agent/qa)을 구성해 파운데이션→팬아웃→점진 QA로 진행한다. 이 프로젝트 기능 구현/수정/리팩터링, "다시 실행/재실행/업데이트/보완", "OCR/RAG/리포트/가드레일 부분만" 등의 요청 시 사용.
 ---
 
 # AI Engine Orchestrator
@@ -20,7 +20,7 @@ description: 보험·법률 AI Python 엔진(OCR Worker·Hybrid RAG·LangGraph �
 - `platform-engineer` — 토대(core·스캐폴딩·contracts·docker-compose·마이그레이션)
 - `ocr-engineer` — OCR Worker(02)
 - `aicore-engineer` — RAG(04) + 가드레일(06) 공용 모듈
-- `agent-engineer` — 리포트(05) + 챗봇(12)
+- `agent-engineer` — 리포트(05)
 - `qa-engineer` — 경계면 교차 검증 (general-purpose 타입)
 
 > 부분 재실행이면 해당 에이전트만 활성화한다.
@@ -32,7 +32,7 @@ description: 보험·법률 AI Python 엔진(OCR Worker·Hybrid RAG·LangGraph �
 2. **팬아웃 (병렬)**:
    - `ocr-engineer` → OCR Worker (contracts·DB 의존)
    - `aicore-engineer` → RAG + 가드레일 (core·ai_client 의존). 공개 API 확정 즉시 `agent-engineer`에 공지.
-3. **조립 (aicore 의존)**: `agent-engineer` → 리포트·챗봇. (05 그래프 설계는 먼저 `_workspace/`에 올려 확인받고 구현)
+3. **조립 (aicore 의존)**: `agent-engineer` → 리포트. (05 그래프 설계는 먼저 `_workspace/`에 올려 확인받고 구현)
 4. **점진 QA**: 각 모듈 완성 직후 `qa-engineer`가 해당 경계면을 즉시 교차 검증. 버그는 책임 에이전트에 반려·재검증.
 
 ## Phase 3: 종합

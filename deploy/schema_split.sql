@@ -10,7 +10,7 @@
 -- db/storage.py·db/search.py·db/search_term.py를 모두 읽고 확인한 것이다(추측 없음).
 --
 --   core   — backend(Spring) 소유. Flyway가 관리.
---   ai     — 이 엔진(ocr_worker·corpus_worker, 향후 report_worker/rag/chatbot) 소유. migrations/*.sql이 관리.
+--   ai     — 이 엔진(ocr_worker·corpus_worker, 향후 report_worker/rag) 소유. migrations/*.sql이 관리.
 --   corpus — Policy-Chunker 소유. db/schema.sql이 관리.
 --
 -- 크로스 스키마 접근은 실제 코드/계약 문서에서 확인된 것만 GRANT한다(최소 권한):
@@ -34,7 +34,7 @@
 --        `INSERT INTO report_issues (id, report_id, title, description, ai_status, tags) ...`로
 --        전량 교체한다. SELECT는 이 경로에서 안 쓰길래 안 줬다 — 필요해지면 그때 추가)
 --   - ai_owner → corpus.policy_chunks, corpus.search_terms : SELECT
---       (Policy-Chunker db/search.py가 report_worker/chatbot 계약과 동일 시그니처의 RAG 검색 레퍼런스
+--       (Policy-Chunker db/search.py가 report_worker 계약과 동일 시그니처의 RAG 검색 레퍼런스
 --        구현이고, 우리 쪽 src/rag가 이걸 그대로 이식할 예정 — RRF 검색은 SELECT만 필요)
 --   - app_owner → ai.report_drafts : SELECT
 --       (contracts.md §4: "손해사정사 UI·후속 단계가 읽는다")
@@ -349,7 +349,7 @@ COMMIT;
 --      backend      DB_USER=app_owner   DB_PASSWORD=<위에서 심은 값>   DB_NAME은 기존 유지
 --      ocr_worker   DATABASE_URL=postgresql://ai_owner:<...>@<host>:5432/<db>
 --      corpus_worker DATABASE_URL=postgresql://corpus_owner:<...>@<host>:5432/<db>
---      (report_worker/rag/chatbot도 구현되면 ai_owner 재사용)
+--      (report_worker/rag도 구현되면 ai_owner 재사용)
 --      Policy-Chunker ingest DATABASE_URL=postgresql://corpus_owner:<...>@<host>:5432/<db>
 -- 2. 세 서비스 재배포. 순서: backend(app_owner) → ocr_worker/corpus_worker(ai_owner/corpus_owner).
 --    backend가 먼저 살아 있어야 kafka_outbox_events 기반 OCR 트리거가 안 끊긴다.

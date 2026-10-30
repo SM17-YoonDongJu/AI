@@ -1,4 +1,4 @@
-# CI/CD — AI 엔진 (OCR · Report · Chatbot)
+# CI/CD — AI 엔진 (OCR · Corpus · Report)
 
 이 레포의 CI/CD는 GitHub Actions 워크플로 하나(`.github/workflows/ci.yml`)로
 **테스트 → 변경 감지 → 빌드·ECR push → EC2 SSM 배포**까지 잇는다.
@@ -38,7 +38,6 @@ dev push
 | **ocr** | `src/ocr_worker/Dockerfile` | `brbs/ocr` | SSM | GPU EC2 (`OCR_EC2_INSTANCE_ID`) → `/opt/ocr/docker-compose.ocr.yml` |
 | **corpus** | `src/corpus_worker/Dockerfile` | `brbs/corpus` | Argo CD | `envs/dev/etl-corpus.values.yaml` |
 | **report** | `src/report_worker/Dockerfile` | `brbs/report` | Argo CD | `envs/dev/report.values.yaml` |
-| **chatbot** | `src/chatbot/Dockerfile` | `brbs/chatbot` | Argo CD | `envs/dev/chatbot.values.yaml` |
 
 - 배포 경로는 `matrix.manifest`로 갈린다. 값이 있으면 **K8s-manifests의 `image.tag`를 sha7로
   커밋**하고 끝낸다(반영은 Argo CD가 한다 — CI는 클러스터에 접속하지 않는다). 비어 있으면 SSM.
@@ -55,13 +54,12 @@ dev push
 
 | 필터 | 경로 | 트리거되는 서비스 |
 |------|------|------------------|
-| `shared` | `pyproject.toml`, `uv.lock`, `src/core/**` | ocr · corpus · report · chatbot **전부** |
+| `shared` | `pyproject.toml`, `uv.lock`, `src/core/**` | ocr · corpus · report **전부** |
 | `ocr` | `src/ocr_worker/**`, `migrations/ai/**` | ocr |
 | `corpus` | `src/corpus_worker/**`, `migrations/corpus/**` | corpus |
 | `report` | `src/report_worker/**`, `src/rag/**`, `src/guardrail/**` | report |
-| `chatbot` | `src/chatbot/**`, `src/rag/**`, `src/guardrail/**` | chatbot |
 
-- 공용 코드(`src/core` 등)를 바꾸면 4개가 전부 재빌드된다.
+- 공용 코드(`src/core` 등)를 바꾸면 3개가 전부 재빌드된다.
 - 워크플로 파일(`.github/**`)만 바꾼 push는 어떤 필터에도 안 걸려 **deploy가 skip**된다.
 
 ### 코드 변경 없이 다시 올리기 (`workflow_dispatch`)
@@ -70,8 +68,8 @@ ECR을 새로 만들었거나 계정을 옮겼을 때처럼 **코드는 그대�
 paths-filter로는 아무것도 걸리지 않는다. 이때는 Actions → Deploy → Run workflow로 돌린다.
 
 ```bash
-gh workflow run deploy.yml --ref dev                      # 4개 전부
-gh workflow run deploy.yml --ref dev -f services=report,chatbot   # 골라서
+gh workflow run deploy.yml --ref dev                      # 3개 전부
+gh workflow run deploy.yml --ref dev -f services=report,corpus   # 골라서
 ```
 
 `services`를 비우면 전부 빌드한다. 테스트 게이트(`ci.yml`)는 수동 실행에서도 그대로 돈다.
@@ -135,7 +133,7 @@ docker image prune -f
 - NVIDIA 드라이버 + nvidia-container-toolkit, SSM Agent
 
 ### backend EC2 (`/home/ubuntu/backend/`)
-- `docker-compose.yml`(report·chatbot 서비스 포함) + `.env.dev` — **backend팀이 관리**
+- `docker-compose.yml`(report 서비스 포함) + `.env.dev` — **backend팀이 관리**
 - SSM Agent (메시지 큐는 **AWS SQS 관리형** — backend EC2에 브로커 없음)
 - 이 레포는 그 위에서 `pull/up`만 원격 실행한다.
 

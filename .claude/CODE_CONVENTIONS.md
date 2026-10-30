@@ -30,15 +30,15 @@
 - 순서는 Ruff(isort 규칙)가 정렬: 표준 라이브러리 → 서드파티 → 로컬.
 
 ## 6. 데이터 모델
-- **외부 경계**(SQS 메시지, WebSocket 메시지, API I/O)는 **pydantic v2 `BaseModel`**로 정의·검증한다. — 잘못된 페이로드를 진입점에서 거른다. 이 프로젝트는 Spring과의 계약(`core/contracts.py`)이 핵심이므로 필수.
+- **외부 경계**(SQS 메시지, API I/O)는 **pydantic v2 `BaseModel`**로 정의·검증한다. — 잘못된 페이로드를 진입점에서 거른다. 이 프로젝트는 Spring과의 계약(`core/contracts.py`)이 핵심이므로 필수.
 - **내부 순수 데이터**는 `@dataclass(slots=True)` 또는 pydantic 중 맥락에 맞게. 가변/검증 불필요하면 dataclass가 가볍다.
 - pydantic v2 API 사용(`model_validate`, `model_dump`). v1 메서드(`.dict()`, `.parse_obj()`) 금지.
 
 ## 7. 비동기 (async-first)
-- I/O 경로는 **async/await**로 작성한다 (`asyncpg`, FastAPI). — 워커·웹소켓이 다수 연결을 효율적으로 처리한다.
+- I/O 경로는 **async/await**로 작성한다 (`asyncpg`). — 워커가 다수 I/O를 효율적으로 처리한다.
 - **async 함수 안에서 블로킹 호출 금지**(동기 `requests`, 동기 DB 드라이버, `time.sleep`). 블로킹 라이브러리는 `asyncio.to_thread`로 격리한다 — `boto3`(SQS·S3)가 대표 사례: 동기 SDK라 수신·삭제·발행 호출을 전부 `asyncio.to_thread`로 뗀다(`core/sqs/*`).
 - 독립 I/O는 `asyncio.gather`로 병렬화한다 (예: tsvector 검색 + 벡터 검색 동시 실행).
-- 리소스는 `async with`로 수명 관리. 풀(asyncpg, redis)은 앱 시작 시 1회 생성·재사용한다.
+- 리소스는 `async with`로 수명 관리. 풀(asyncpg)은 앱 시작 시 1회 생성·재사용한다.
 
 ## 8. 에러 처리
 - **구체적 예외**만 잡는다. `except Exception:` 광범위 캐치 금지(최상위 워커 루프의 의도적 격리 제외, 이때도 로깅·재발행 필수).

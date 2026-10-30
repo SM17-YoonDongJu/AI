@@ -1,6 +1,6 @@
 # 보험·법률 AI 엔진 — LangGraph · DB 구조 통합 아키텍처 문서
 
-> 대상 코드: `src/report_worker` · `src/rag` · `src/guardrail` · `src/chatbot` · `src/core` · `migrations` · `tempVectorDB`
+> 대상 코드: `src/report_worker` · `src/rag` · `src/guardrail` · `src/core` · `migrations` · `tempVectorDB`
 > 최종 점검일: 2026-07-15 · 브랜치 `11-feature-langgraph-멀티에이전트-구현`
 > 이 문서 세트는 원본 코드와 직접 대조해 작성했고, 모든 file:line 참조는 위 브랜치 기준이다.
 > 각 섹션은 코드 정독 → 적대적 교차검증(코드 재대조)을 거쳐, 확인된 사실만 담았다.
@@ -26,28 +26,27 @@
 
 ---
 
-## 1. 시스템 한눈에 — LLM 소비 컴포넌트는 둘
+## 1. 시스템 한눈에 — LLM 소비 컴포넌트는 리포트 워커
 
-이 엔진에는 LLM(대형 언어 모델, 즉 사람 말로 묻고 답하는 AI)을 실제로 불러 쓰는 부분이 **두 개** 설계돼 있다. 그리고 그 아래에 세 컴포넌트가 함께 쓰는 공용 모듈(RAG·가드레일·ai_client)과, 모두가 딛고 서는 토대(core)가 깔려 있다.
+이 엔진에는 LLM(대형 언어 모델, 즉 사람 말로 묻고 답하는 AI)을 실제로 불러 쓰는 부분은 **리포트 워커** 하나다. 그리고 그 아래에 리포트 워커가 쓰는 공용 모듈(RAG·가드레일·ai_client)과, 모두가 딛고 서는 토대(core)가 깔려 있다.
 
 | 컴포넌트 | 통신 | 오케스트레이션 | 구현 현황 |
 |----------|------|-----------------|-----------|
 | **리포트 워커(05)** | Kafka `report-job` 소비 | **LangGraph** StateGraph (14노드·3분기) | ✅ **구현됨** |
-| **챗봇(12)** | FastAPI WebSocket 직결·비스트리밍 | 단순 4단계 순차 조립(계획) | ⚠️ **미구현(스펙 단계)** — `__init__.py` 도크스트링 1줄뿐 |
-| RAG(04) — `src/rag` | 함수 호출(공용) | — | ✅ 구현됨 (리포트·챗봇 공유) |
+| RAG(04) — `src/rag` | 함수 호출(공용) | — | ✅ 구현됨 (리포트에서 사용) |
 | 가드레일(06) — `src/guardrail` | 함수 호출(공용) | — | ✅ 결정론 파트 구현 / ⚠️ NER·인용강제·환각치환 미구현 |
 | core — `src/core` | — | — | ✅ 구현됨 (config·contracts·kafka·db·ai_client·logging) |
 
 > 표 읽는 법: 왼쪽이 "어떤 부품인지", 가운데 둘이 "어떻게 말을 주고받고 어떻게 지휘되는지", 맨 오른쪽이 "지금 진짜로 돌아가는지(✅) 아직 계획뿐인지(⚠️)"다.
 >
-> 참고로 **Kafka**는 부품끼리 쪽지를 주고받는 우체통(메시지 대기줄), **WebSocket**은 브라우저와 서버가 전화선처럼 계속 연결돼 있는 통로, **비스트리밍**은 답을 한 글자씩 흘리지 않고 완성된 문장 한 방에 돌려주는 방식, **StateGraph**는 위에서 말한 "작업 순서도"다.
+> 참고로 **Kafka**는 부품끼리 쪽지를 주고받는 우체통(메시지 대기줄), **비스트리밍**은 답을 한 글자씩 흘리지 않고 완성된 문장 한 방에 돌려주는 방식, **StateGraph**는 위에서 말한 "작업 순서도"다.
 
-> **"우리 랭그래프"의 실체는 리포트 워커의 그래프 하나다.** 챗봇은 LangGraph를 쓰지 않고(문서상 단순 4단계 순차 파이프라인) 아직 코드가 없다. 그래서 이 문서의 LangGraph 심층은 전부 리포트 워커 기준이고, 챗봇은 계획·현황으로 별도 정리했다([chatbot.md](./chatbot.md)).
+> **"우리 랭그래프"의 실체는 리포트 워커의 그래프 하나다.** 이 문서의 LangGraph 심층은 전부 리포트 워커 기준이다.
 
 ### 아키텍처 배치 (CLAUDE.md 확정 사항)
 
 ```
-Frontend ──REST/WS──┐
+Frontend ──REST─────┐
                     ▼
              Spring Boot 게이트웨이 (업로드·JWT·S3·Kafka 발행) ── 별도 범위(Python 아님)
                     │  Kafka
@@ -57,11 +56,9 @@ Frontend ──REST/WS──┐
         │                          │  함수호출
         └──► ocr_results(DB)       ├──► RAG(04, src/rag) ──► policy/case/schedule_chunks(pgvector)
                                    └──► Guardrail(06, src/guardrail) ──► ai_client ──HTTP──► Ollama(EXAONE·qwen3)
-
-   Chatbot(12) ──WS 직결(ALB /ws/chat)──► [미구현] ──► 같은 RAG·Guardrail·ai_client를 함수호출로 조립 예정
 ```
 
-> 쉽게 말하면: 사용자가 파일을 올리면 **Spring Boot 게이트웨이**(현관·경비실 역할, 로그인·파일보관·쪽지 발행 담당이며 이 저장소 밖의 Java 코드)가 접수한다. 게이트웨이는 우체통(Kafka)에 작업 쪽지를 넣고, **OCR 워커**(사진 속 글자를 텍스트로 읽어내는 부품)가 먼저 읽어 그 결과를 DB에 남긴다. 이어 **리포트 워커**가 쪽지를 받아 보고서를 만드는데, 이때 사서(RAG)와 문지기(가드레일)를 불러 쓰고, 그 둘은 다시 **ai_client**를 통해 로컬 AI 서버 **Ollama**(모델 EXAONE·qwen3)에 HTTP로 질문을 던진다. 챗봇은 같은 재료를 쓸 예정이지만 아직 빈칸이다.
+> 쉽게 말하면: 사용자가 파일을 올리면 **Spring Boot 게이트웨이**(현관·경비실 역할, 로그인·파일보관·쪽지 발행 담당이며 이 저장소 밖의 Java 코드)가 접수한다. 게이트웨이는 우체통(Kafka)에 작업 쪽지를 넣고, **OCR 워커**(사진 속 글자를 텍스트로 읽어내는 부품)가 먼저 읽어 그 결과를 DB에 남긴다. 이어 **리포트 워커**가 쪽지를 받아 보고서를 만드는데, 이때 사서(RAG)와 문지기(가드레일)를 불러 쓰고, 그 둘은 다시 **ai_client**를 통해 로컬 AI 서버 **Ollama**(모델 EXAONE·qwen3)에 HTTP로 질문을 던진다.
 
 ---
 
@@ -117,7 +114,6 @@ report_drafts (UPSERT) · reports (UPDATE status=AWAITING_ADOPTION) · report_is
 | [rag.md](./rag.md) | **자료 참조(검색)** | 라우터→오타보정→tsvector∥pgvector→RRF→인용역추적, 버전 필터(반열림 구간), namespace↔테이블, 입출력 계약 |
 | [guardrail.md](./guardrail.md) | **안전장치** | 입력(PII 마스킹·도메인차단)/생성(단정금액 치환)/출력(고지문·LLM Judge) 3단계, report_worker 연동, 구현 현황 정직 판별 |
 | [ocr.md](./ocr.md) | **OCR 워커(02, 미구현)** | 업로드 서류를 글자로 바꾸는 단계. 현재 스펙만 존재. OcrJob/DocType 계약, 데이터 흐름 10단계, 보존·삭제 정책 |
-| [chatbot.md](./chatbot.md) | **챗봇(12, 계획·현황)** | 미구현 현황, 계획된 WS 아키텍처·세션(Redis 24h·PG 90일)·이벤트 스키마, 리포트와의 차이 |
 | [core.md](./core.md) | **동작 배관** | ai_client(비스트리밍·1024d 강제)·config·db(asyncpg 풀)·kafka(at-least-once·DLQ)·logging |
 
 > 표 읽는 법: 궁금한 게 "AI 작업 순서"면 langgraph, "데이터가 어디 저장되나"면 database, "자료를 어떻게 찾아오나"면 rag로 가면 된다. 낯선 용어는 언제든 [glossary.md](./glossary.md)에서 찾을 수 있다.
@@ -184,13 +180,12 @@ report_drafts (UPSERT) · reports (UPDATE status=AWAITING_ADOPTION) · report_is
 - ✅ **RAG**: 라우터·trigram 오타보정·tsvector·pgvector·RRF·버전필터·인용역추적 실동작. `medical` namespace만 미구현.
 - ✅ **core 배관**: config·kafka(at-least-once·DLQ·우아한종료)·db(asyncpg 풀·pgvector 등록)·ai_client(비스트리밍·1024d 강제)·logging 실동작.
 - ⚠️ **가드레일**: 결정론 파트(PII 정규식 마스킹·단정금액 치환·고지문·LLM Judge 호출)는 실동작. **문서가 약속한 NER PII·인용 강제 검증·환각 섹션 자동삭제는 미구현.** LLM Judge는 "탐지는 하되 조치는 안 하는" 관찰 전용.
-- ⚠️ **챗봇**: **본체 미구현.** `app.py`·WS 핸들러·세션·JWT·Redis·PG 연동 없음. WS 계약 모델(`ChatClientMessage`/`ChatServerMessage`)도 코드에 미정의. 조립 재료(RAG·가드레일·ai_client)는 준비돼 있어 구현은 "조립" 작업.
 - 📌 **DB 소유권**: Python 마이그레이션은 RAG 벡터 4테이블만 소유. 업무 7테이블(`reports` 등)은 Spring 소유이며 리포트 워커는 읽기/UPDATE만. `tempVectorDB/init`은 실험용 로컬 복제본이고 물리 FK가 없다.
 - 📌 **알려진 계약 갭**: `reports.status='BLOCKED'`는 워커가 신설한 값으로 Spring status enum과 아직 미정렬(TODO).
 
 > 용어 도우미: **trigram**(글자 3개씩 잘라 비교해 오타를 잡아내는 방식), **pgvector**(PostgreSQL에서 임베딩 좌표로 비슷한 문장을 찾게 해주는 확장), **at-least-once**("최소 한 번은 반드시 처리 — 대신 드물게 중복될 수 있음"), **asyncpg 풀**(DB 연결을 미리 여러 개 뚫어 재사용하는 대기줄), **NER**(문장에서 사람 이름·주민번호 같은 개체를 자동으로 집어내는 기술), **PII**(개인식별정보), **LLM Judge**(다른 AI의 답이 근거에 맞는지 채점하는 심판 AI), **JWT**(로그인 신분증 토큰), **FK**(테이블 간 참조 무결성을 강제하는 외래키 제약), **enum**(미리 정해둔 값 목록)이다.
 >
-> 쉽게 말하면: 리포트 엔진과 그 배관·검색은 실제로 돌아간다. 반면 가드레일은 "규칙 기반으로 확실히 막는 부분"은 되지만 AI로 판단해야 하는 고급 방어(NER·인용 강제·환각 자동삭제)는 아직 안 붙었고, 심판 AI는 "잘못을 발견해도 지적만 하고 손은 대지 않는" 관찰자 상태다. 챗봇은 재료만 갖춰졌고 본체는 빈 접시다.
+> 쉽게 말하면: 리포트 엔진과 그 배관·검색은 실제로 돌아간다. 반면 가드레일은 "규칙 기반으로 확실히 막는 부분"은 되지만 AI로 판단해야 하는 고급 방어(NER·인용 강제·환각 자동삭제)는 아직 안 붙었고, 심판 AI는 "잘못을 발견해도 지적만 하고 손은 대지 않는" 관찰자 상태다.
 
 후유장해 계산의 알려진 버그(좌우 부위 미구분·검증 백스톱 헐거움 등)는 [../report-worker/known-issues.md](../report-worker/known-issues.md)에 우선순위와 함께 정리돼 있다.
 
@@ -199,7 +194,7 @@ report_drafts (UPSERT) · reports (UPDATE status=AWAITING_ADOPTION) · report_is
 ## 7. 이 문서의 근거·검증 방법
 
 - 각 서브시스템을 코드 정독으로 1차 작성한 뒤, **동일 파일을 재대조하는 적대적 교차검증**을 돌려 file:line·동작 주장을 확인했다(2026-07-15).
-- 검증에서 발견된 라인번호 오기·인용 출처 오류는 반영했다. "확인된 사실"만 남기고, 코드로 확인 못 한 부분(예: 챗봇 런타임, Docker 미기동 경로)은 정직하게 "미구현/미검증"으로 표기했다.
+- 검증에서 발견된 라인번호 오기·인용 출처 오류는 반영했다. "확인된 사실"만 남기고, 코드로 확인 못 한 부분(예: Docker 미기동 경로)은 정직하게 "미구현/미검증"으로 표기했다.
 - 통합 검증(RAG 실검색·E2E)은 `docker compose up -d` 후 `PYTHONPATH=src python scripts/battery.py`로 별도 수행이 필요하다(본 문서는 정적 코드 대조 범위).
 
 > 쉽게 말하면: 먼저 코드를 정독해 초안을 쓰고, 그다음 "일부러 트집 잡듯" 같은 코드를 다시 대조하며 줄 번호와 동작 설명이 맞는지 재확인했다(**적대적 교차검증**). 코드만 봐서는 확신할 수 없는 부분은 아는 척하지 않고 "미검증"으로 남겼다. 실제로 검색이 되는지, 처음부터 끝까지(**E2E**, end-to-end) 도는지까지 보려면 위 명령으로 컨테이너를 띄워 별도로 돌려봐야 한다 — 이 문서 자체는 실행 없이 코드를 대조한 범위까지다.

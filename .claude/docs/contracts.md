@@ -12,9 +12,8 @@
 | `ocr_worker` → DB | `ocr_results` 테이블 | [`ocr_results`](#3-ocr_results-db-교차-계약) |
 | `ocr_worker` → `report_worker` | Kafka `report-job` | [`ReportJob`](#2-reportjob) |
 | `report_worker` → DB | `report_drafts` 테이블 | [`report_drafts`](#4-report_drafts-db-교차-계약) |
-| Frontend ↔ `chatbot` | WebSocket / REST | [chatbot-events.md](chatbot-events.md) |
-| `report_worker`·`chatbot` → `rag` | Python 함수 호출 | [RAG 인터페이스](#5-rag-모듈-함수-인터페이스) |
-| `report_worker`·`chatbot` → `guardrail` | Python 함수 호출 | [가드레일 인터페이스](#6-가드레일-모듈-함수-인터페이스) |
+| `report_worker` → `rag` | Python 함수 호출 | [RAG 인터페이스](#5-rag-모듈-함수-인터페이스) |
+| `report_worker` → `guardrail` | Python 함수 호출 | [가드레일 인터페이스](#6-가드레일-모듈-함수-인터페이스) |
 | 전 워커 → `ai_client` | OpenAI 호환 HTTP | [ai_client 인터페이스](#7-ai_client-인터페이스) |
 
 공통 규약:
@@ -193,7 +192,7 @@
 ---
 
 ## 5. RAG 모듈 함수 인터페이스
-`src/rag` — `report_worker`·`chatbot`이 **함수 호출**. 순수 함수형(부수효과 없음).
+`src/rag` — `report_worker`가 **함수 호출**. 순수 함수형(부수효과 없음).
 
 ```python
 async def search(
@@ -225,7 +224,7 @@ class RagResult(BaseModel):
 ---
 
 ## 6. 가드레일 모듈 함수 인터페이스
-`src/guardrail` — 단계별 함수로 분리(호출자가 필요한 것만 조립). 리포트=3단계 전부, 챗봇=입력·생성·출력(LLM Judge 제외).
+`src/guardrail` — 단계별 함수로 분리(호출자가 필요한 것만 조립). 리포트=3단계 전부.
 
 ```python
 async def guard_input(text: str) -> InputGuardResult: ...
@@ -243,7 +242,7 @@ class OutputGuardResult(BaseModel):
     final_text: str          # 고지문 삽입됨
     judge_failures: list[str]  # 인용 검증 실패 섹션(리포트만, run_judge=True)
 ```
-- `run_judge`: 리포트=True(EXAONE/LLM Judge로 인용↔원문 검증), **챗봇=False**.
+- `run_judge`: 리포트=True(EXAONE/LLM Judge로 인용↔원문 검증).
 - PII 마스킹 규칙은 `ocr_worker` 입력단과 **동일 정의** 공유.
 
 ---
@@ -252,7 +251,7 @@ class OutputGuardResult(BaseModel):
 `src/core/ai_client.py` — OpenAI 호환(Ollama/vLLM/TEI). 모델·엔드포인트는 config 주입(모델 미정).
 
 ```python
-async def chat(messages: list[dict[str, str]], **opts) -> str: ...   # 챗봇은 비스트리밍
+async def chat(messages: list[dict[str, str]], **opts) -> str: ...   # 비스트리밍(완성 응답 1회)
 async def embed(text: str) -> list[float]: ...                       # len == 1024 보장
 ```
 

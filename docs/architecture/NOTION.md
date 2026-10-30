@@ -1,9 +1,9 @@
 <!-- Notion 붙여넣기용 합본. 개별 문서는 docs/architecture/*.md 참조. -->
-<!-- 순서: README + lifecycle + glossary + langgraph + database + rag + guardrail + ocr + chatbot + core -->
+<!-- 순서: README + lifecycle + glossary + langgraph + database + rag + guardrail + ocr + core -->
 
 # 보험·법률 AI 엔진 — LangGraph · DB 구조 통합 아키텍처 문서
 
-> 대상 코드: `src/report_worker` · `src/rag` · `src/guardrail` · `src/chatbot` · `src/core` · `migrations` · `tempVectorDB`
+> 대상 코드: `src/report_worker` · `src/rag` · `src/guardrail` · `src/core` · `migrations` · `tempVectorDB`
 > 최종 점검일: 2026-07-15 · 브랜치 `11-feature-langgraph-멀티에이전트-구현`
 > 이 문서 세트는 원본 코드와 직접 대조해 작성했고, 모든 file:line 참조는 위 브랜치 기준이다.
 > 각 섹션은 코드 정독 → 적대적 교차검증(코드 재대조)을 거쳐, 확인된 사실만 담았다.
@@ -29,28 +29,27 @@
 
 ---
 
-## 1. 시스템 한눈에 — LLM 소비 컴포넌트는 둘
+## 1. 시스템 한눈에 — LLM 소비 컴포넌트는 리포트 워커
 
-이 엔진에는 LLM(대형 언어 모델, 즉 사람 말로 묻고 답하는 AI)을 실제로 불러 쓰는 부분이 **두 개** 설계돼 있다. 그리고 그 아래에 세 컴포넌트가 함께 쓰는 공용 모듈(RAG·가드레일·ai_client)과, 모두가 딛고 서는 토대(core)가 깔려 있다.
+이 엔진에는 LLM(대형 언어 모델, 즉 사람 말로 묻고 답하는 AI)을 실제로 불러 쓰는 부분은 **리포트 워커** 하나다. 그리고 그 아래에 리포트 워커가 쓰는 공용 모듈(RAG·가드레일·ai_client)과, 모두가 딛고 서는 토대(core)가 깔려 있다.
 
 | 컴포넌트 | 통신 | 오케스트레이션 | 구현 현황 |
 |----------|------|-----------------|-----------|
 | **리포트 워커(05)** | Kafka `report-job` 소비 | **LangGraph** StateGraph (14노드·3분기) | ✅ **구현됨** |
-| **챗봇(12)** | FastAPI WebSocket 직결·비스트리밍 | 단순 4단계 순차 조립(계획) | ⚠️ **미구현(스펙 단계)** — `__init__.py` 도크스트링 1줄뿐 |
-| RAG(04) — `src/rag` | 함수 호출(공용) | — | ✅ 구현됨 (리포트·챗봇 공유) |
+| RAG(04) — `src/rag` | 함수 호출(공용) | — | ✅ 구현됨 (리포트에서 사용) |
 | 가드레일(06) — `src/guardrail` | 함수 호출(공용) | — | ✅ 결정론 파트 구현 / ⚠️ NER·인용강제·환각치환 미구현 |
 | core — `src/core` | — | — | ✅ 구현됨 (config·contracts·kafka·db·ai_client·logging) |
 
 > 표 읽는 법: 왼쪽이 "어떤 부품인지", 가운데 둘이 "어떻게 말을 주고받고 어떻게 지휘되는지", 맨 오른쪽이 "지금 진짜로 돌아가는지(✅) 아직 계획뿐인지(⚠️)"다.
 >
-> 참고로 **Kafka**는 부품끼리 쪽지를 주고받는 우체통(메시지 대기줄), **WebSocket**은 브라우저와 서버가 전화선처럼 계속 연결돼 있는 통로, **비스트리밍**은 답을 한 글자씩 흘리지 않고 완성된 문장 한 방에 돌려주는 방식, **StateGraph**는 위에서 말한 "작업 순서도"다.
+> 참고로 **Kafka**는 부품끼리 쪽지를 주고받는 우체통(메시지 대기줄), **비스트리밍**은 답을 한 글자씩 흘리지 않고 완성된 문장 한 방에 돌려주는 방식, **StateGraph**는 위에서 말한 "작업 순서도"다.
 
-> **"우리 랭그래프"의 실체는 리포트 워커의 그래프 하나다.** 챗봇은 LangGraph를 쓰지 않고(문서상 단순 4단계 순차 파이프라인) 아직 코드가 없다. 그래서 이 문서의 LangGraph 심층은 전부 리포트 워커 기준이고, 챗봇은 계획·현황으로 별도 정리했다([chatbot.md](./chatbot.md)).
+> **"우리 랭그래프"의 실체는 리포트 워커의 그래프 하나다.** 이 문서의 LangGraph 심층은 전부 리포트 워커 기준이다.
 
 ### 아키텍처 배치 (CLAUDE.md 확정 사항)
 
 ```
-Frontend ──REST/WS──┐
+Frontend ──REST─────┐
                     ▼
              Spring Boot 게이트웨이 (업로드·JWT·S3·Kafka 발행) ── 별도 범위(Python 아님)
                     │  Kafka
@@ -60,11 +59,9 @@ Frontend ──REST/WS──┐
         │                          │  함수호출
         └──► ocr_results(DB)       ├──► RAG(04, src/rag) ──► policy/case/schedule_chunks(pgvector)
                                    └──► Guardrail(06, src/guardrail) ──► ai_client ──HTTP──► Ollama(EXAONE·qwen3)
-
-   Chatbot(12) ──WS 직결(ALB /ws/chat)──► [미구현] ──► 같은 RAG·Guardrail·ai_client를 함수호출로 조립 예정
 ```
 
-> 쉽게 말하면: 사용자가 파일을 올리면 **Spring Boot 게이트웨이**(현관·경비실 역할, 로그인·파일보관·쪽지 발행 담당이며 이 저장소 밖의 Java 코드)가 접수한다. 게이트웨이는 우체통(Kafka)에 작업 쪽지를 넣고, **OCR 워커**(사진 속 글자를 텍스트로 읽어내는 부품)가 먼저 읽어 그 결과를 DB에 남긴다. 이어 **리포트 워커**가 쪽지를 받아 보고서를 만드는데, 이때 사서(RAG)와 문지기(가드레일)를 불러 쓰고, 그 둘은 다시 **ai_client**를 통해 로컬 AI 서버 **Ollama**(모델 EXAONE·qwen3)에 HTTP로 질문을 던진다. 챗봇은 같은 재료를 쓸 예정이지만 아직 빈칸이다.
+> 쉽게 말하면: 사용자가 파일을 올리면 **Spring Boot 게이트웨이**(현관·경비실 역할, 로그인·파일보관·쪽지 발행 담당이며 이 저장소 밖의 Java 코드)가 접수한다. 게이트웨이는 우체통(Kafka)에 작업 쪽지를 넣고, **OCR 워커**(사진 속 글자를 텍스트로 읽어내는 부품)가 먼저 읽어 그 결과를 DB에 남긴다. 이어 **리포트 워커**가 쪽지를 받아 보고서를 만드는데, 이때 사서(RAG)와 문지기(가드레일)를 불러 쓰고, 그 둘은 다시 **ai_client**를 통해 로컬 AI 서버 **Ollama**(모델 EXAONE·qwen3)에 HTTP로 질문을 던진다.
 
 ---
 
@@ -120,7 +117,6 @@ report_drafts (UPSERT) · reports (UPDATE status=AWAITING_ADOPTION) · report_is
 | [rag.md](./rag.md) | **자료 참조(검색)** | 라우터→오타보정→tsvector∥pgvector→RRF→인용역추적, 버전 필터(반열림 구간), namespace↔테이블, 입출력 계약 |
 | [guardrail.md](./guardrail.md) | **안전장치** | 입력(PII 마스킹·도메인차단)/생성(단정금액 치환)/출력(고지문·LLM Judge) 3단계, report_worker 연동, 구현 현황 정직 판별 |
 | [ocr.md](./ocr.md) | **OCR 워커(02, 미구현)** | 업로드 서류를 글자로 바꾸는 단계. 현재 스펙만 존재. OcrJob/DocType 계약, 데이터 흐름 10단계, 보존·삭제 정책 |
-| [chatbot.md](./chatbot.md) | **챗봇(12, 계획·현황)** | 미구현 현황, 계획된 WS 아키텍처·세션(Redis 24h·PG 90일)·이벤트 스키마, 리포트와의 차이 |
 | [core.md](./core.md) | **동작 배관** | ai_client(비스트리밍·1024d 강제)·config·db(asyncpg 풀)·kafka(at-least-once·DLQ)·logging |
 
 > 표 읽는 법: 궁금한 게 "AI 작업 순서"면 langgraph, "데이터가 어디 저장되나"면 database, "자료를 어떻게 찾아오나"면 rag로 가면 된다. 낯선 용어는 언제든 [glossary.md](./glossary.md)에서 찾을 수 있다.
@@ -187,13 +183,12 @@ report_drafts (UPSERT) · reports (UPDATE status=AWAITING_ADOPTION) · report_is
 - ✅ **RAG**: 라우터·trigram 오타보정·tsvector·pgvector·RRF·버전필터·인용역추적 실동작. `medical` namespace만 미구현.
 - ✅ **core 배관**: config·kafka(at-least-once·DLQ·우아한종료)·db(asyncpg 풀·pgvector 등록)·ai_client(비스트리밍·1024d 강제)·logging 실동작.
 - ⚠️ **가드레일**: 결정론 파트(PII 정규식 마스킹·단정금액 치환·고지문·LLM Judge 호출)는 실동작. **문서가 약속한 NER PII·인용 강제 검증·환각 섹션 자동삭제는 미구현.** LLM Judge는 "탐지는 하되 조치는 안 하는" 관찰 전용.
-- ⚠️ **챗봇**: **본체 미구현.** `app.py`·WS 핸들러·세션·JWT·Redis·PG 연동 없음. WS 계약 모델(`ChatClientMessage`/`ChatServerMessage`)도 코드에 미정의. 조립 재료(RAG·가드레일·ai_client)는 준비돼 있어 구현은 "조립" 작업.
 - 📌 **DB 소유권**: Python 마이그레이션은 RAG 벡터 4테이블만 소유. 업무 7테이블(`reports` 등)은 Spring 소유이며 리포트 워커는 읽기/UPDATE만. `tempVectorDB/init`은 실험용 로컬 복제본이고 물리 FK가 없다.
 - 📌 **알려진 계약 갭**: `reports.status='BLOCKED'`는 워커가 신설한 값으로 Spring status enum과 아직 미정렬(TODO).
 
 > 용어 도우미: **trigram**(글자 3개씩 잘라 비교해 오타를 잡아내는 방식), **pgvector**(PostgreSQL에서 임베딩 좌표로 비슷한 문장을 찾게 해주는 확장), **at-least-once**("최소 한 번은 반드시 처리 — 대신 드물게 중복될 수 있음"), **asyncpg 풀**(DB 연결을 미리 여러 개 뚫어 재사용하는 대기줄), **NER**(문장에서 사람 이름·주민번호 같은 개체를 자동으로 집어내는 기술), **PII**(개인식별정보), **LLM Judge**(다른 AI의 답이 근거에 맞는지 채점하는 심판 AI), **JWT**(로그인 신분증 토큰), **FK**(테이블 간 참조 무결성을 강제하는 외래키 제약), **enum**(미리 정해둔 값 목록)이다.
 >
-> 쉽게 말하면: 리포트 엔진과 그 배관·검색은 실제로 돌아간다. 반면 가드레일은 "규칙 기반으로 확실히 막는 부분"은 되지만 AI로 판단해야 하는 고급 방어(NER·인용 강제·환각 자동삭제)는 아직 안 붙었고, 심판 AI는 "잘못을 발견해도 지적만 하고 손은 대지 않는" 관찰자 상태다. 챗봇은 재료만 갖춰졌고 본체는 빈 접시다.
+> 쉽게 말하면: 리포트 엔진과 그 배관·검색은 실제로 돌아간다. 반면 가드레일은 "규칙 기반으로 확실히 막는 부분"은 되지만 AI로 판단해야 하는 고급 방어(NER·인용 강제·환각 자동삭제)는 아직 안 붙었고, 심판 AI는 "잘못을 발견해도 지적만 하고 손은 대지 않는" 관찰자 상태다.
 
 후유장해 계산의 알려진 버그(좌우 부위 미구분·검증 백스톱 헐거움 등)는 [../report-worker/known-issues.md](../report-worker/known-issues.md)에 우선순위와 함께 정리돼 있다.
 
@@ -202,7 +197,7 @@ report_drafts (UPSERT) · reports (UPDATE status=AWAITING_ADOPTION) · report_is
 ## 7. 이 문서의 근거·검증 방법
 
 - 각 서브시스템을 코드 정독으로 1차 작성한 뒤, **동일 파일을 재대조하는 적대적 교차검증**을 돌려 file:line·동작 주장을 확인했다(2026-07-15).
-- 검증에서 발견된 라인번호 오기·인용 출처 오류는 반영했다. "확인된 사실"만 남기고, 코드로 확인 못 한 부분(예: 챗봇 런타임, Docker 미기동 경로)은 정직하게 "미구현/미검증"으로 표기했다.
+- 검증에서 발견된 라인번호 오기·인용 출처 오류는 반영했다. "확인된 사실"만 남기고, 코드로 확인 못 한 부분(예: Docker 미기동 경로)은 정직하게 "미구현/미검증"으로 표기했다.
 - 통합 검증(RAG 실검색·E2E)은 `docker compose up -d` 후 `PYTHONPATH=src python scripts/battery.py`로 별도 수행이 필요하다(본 문서는 정적 코드 대조 범위).
 
 > 쉽게 말하면: 먼저 코드를 정독해 초안을 쓰고, 그다음 "일부러 트집 잡듯" 같은 코드를 다시 대조하며 줄 번호와 동작 설명이 맞는지 재확인했다(**적대적 교차검증**). 코드만 봐서는 확신할 수 없는 부분은 아는 척하지 않고 "미검증"으로 남겼다. 실제로 검색이 되는지, 처음부터 끝까지(**E2E**, end-to-end) 도는지까지 보려면 위 명령으로 컨테이너를 띄워 별도로 돌려봐야 한다 — 이 문서 자체는 실행 없이 코드를 대조한 범위까지다.
@@ -245,7 +240,6 @@ report_drafts (UPSERT) · reports (UPDATE status=AWAITING_ADOPTION) · report_is
 | **공용 모듈 — 가드레일(06)** | 개인정보 마스킹·단정 금액 치환·고지문 삽입 등 안전장치 | ⚠️ 결정론 파트만 구현 (NER·인용강제·환각치환 미구현) |
 | **공용 모듈 — ai_client(core)** | Ollama EXAONE(GPU 노드)를 HTTP로 호출하는 LLM 창구. 비스트리밍 | ✅ 구현됨 |
 | **DB** (PostgreSQL) | 모든 상태와 결과를 담는 창고. RAG 벡터 4테이블 + 업무 7테이블 | ✅ 구현됨 |
-| **챗봇(12)** | 사용자와 실시간으로 대화하는 상담원(WebSocket 직결) | ⚠️ **미구현(스펙 단계)** |
 | **손해사정사** | AI 초안을 검수하고 최종 서명하는 사람 전문가 | 사람 |
 
 > 표 읽는 법: "별도 범위"는 이 Python 엔진 밖(Spring/프론트)이라는 뜻이고, "미구현(스펙 단계)"은 문서·골격만 있고 실행 코드가 아직 없다는 뜻이다. 초록 체크(✅)만 지금 실제로 돈다.
@@ -468,9 +462,7 @@ _HARD_FAILURE_PREFIXES = ("load_context_failed", "persist_failed", "ocr_result_m
 | **core 배관** | ✅ 구현됨 | config·kafka(at-least-once·DLQ·우아한 종료)·db(asyncpg 풀)·ai_client(비스트리밍·1024d 강제)·logging |
 | **가드레일(06)** | ⚠️ 부분 | PII 정규식 마스킹·단정금액 치환·고지문·LLM Judge 호출은 동작. **NER PII·인용 강제·환각 섹션 자동삭제는 미구현.** LLM Judge는 관찰 전용 |
 | **OCR 워커(02)** | ⚠️ 미구현(스펙) | PaddleOCR·문서분류·엔티티추출·PII 마스킹은 설계만. `ocr_results`를 채우는 실행 코드 없음 |
-| **챗봇(12)** | ⚠️ 미구현(스펙) | `app.py`·WS 핸들러·세션·JWT·Redis·PG 연동 없음. WS 계약 모델(`ChatClientMessage`/`ChatServerMessage`)도 `core/contracts.py`에 미정의 |
 
-> 챗봇은 이 생애주기(업로드→리포트)와는 **별개의 실시간 상담 창구**다. 사용자가 "교통사고 후유장해 보상 받을 수 있나요?"를 물으면 입력 가드레일 → RAG 검색 → LLM 생성(완성) → 출력 가드레일의 4단계로 답을 1회 돌려주는 설계다(비스트리밍). 조립 재료(RAG·가드레일·ai_client)는 이미 있으므로, 챗봇 구현은 이들을 FastAPI WebSocket 위에서 순서대로 부르는 "조립" 작업으로 수렴한다. 리포트 워커와 달리 챗봇은 출력 가드레일을 `run_judge=False`로 불러 LLM Judge를 건너뛴다(온라인 대화 지연을 낮추려고).
 
 ---
 
@@ -508,14 +500,14 @@ _HARD_FAILURE_PREFIXES = ("load_context_failed", "persist_failed", "ocr_result_m
 
 ## 7. 한 문장으로 되짚기
 
-진단서 사진 한 장은 → S3 금고와 Kafka 주문표를 거쳐 → OCR로 **마스킹 텍스트**가 되고 → 리포트 워커의 14노드를 지나며 **약관·판례·장해분류표 근거를 붙인 리포트 초안**으로 자라난 뒤 → 손해사정사의 **서명**으로 확정되고 → 그 순간 개인정보 원본은 지워진다. 지금 실제로 도는 건 리포트 워커·RAG·가드레일(결정론 파트)·core이고, OCR 워커와 챗봇은 아직 스펙 단계다.
+진단서 사진 한 장은 → S3 금고와 Kafka 주문표를 거쳐 → OCR로 **마스킹 텍스트**가 되고 → 리포트 워커의 14노드를 지나며 **약관·판례·장해분류표 근거를 붙인 리포트 초안**으로 자라난 뒤 → 손해사정사의 **서명**으로 확정되고 → 그 순간 개인정보 원본은 지워진다. 지금 실제로 도는 건 리포트 워커·RAG·가드레일(결정론 파트)·core이고, OCR 워커는 아직 스펙 단계다.
 
 ---
 
 # 용어 사전 (Glossary) — 비전문가를 위한 쉬운 풀이
 
 > 출처: AI 엔진 아키텍처 문서 세트 · 최종 점검일 2026-07-15 · 브랜치 `11-feature-langgraph-멀티에이전트-구현`
-> 상위: [README](./README.md) · rag.md·database.md·core.md·langgraph.md(+guardrail.md·chatbot.md)의 용어를 쉬운 말로 풀어 정리
+> 상위: [README](./README.md) · rag.md·database.md·core.md·langgraph.md(+guardrail.md)의 용어를 쉬운 말로 풀어 정리
 
 ## 🎯 한 문장 요약
 
@@ -632,7 +624,7 @@ _HARD_FAILURE_PREFIXES = ("load_context_failed", "persist_failed", "ocr_result_m
 | **NER** (Named Entity Recognition, 개체명 인식) | AI가 문장에서 **이름·주소 같은 개체를 알아내는** 기술. 정규식으로 못 잡는 비정형 PII(사람 이름 등)를 잡으려는 용도지만, **🚧 이 프로젝트에선 아직 미구현**(현재는 정규식만 동작)이다. → guardrail.md |
 | **가드레일** (guardrail) | AI가 **위험하거나 부정확한 결과를 내지 않게 막는 안전장치**. 입력(PII 마스킹·주제 이탈 차단)·생성(단정 금액을 범위 표현으로)·출력(고지문 삽입·인용 검증) 3단계로 되어 있다. 도로 옆 가드레일처럼 벗어나지 않게 잡아준다. |
 | **고지문** (disclaimer) | 리포트 맨 앞에 넣는 **법적 안내 문구**. "정확한 보험금 지급 여부는 담당 손해사정사의 검토 후 확정됩니다" 같은 문장으로, AI 결과가 확정이 아님을 알린다. 이미 있으면 중복으로 넣지 않는다(멱등). |
-| **JWT (RS256)** | **로그인 상태를 증명하는 디지털 출입증**(JSON Web Token). RS256은 그 출입증에 **위조 방지 서명**을 하는 방식이다. 챗봇이 연결될 때 이 토큰을 검사해 정당한 사용자만 받고, 무효면 거부(`4401`)한다. → chatbot.md(계획 단계) |
+| **JWT (RS256)** | **로그인 상태를 증명하는 디지털 출입증**(JSON Web Token). RS256은 그 출입증에 **위조 방지 서명**을 하는 방식이다. |
 | **SSE-S3** (Server-Side Encryption with S3-Managed Keys) | AWS S3가 파일을 저장할 때 **자동으로 암호화**해 주는 기능(열쇠 관리도 S3가 대신). 창고에 물건을 넣으면 알아서 자물쇠를 채워주는 것과 같다. 이 프로젝트에서 파일 저장(S3)은 Spring Boot 게이트웨이가 담당한다. |
 
 ---
@@ -670,16 +662,13 @@ _HARD_FAILURE_PREFIXES = ("load_context_failed", "persist_failed", "ocr_result_m
 | 용어 | 쉬운 설명 |
 |------|-----------|
 | **Spring Boot 게이트웨이** | 프런트엔드와 처음 만나는 **정문 서버**(자바 기반). 파일 업로드·로그인(JWT)·S3 저장·Kafka로 일감 발행을 맡는다. 이 Python AI 엔진과는 **별도 범위**로, 여기선 손대지 않는다. |
-| **FastAPI** | 파이썬으로 **웹 API·WebSocket 서버를 빠르게** 만드는 프레임워크. 챗봇이 이걸로 실시간 연결을 받도록 설계돼 있다(**🚧 본체는 아직 미구현**). |
-| **WebSocket** | 서버와 클라이언트가 **연결을 계속 열어두고 양방향으로 주고받는** 통신. 매번 새로 문을 두드리는 대신 전화선을 계속 연결해 두는 것과 같다. 챗봇 대화에 쓸 예정이다. |
-| **Redis** (레디스) | 데이터를 **메모리에 두어 아주 빠르게 읽고 쓰는** 저장소. 챗봇 세션(만료 24시간)과 최근 대화 요약 캐시를 여러 서버(Pod)가 공유하는 데 쓸 계획이다. 접수처의 빠른 메모판이라고 보면 된다. |
 | **AWS S3** | 아마존의 **파일 보관 창고**(객체 스토리지). 약관 PDF·표 파일 등을 넣어두고 열쇠(key)로 꺼낸다. 저장·발급은 Spring Boot가 담당한다. |
-| **ALB** (Application Load Balancer) | 들어오는 요청을 **여러 서버에 나눠 보내주는 교통정리 장치**(아마존 로드밸런서). 챗봇의 `/ws/chat` 경로 요청을 FastAPI로 라우팅한다. |
-| **GPU 노드** | **AI 모델 계산을 담당하는 고성능(그래픽카드 탑재) 서버**. LLM·임베딩처럼 무거운 연산은 여기서 돌린다. 챗봇 서버 자체는 GPU가 필요 없는 일반 노드에 두고, 계산만 GPU 노드에 HTTP로 맡긴다. |
+| **ALB** (Application Load Balancer) | 들어오는 요청을 **여러 서버에 나눠 보내주는 교통정리 장치**(아마존 로드밸런서). 외부 요청을 대상 서버로 라우팅한다. |
+| **GPU 노드** | **AI 모델 계산을 담당하는 고성능(그래픽카드 탑재) 서버**. LLM·임베딩처럼 무거운 연산은 여기서 돌린다. |
 
 ---
 
-> 참고: **🚧 미구현** 표시(챗봇 본체, NER PII, 인용 강제 검증, 환각 섹션 자동삭제, `medical` namespace 등)는 문서에 설계는 있으나 코드로는 아직 없는 부분입니다. 실제 동작 여부는 rag.md·core.md·guardrail.md·langgraph.md의 "정직 표기" 절을 함께 확인하세요.
+> 참고: **🚧 미구현** 표시(NER PII, 인용 강제 검증, 환각 섹션 자동삭제, `medical` namespace 등)는 문서에 설계는 있으나 코드로는 아직 없는 부분입니다. 실제 동작 여부는 rag.md·core.md·guardrail.md·langgraph.md의 "정직 표기" 절을 함께 확인하세요.
 
 ---
 
@@ -2017,7 +2006,7 @@ UPDATE reports SET status = 'BLOCKED', updated_at = now() WHERE id = $1
 
 ---
 
-# 공용 Hybrid RAG 검색 파이프라인 (`src/rag` · report_worker·chatbot 공유)
+# 공용 Hybrid RAG 검색 파이프라인 (`src/rag` · report_worker 사용)
 
 > 출처: AI 엔진 아키텍처 문서 세트 · 최종 점검일 2026-07-15 · 브랜치 `11-feature-langgraph-멀티에이전트-구현`
 > 상위: [README](./README.md) · 원본 코드 정독 + 적대적 교차검증(코드 재대조) 완료
@@ -2032,7 +2021,7 @@ UPDATE reports SET status = 'BLOCKED', updated_at = now() WHERE id = $1
 
 두 방식이 각자 후보 목록을 뽑아 오면, 사서는 **양쪽에서 모두 위에 올라온 책일수록 높은 점수**를 주는 규칙(RRF)으로 순위를 정리한다. 마지막으로 손님에게 답을 줄 때 "이건 몇 조 몇 항에서 나온 내용입니다" 하고 **출처까지 콕 집어** 알려준다.
 
-여기서 중요한 점은, 이 사서(=`search()` 함수)는 **혼자 일하는 게 아니라 두 부서(리포트 워커·챗봇)가 똑같이 불러 쓰는 공용 직원**이라는 것이다. 그래서 입력과 출력이 명확하고, 데이터베이스 조회와 임베딩 계산 말고는 딴짓(부수효과)을 하지 않도록 깔끔하게 짜여 있다.
+여기서 중요한 점은, 이 사서(=`search()` 함수)는 **리포트 워커가 불러 쓰는 공용 직원**이라는 것이다. 그래서 입력과 출력이 명확하고, 데이터베이스 조회와 임베딩 계산 말고는 딴짓(부수효과)을 하지 않도록 깔끔하게 짜여 있다.
 
 ---
 
@@ -2042,7 +2031,7 @@ Hybrid RAG(키워드 검색과 의미 검색을 섞어 쓰는 검색 방식) 검
 
 > 쉽게 말하면: "순수 함수형"이란 같은 질문을 넣으면 언제나 같은 답이 나오고, 몰래 다른 곳의 값을 바꾸거나 하지 않는 깔끔한 함수라는 뜻이다.
 
-`report_worker`(리포트 생성 워커)와 `chatbot` 두 소비자가 동일한 함수 `search()`를 직접 호출해 공유한다. 패키지가 밖으로 열어 두는 창구(공개 표면)는 아주 좁게 통제된다.
+`report_worker`(리포트 생성 워커)가 함수 `search()`를 직접 호출해 사용한다. 패키지가 밖으로 열어 두는 창구(공개 표면)는 아주 좁게 통제된다.
 
 ```python
 # src/rag/__init__.py:7-9
@@ -2059,7 +2048,7 @@ __all__ = ["RagError", "search"]
 
 ```python
 # src/rag/search.py:3-5
-report_worker·chatbot이 함수 호출로 공유하는 단일 진입점 `search()`를 제공한다. 순수
+report_worker가 함수 호출로 사용하는 단일 진입점 `search()`를 제공한다. 순수
 함수형 인터페이스(in/out 명확, DB·임베딩 외 부수효과 없음)로, 호출자가 조립하기 쉽다.
 ```
 
@@ -3112,9 +3101,9 @@ class Citation(BaseModel):
 
 ## 1. 3단계 개요
 
-가드레일은 **독립 서비스가 아니라 공용 Python 모듈**이다. `report_worker`(05, Kafka 워커)와 `chatbot`(12, FastAPI)이 **함수 호출**로 공유하며, 모듈 자체는 Frontend·Spring Boot·Kafka와 직접 통신하지 않는다(`.claude/docs/06_guardrail.md:9`, `src/guardrail/README.md:3`). 개인정보보호·법적 안전성이 도메인 핵심 제약이라 반드시 거쳐야 하는 경로로 설계됐고, 단계별 함수로 잘게 쪼개 두어 호출하는 쪽이 필요한 것만 골라 조립한다(`README.md:3`).
+가드레일은 **독립 서비스가 아니라 공용 Python 모듈**이다. `report_worker`(05)가 **함수 호출**로 사용하며, 모듈 자체는 Frontend·Spring Boot·Kafka와 직접 통신하지 않는다(`.claude/docs/06_guardrail.md:9`, `src/guardrail/README.md:3`). 개인정보보호·법적 안전성이 도메인 핵심 제약이라 반드시 거쳐야 하는 경로로 설계됐고, 단계별 함수로 잘게 쪼개 두어 호출하는 쪽이 필요한 것만 골라 조립한다(`README.md:3`).
 
-> 쉽게 말하면: 가드레일은 "스스로 켜져 있는 서버"가 아니라 "필요할 때 꺼내 쓰는 앱 안의 부품"이다. 리포트 워커와 챗봇이라는 두 프로그램이 이 부품을 각자 가져다 쓴다. 부품이므로 카프카(메시지 우체통)나 스프링 같은 외부 시스템과 직접 대화하지 않는다.
+> 쉽게 말하면: 가드레일은 "스스로 켜져 있는 서버"가 아니라 "필요할 때 꺼내 쓰는 앱 안의 부품"이다. 리포트 워커가 이 부품을 가져다 쓴다. 부품이므로 카프카(메시지 우체통)나 스프링 같은 외부 시스템과 직접 대화하지 않는다.
 
 실제 구현은 `src/guardrail/guards.py` **단 하나의 파일(96줄)**에 3개 진입 함수로 담겨 있다. 모듈 상단 docstring(파일 맨 위에 붙는 설명문)이 3단계를 요약한다(`guards.py:1-9`):
 
@@ -3487,7 +3476,7 @@ async def output_guardrail(state: ReportState) -> dict[str, Any]:
 ```
 
 - 입력: `state["report"]`(바로 앞 `report_compose`가 만든 통합 Markdown, `agents.py:556-557`)와 `chunks=state["retrieved_clauses"]`(RAG가 채운 검색 조각, `state.py:32`).
-- `run_judge=True`로 고정 → **리포트 경로에서는 항상 심사관을 켠다**(챗봇은 이 노드를 쓰지 않으므로 LLM Judge 미적용, `06_guardrail.md:25`·`:41`, `README.md:11`).
+- `run_judge=True`로 고정 → **리포트 경로에서는 항상 심사관을 켠다**.
 - 결과로 `report`(고지문 붙은 최종본)와 `judge_failures`를 state에 합쳐 넣는다(`state.py:48`의 `judge_failures: list[str]` 칸).
 - 그래프 순서: `report_compose → output_guardrail → persist → END`(`graph.py:66-69`).
 
@@ -3554,7 +3543,6 @@ START → load_context → input_guardrail
 
 - 계좌번호 마스킹은 주석("연속 10자리 이상")과 실제 정규식(하이픈 3덩이)이 서로 맞지 않고(`guards.py:31-32`), 하이픈 없이 쭉 이어진 계좌 숫자열은 가려지지 않는다.
 - `reports.status = 'BLOCKED'`는 Spring status enum 계약에 아직 반영되지 않은 신설값이다(`agents.py:642-643` TODO).
-- 챗봇(12) 연동 코드는 이번 조사 범위(`report_worker`)에 들어 있지 않다. docs상 챗봇은 입력·생성·출력은 쓰되 LLM Judge만 빼는 것으로 설계됐지만(`06_guardrail.md:37-41`), 실제 챗봇 호출부는 본 문서가 다루는 파일에 포함되지 않아 확인할 수 없다.
 
 **총평:** 가드레일은 "3단계 뼈대 + 결정론 규칙(마스킹·치환·고지문) + LLM Judge 관찰"까지는 실제로 작동한다. 하지만 문서가 약속한 고급 기능(NER 기반 PII 탐지, 인용 강제 검증, 환각 섹션 자동 삭제)은 아직 프롬프트 지침에 머물거나 미구현으로 남아 있다.
 
@@ -3818,426 +3806,6 @@ RUN uv sync --no-dev --extra ocr
 
 ---
 
-# 12번 챗봇 — FastAPI WebSocket 직결·비스트리밍
-
-> 출처: AI 엔진 아키텍처 문서 세트 · 최종 점검일 2026-07-15 · 브랜치 `11-feature-langgraph-멀티에이전트-구현`
-> 상위: [README](./README.md) · 원본 코드 정독 + 적대적 교차검증(코드 재대조) 완료
-
-## 🎯 한 문장 요약
-사용자와 실시간 채팅으로 보험·법률 질문에 답하는 챗봇의 설계 문서이며, 배포 골격과 상세 스펙은 잡혀 있지만 **본체 코드는 아직 만들어지지 않은 "설계도" 단계**임을 정직하게 정리한 글이다.
-
-## 🌱 쉽게 말하면
-이 챗봇은 상담 창구 직원 같은 역할을 하려고 계획된 프로그램이다. 손님(사용자)이 채팅으로 질문하면, 관련 약관·판례를 찾아보고(RAG), 위험한 표현을 걸러낸 뒤(가드레일), AI가 답을 완성해서 한 번에 통째로 건네준다. 마치 편지를 조금씩 흘려보내지 않고 완성된 한 장을 봉투에 담아 전달하는 것과 같다(비스트리밍).
-
-그런데 중요한 반전이 있다. 이 상담 창구는 **간판(Dockerfile)과 안내 규칙(스펙 문서)은 다 준비됐지만, 정작 안에서 일할 직원(`app.py` 실행 코드)은 아직 출근하지 않은 상태**다. 다만 직원이 쓸 도구들(검색·필터·AI 호출 모듈)은 옆 팀(리포트 워커)이 이미 만들어 놨기 때문에, 나중에 직원이 오면 그 도구들을 순서대로 쓰기만 하면 되는 "조립" 작업만 남았다.
-
-> 쉽게 말하면: 재료(공용 모듈)는 다 있는데, 그 재료로 요리할 주방장(챗봇 본체)이 아직 없는 식당이다.
-
----
-
-## 1. 현재 구현 상태 — **미구현(스펙 단계)**
-
-`src/chatbot/` 디렉터리에는 **실행 코드가 존재하지 않는다.** 실제 파일 목록은 다음 3개(+`__pycache__`)뿐이다.
-
-```
-src/chatbot/Dockerfile
-src/chatbot/README.md
-src/chatbot/__init__.py
-```
-
-핵심 진입점으로 문서·Dockerfile이 참조하는 `app.py`(FastAPI 앱)는 **부재한다.** 즉 챗봇은 계약·배포 골격만 잡힌 **스펙 단계**이며, WebSocket(브라우저와 서버가 실시간 양방향으로 계속 이어진 대화 통로) 수락·세션·가드레일 조립 로직은 아직 한 줄도 구현되어 있지 않다.
-
-> 쉽게 말하면: 문패는 붙었지만 문을 열면 방이 비어 있는 상태다.
-
-### 1-1. `__init__.py` — 도크스트링 1줄뿐
-
-파일 전체가 모듈 도크스트링(파일 맨 위에 붙이는 설명용 문자열) 한 줄이다(`src/chatbot/__init__.py:1`).
-
-```python
-"""Chatbot (12) — FastAPI WebSocket 직결(비스트리밍). 범용 노드."""
-```
-
-클래스·함수·라우터·`app` 객체 등 실질 코드는 전혀 없다.
-
-### 1-2. `Dockerfile` — 진입점을 "구현 단계에서 추가"로 명시
-
-배포 골격(프로그램을 서버에 담아 실행하기 위한 컨테이너 설계도)은 존재하나, 실제로 켜질 때 실행할 시작점(엔트리포인트)이 아직 없음을 주석으로 **정직하게 표기**하고 있다(`src/chatbot/Dockerfile:19-20`).
-
-```dockerfile
-# 엔트리포인트(chatbot/app.py:app)는 구현 단계에서 추가.
-CMD ["uvicorn", "chatbot.app:app", "--host", "0.0.0.0", "--port", "8000"]
-```
-
-이 컨테이너를 지금 빌드·기동하면 `chatbot.app` 모듈이 없어 `uvicorn`(FastAPI 앱을 실제로 켜서 웹 요청을 받게 해 주는 실행기)이 임포트 에러로 즉시 실패한다(런타임 미검증).
-
-Dockerfile 자체는 완성형이다. 정리하면 이렇다.
-
-- 레포 루트를 빌드 컨텍스트로 `uv sync --no-dev --extra chatbot`(`Dockerfile:8`) — 챗봇에 필요한 패키지만 골라 설치한다.
-- `python:3.12-slim` 2-스테이지 — 가벼운 파이썬 이미지를 2단계로 나눠 빌드한다.
-- `PYTHONPATH=/app/src`(`Dockerfile:13`) — 파이썬이 소스 코드를 어디서 찾을지 알려준다.
-- `EXPOSE 8000`(`Dockerfile:17`) — 8000번 포트를 바깥에 연다.
-- GPU 불필요한 범용 노드용(`Dockerfile:1`) — 무거운 AI 계산은 다른 서버가 맡으므로, 이 컨테이너는 평범한 서버면 된다.
-
-### 1-3. 계약 모델(`ChatClientMessage`/`ChatServerMessage`)도 **코드에 미정의**
-
-README와 이벤트 명세는 WS(WebSocket) 입출력의 "코드 계약"(주고받을 메시지의 모양을 코드로 못 박아 둔 약속)으로 `core.contracts.ChatClientMessage` / `core.contracts.ChatServerMessage`를 지목한다(`src/chatbot/README.md:15-16`, `.claude/docs/chatbot-events.md:59,78`). 그러나 **실제 `src/core/contracts.py`에는 이 두 모델이 존재하지 않는다.** `__all__`(이 파일이 바깥에 공개하는 이름 목록)에도 없고(`src/core/contracts.py:19-31`), 파일 어디에도 `Chat`으로 시작하는 심볼이 없다.
-
-```python
-__all__ = [
-    "OCR_JOB_TOPIC",
-    "REPORT_JOB_TOPIC",
-    "Chunk",
-    "Citation",
-    "ContentType",
-    "DocType",
-    "InputGuardResult",
-    "OcrJob",
-    "OutputGuardResult",
-    "RagResult",
-    "ReportJob",
-]
-```
-
-정의된 계약은 OCR/리포트 Kafka 페이로드(`OcrJob`·`ReportJob`), RAG 결과(`Chunk`·`Citation`·`RagResult`), 가드레일 결과(`InputGuardResult`·`OutputGuardResult`)까지다. **챗봇 WS 메시지 계약은 문서상 약속만 존재하고 아직 코드화되지 않았다** — 구현 시 신설해야 할 항목이다.
-
-> 쉽게 말하면: "이런 형식으로 주고받자"는 계약서를 문서에는 써 놨는데, 정작 코드 안에 그 계약서가 아직 안 들어가 있다.
-
-### 1-4. 정리
-
-| 항목 | 문서/스펙 | 실제 코드 |
-|---|---|---|
-| `app.py`(FastAPI 앱·`app` 객체) | Dockerfile CMD가 참조 | **없음** |
-| `ChatClientMessage`/`ChatServerMessage` | README·events.md가 "코드 계약"으로 지목 | **`core/contracts.py`에 미정의** |
-| WS 수락·JWT·세션·가드레일 조립 | 상세 스펙 존재 | **없음** |
-| Dockerfile | 완성 | 존재(단, 진입점 없어 미기동) |
-| `__init__.py` | — | 도크스트링 1줄 |
-| 의존 공용 모듈(`rag`·`guardrail`·`ai_client`) | — | **구현되어 있음**(§5) |
-
-> 표 읽는 법: 왼쪽은 "문서엔 이렇게 계획됐다", 오른쪽은 "실제 코드는 이렇다". 굵게 표시된 **없음/미정의**가 아직 안 만들어진 부분이다.
-
-즉 **챗봇 본체는 미구현**이나, 그 조립 재료인 공용 모듈(RAG·가드레일·ai_client)은 이미 동작 코드로 존재한다. 챗봇 구현은 이들을 FastAPI WebSocket 핸들러에서 순서대로 호출하는 "조립" 작업이 된다.
-
----
-
-## 2. 계획된 아키텍처 (문서 기준)
-
-### 2-1. FastAPI WebSocket 직결
-
-ALB(AWS 로드밸런서, 들어오는 요청을 여러 서버에 나눠 보내는 교통정리 장치)의 `/ws/chat` 경로 라우팅으로 **FastAPI가 WebSocket을 직접 수락**한다(Spring Boot 게이트웨이 미경유). LLM(대형 언어 모델, 답변 문장을 생성하는 AI)은 별도 GPU 노드를 HTTP로 호출하므로 챗봇 자체는 GPU가 필요 없는 **범용 노드**에 배포한다(`src/chatbot/README.md:3`, `.claude/docs/12_chatbot.md:6,20-22`, `.claude/docs/chatbot-events.md:6`).
-
-> 쉽게 말하면: 무거운 AI 계산은 옆 건물(GPU 서버)에 전화로 맡기고, 챗봇 서버는 손님 응대와 심부름만 하니 값싼 일반 서버면 충분하다.
-
-문서가 규정한 처리 파이프라인은 **입력 가드레일 → RAG 검색 → LLM 생성(완성) → 출력 가드레일**의 4단계다(`src/chatbot/README.md:9`, `.claude/docs/12_chatbot.md:30-36`).
-
-`.claude/docs/12_chatbot.md:30-36`의 상세 순서:
-
-1. 입력 가드레일 — PII(개인식별정보, 주민번호·전화번호처럼 개인을 특정하는 정보) 마스킹, 도메인 외 질문 차단
-2. RAG 모듈(04번) — 쿼리에 적합한 namespace(검색 대상 묶음. 약관·판례·분쟁사례처럼 문서 종류별 구획) 선택, 약관·판례·분쟁사례 검색, 멀티턴 컨텍스트(앞선 여러 번의 대화 맥락) 구성
-3. AI 라우터(`ai_client`) — RAG 결과와 대화 이력을 컨텍스트로 Ollama EXAONE 응답 생성 (완성까지 대기, 비스트리밍)
-4. 출력 가드레일 — 단정표현 치환, 고지문 삽입
-5. 완성된 응답을 WebSocket 메시지로 1회 전달
-
-> 쉽게 말하면: (1) 질문에서 민감정보 지우고 엉뚱한 주제면 막고 → (2) 관련 자료 찾아오고 → (3) AI가 답 쓰고 → (4) 위험한 단정 표현을 부드럽게 바꾸고 안내문 붙여서 → (5) 완성본을 한 번에 건넨다.
-
-### 2-2. 비스트리밍(완성 응답 1회)
-
-문서의 최우선 전제는 **비스트리밍**(답을 토막토막 흘려보내지 않고 완성된 뒤 통째로 보냄)이다. LLM 완성 응답을 **1회** `message` 이벤트로 전달하며, 토큰 스트리밍이나 `stream`/`done` 청크가 **없다**(`.claude/docs/chatbot-events.md:7,90`, `src/chatbot/README.md:10`).
-
-> `.claude/docs/chatbot-events.md:90`: "비스트리밍이므로 `stream`(토큰 청크)·`done`(완료 신호) 이벤트는 **없다**. 클라이언트는 요청 후 `message` 또는 `error`를 1회 기다린다(처리 중엔 "입력 중..." 인디케이터 표시 권장)."
-
-이 비스트리밍 특성은 하부 `ai_client.chat()`이 애초에 `"stream": False`로 완성 응답만 받는 것과 정합적이다(`src/core/ai_client.py:86`, §5-3 참조).
-
-> 쉽게 말하면: ChatGPT처럼 글자가 또르르 흘러나오는 방식이 아니라, 답이 다 완성될 때까지 기다렸다가 한 덩어리로 받는다. 그래서 클라이언트 화면엔 그 동안 "입력 중..." 표시를 띄워 두면 좋다.
-
-### 2-3. 리포트 워커(Kafka)와의 차이
-
-같은 "LLM 소비 컴포넌트"지만 통신·전달 방식이 대비된다.
-
-| 구분 | 챗봇(12) | 리포트 워커(05) |
-|---|---|---|
-| 통신 방식 | FastAPI WebSocket **직결**(ALB `/ws/chat`) + REST(세션) | **Kafka** 토픽 소비/발행(`report-job`) |
-| 트리거 | 사용자 WS 메시지(실시간) | `report-job` 메시지(비동기 잡) |
-| 응답 전달 | WS로 **완성 응답 1회**(비스트리밍) | 리포트 산출물 DB 저장/후속 발행 |
-| 실행 모델 | 온라인 요청-응답(대기형) | 오프라인 배치성 워커 |
-| 오케스트레이션 | 단순 4단계 순차 조립(계획) | LangGraph 멀티에이전트 그래프 |
-| LLM Judge | **미적용**(`run_judge=False`) | **적용**(`run_judge=True`, `agents.py:564`) |
-| 배포 | 범용 노드, 8000 포트, `.[chatbot]` extra | Kafka 워커 |
-
-> 표 읽는 법: 챗봇은 손님과 실시간으로 대화하는 "전화 상담"이고, 리포트 워커는 접수된 일감을 뒤에서 처리하는 "택배 배송"이라고 보면 된다. Kafka(작업을 큐에 쌓아 뒀다가 순서대로 꺼내 처리하는 메시지 우체통)는 리포트 쪽만 쓴다.
-
-리포트 워커는 `report-job` 토픽을 Kafka로 소비하는 워커임에 반해(`REPORT_JOB_TOPIC = "report-job"`, `src/core/contracts.py:35`), 챗봇은 Kafka를 전혀 쓰지 않고 WebSocket·REST로 프런트와 직접 통신한다(`.claude/docs/12_chatbot.md:57-68`의 통신 표).
-
----
-
-## 3. 계획된 상태/세션 관리
-
-> 아래는 전부 **문서상 계획**이며, 대응 코드는 아직 없다(§1).
-
-### 3-1. 세션 수명주기(REST + WS)
-
-세션(한 사용자의 대화 한 묶음. 로그인처럼 "지금 누가 어디까지 대화했나"를 기억하는 단위)은 이렇게 흘러간다.
-
-- **생성**: 프런트가 REST `POST /sessions`로 `session_id`와 `ws_url`을 발급받는다(`.claude/docs/chatbot-events.md:14-20`, `12_chatbot.md:46`).
-- **연결**: `wss://<host>/ws/chat?session_id=<id>` + JWT(로그인 증표 역할을 하는 서명된 토큰)로 WS 수립. **on-connect 시 JWT(RS256) 스테이트리스 검증**(서버가 따로 저장해 둔 것 없이 토큰 서명만으로 진위 확인), 실패 시 거부(`4401`)(`chatbot-events.md:42-45`).
-- **중복 연결**: 동일 `session_id`로 중복 연결 시 **기존 연결 해제 후 신규 수립**(종료 코드 `4409`)(`chatbot-events.md:45,101`, `12_chatbot.md:22`).
-- **종료**: REST `DELETE /sessions/{session_id}` → `204`, Redis 세션 키·WS 연결 정리(`chatbot-events.md:22-23`).
-
-> 쉽게 말하면: 먼저 상담 번호표(session_id)를 받고 → 그 번호표와 신분증(JWT)을 들고 통화를 연결하고 → 같은 번호로 또 걸면 먼저 통화는 끊기고 새 통화가 이어지며 → 상담이 끝나면 기록을 정리한다.
-
-### 3-2. Redis — 다중 Pod 세션·컨텍스트 공유
-
-FastAPI Pod(같은 챗봇을 복제해 여러 개 띄운 각각의 실행 단위)가 스케일아웃(요청이 많을 때 서버 대수를 늘림)돼도 세션 상태·멀티턴 컨텍스트를 **Redis(모든 Pod가 공유하는 초고속 메모리 저장소)로 공유**해, 재연결이 다른 Pod로 가도 컨텍스트를 복구한다. 세션 만료는 **24시간**이며 만료 시 Redis 키가 자동 삭제된다(`12_chatbot.md:22,24-26`, `chatbot-events.md:8,123`, `README.md:7`).
-
-- 멀티턴 컨텍스트는 **이전 N턴 요약을 Redis에 캐시**해 PostgreSQL 조회를 최소화한다(`12_chatbot.md:26`, `chatbot-events.md:123`).
-- Redis 통신 방식은 세션 상태 공유용 **Pub/Sub**(발행-구독. 한 곳에서 알림을 뿌리면 구독한 여러 Pod가 동시에 받는 방식)과 컨텍스트 캐시용 **GET/SET**(값을 넣고 꺼내는 단순 조회) 두 갈래로 규정된다(`12_chatbot.md:67-68`).
-
-> 쉽게 말하면: 상담원이 여러 명(Pod)이어도 손님 정보를 공용 화이트보드(Redis)에 적어 두니, 다음에 다른 상담원이 받아도 앞 대화를 이어갈 수 있다. 그 메모는 24시간 지나면 저절로 지워진다.
-
-### 3-3. PostgreSQL — 대화 이력(90일)
-
-턴별 **질문·응답·인용 출처·타임스탬프**를 asyncpg(파이썬이 PostgreSQL과 비동기로 대화하게 해 주는 드라이버)로 저장한다. 보존 기간은 **90일**이며, 컨텍스트 윈도우(AI가 한 번에 볼 수 있는 대화 분량의 한계) 초과 시 **오래된 턴부터 요약·압축**한다(`12_chatbot.md:38-40`, `chatbot-events.md:36`, `README.md:11`). 이력은 REST `GET /sessions/{session_id}/history`로 조회한다(`chatbot-events.md:25-36`).
-
-> 쉽게 말하면: Redis가 "지금 쓰는 임시 메모지"라면, PostgreSQL은 "90일간 보관하는 정식 상담 일지"다. 대화가 너무 길어지면 오래된 부분은 요약해서 자리를 아낀다.
-
-### 3-4. 상태 전이 요약
-
-문서 시퀀스(`chatbot-events.md:105-120`) 기준의 상태 흐름:
-
-```
-[세션 생성(REST)] → Redis SET 세션
-  → [WS connect] → on-connect JWT 검증(실패=4401)
-  → [message 수신] → 입력 가드레일 → RAG 검색 → LLM 생성(완성) → 출력 가드레일
-  → [message 1회 응답(citations 포함)] → PG 이력 저장(90일)
-  → (다음 메시지 반복)
-  → [DELETE 세션] → Redis DEL, WS 정리
-만료(24h)=4408 / 중복연결=4409 / 정상종료=1000
-```
-
----
-
-## 4. 이벤트 스키마 (`chatbot-events.md` 요약)
-
-챗봇의 외부 인터페이스는 **REST(세션 관리) + WebSocket(실시간 메시지)** 이원 구성이다(`.claude/docs/chatbot-events.md:3`).
-
-> 쉽게 말하면: 세션을 만들고 지우는 "사무 창구"는 REST로, 실제 대화를 주고받는 "통화선"은 WebSocket으로 나눠 쓴다.
-
-### 4-1. REST 엔드포인트
-
-| 메서드·경로 | 용도 | 요청 | 응답 |
-|---|---|---|---|
-| `POST /sessions` | 세션 생성 | `{}`(+선택 메타), `Authorization: Bearer <JWT(RS256)>` | `201` `{session_id, ws_url}` |
-| `DELETE /sessions/{session_id}` | 세션 종료 | — | `204`(Redis 키·WS 정리) |
-| `GET /sessions/{session_id}/history` | 이력 조회 | — | `200` `{session_id, turns[]}` |
-
-세션 생성 응답 예(`chatbot-events.md:18-20`):
-
-```json
-{ "session_id": "s_9f3a...", "ws_url": "wss://<host>/ws/chat?session_id=s_9f3a..." }
-```
-
-이력 조회 응답의 `turns[]`는 `role`·`text`·`ts`를 갖고, assistant 턴은 `citations`를 포함한다(`chatbot-events.md:27-35`).
-
-### 4-2. WebSocket `/ws/chat`
-
-**연결(handshake)**: `wss://<host>/ws/chat?session_id=<id>` + JWT, on-connect RS256 검증(실패 `4401`), 동일 세션 중복 시 기존 해제 후 신규(`chatbot-events.md:42-45`).
-
-**클라이언트 → 서버: `message`**(`chatbot-events.md:49-59`)
-
-```json
-{ "type": "message", "session_id": "s_9f3a...", "text": "교통사고 후유장해 보상 받을 수 있나요?" }
-```
-
-| 필드 | 타입 | 필수 | 설명 |
-|---|---|---|---|
-| `type` | string | ✓ | `"message"` 고정 |
-| `session_id` | string | ✓ | 세션 식별자 |
-| `text` | string | ✓ | 사용자 입력(서버에서 PII 마스킹됨) |
-
-→ 코드 계약 지목: `core.contracts.ChatClientMessage`(단, §1-3 — **미정의**).
-
-**서버 → 클라이언트: `message`**(완성 응답, 비스트리밍 1회)(`chatbot-events.md:63-78`)
-
-```json
-{
-  "type": "message",
-  "text": "참고 추정 범위: 후유장해 등급에 따라 ... [제3조][2021다1234]",
-  "citations": ["[제3조]", "[2021다1234]"]
-}
-```
-
-| 필드 | 타입 | 설명 |
-|---|---|---|
-| `type` | string | `"message"` 고정 |
-| `text` | string | 완성된 응답(고지문·단정표현 치환 적용됨) |
-| `citations` | string[] | 인용 근거(조항·판례 번호) |
-
-→ 코드 계약 지목: `core.contracts.ChatServerMessage`(§1-3 — **미정의**).
-
-> 쉽게 말하면: `citations`는 답변이 어느 약관 조항·판례에서 나왔는지 출처를 함께 붙여 주는 각주 같은 것이다. AI가 근거 없이 지어내지 않았음을 보여 준다.
-
-**서버 → 클라이언트: `error`**(`chatbot-events.md:80-88`)
-
-```json
-{ "type": "error", "code": "DOMAIN_BLOCKED", "message": "보험·법률 외 질문은 답변할 수 없습니다." }
-```
-
-| `code` | 의미 |
-|---|---|
-| `DOMAIN_BLOCKED` | 입력 가드레일 — 도메인 외 질문 차단 |
-| `RATE_LIMITED` | 과도한 요청 |
-| `INTERNAL` | LLM/RAG 등 내부 오류(안전 폴백 메시지 동반 가능) |
-
-`stream`·`done` 이벤트는 **없다**(비스트리밍). 클라이언트는 `message` 또는 `error`를 1회 대기한다(`chatbot-events.md:90`).
-
-### 4-3. WebSocket 종료(close) 코드(`chatbot-events.md:94-101`)
-
-| 코드 | 의미 |
-|---|---|
-| `1000` | 정상 종료 |
-| `4401` | 인증 실패(JWT 무효/만료) |
-| `4408` | 세션 만료(24h) |
-| `4409` | 동일 session_id 중복 연결로 기존 연결 해제 |
-
-> 표 읽는 법: 통화가 끊길 때 서버가 남기는 "사유 코드"다. `1000`이면 정상, `44xx`대는 인증·만료·중복 같은 문제로 끊긴 경우다.
-
----
-
-## 5. 리포트 워커와 공유하는 것 — 공용 모듈 함수 호출
-
-챗봇의 통신 표(`.claude/docs/12_chatbot.md:64-65`)는 RAG·AI 라우터를 **"Python 함수 내부 호출"**·"Ollama HTTP"로 규정한다. Kafka가 아니라 **같은 프로세스 내 함수 호출**로 공용 모듈을 조립한다. 아래 3개 모듈은 **이미 구현되어 있어**, 챗봇은 이를 그대로 호출만 하면 된다.
-
-> 쉽게 말하면: 멀리 있는 서비스에 네트워크로 요청을 보내는 게 아니라, 같은 프로그램 안에 있는 함수를 그냥 불러 쓰는 방식이다. 옆 방 사람에게 전화하는 게 아니라 바로 옆자리 동료에게 말 거는 셈이다.
-
-### 5-1. `src/rag` — Hybrid RAG 검색
-
-RAG는 "질문에 맞는 자료를 먼저 찾아와서, 그 자료를 근거로 AI가 답하게" 하는 방식이다. 공개 진입점은 `search()` 하나다(`src/rag/__init__.py:7-9`):
-
-```python
-from rag.search import RagError, search
-__all__ = ["RagError", "search"]
-```
-
-시그니처(`src/rag/search.py:281-290`):
-
-```python
-async def search(
-    query: str,
-    insurance_type: str | None = None,
-    namespaces: list[str] | None = None,
-    top_k: int = DEFAULT_TOP_K,
-    *,
-    insurer: str | None = None,
-    product: str | None = None,
-    contract_date: datetime.date | None = None,
-) -> RagResult:
-```
-
-- 반환은 `RagResult(ranked_chunks: list[Chunk], citations: list[Citation])`(`src/core/contracts.py:119-123`). 챗봇은 여기 `citations`를 서버 `message` 이벤트의 `citations` 필드로 그대로 실을 수 있다.
-- 도크스트링은 이 모듈이 **`report_worker`·`chatbot`이 함수 호출로 공유**하는 04번 파이프라인임을 명시한다(`src/rag/__init__.py:1`). 범위 밖(비신체보험) 쿼리는 **빈 결과**로 반환된다(`src/rag/search.py:305,308-310`).
-- 챗봇 구현 시 `namespaces=None`이면 라우터가 namespace(terms·case)를 결정한다(`search.py:284,307`).
-
-> 쉽게 말하면: `search()`에 질문을 넣으면 관련 약관·판례를 찾아 "근거 문단(chunks)"과 "출처 목록(citations)"을 돌려준다. 챗봇은 그 출처 목록을 답변에 그대로 붙이면 된다. namespace를 안 정해 주면 알아서 어느 자료함을 뒤질지 골라 준다.
-
-### 5-2. `src/guardrail` — 3단계 가드레일 (챗봇 차이: `run_judge=False`)
-
-가드레일은 안전장치다. `guardrail/guards.py`가 입력/생성/출력 3단계를 모두 제공한다. 결과 모델은 `core.contracts`의 `InputGuardResult`/`OutputGuardResult`가 단일 출처다(`src/guardrail/guards.py:7,14`).
-
-**입력 가드레일** — PII 마스킹 + 도메인 외 차단(`guards.py:36-43`):
-
-```python
-async def guard_input(text: str) -> InputGuardResult:
-    masked = _mask_pii(text or "")
-    for kw in _OFF_DOMAIN:
-        if kw in (text or ""):
-            return InputGuardResult(
-                masked_text=masked, blocked=True, reason=f"보험·법률 외 질문({kw})"
-            )
-    return InputGuardResult(masked_text=masked, blocked=False, reason=None)
-```
-
-- PII 마스킹은 정규식(문자 패턴을 규칙으로 찾아내는 방식)으로 주민번호(앞 6자리 보존)·전화번호·계좌번호를 치환한다(`guards.py:26-33`). 이 규칙은 `ocr_worker` 입력단과 **동일해야** 한다(어긋나면 한쪽 PII 유출)(`guards.py:8`).
-- 도메인 차단 키워드는 간이 목록 `("부동산","주식","코인","비트코인","연애","요리","게임")`(`guards.py:22`). 챗봇은 `blocked=True` 시 `error` 이벤트 `DOMAIN_BLOCKED`로 매핑하게 된다(§4-2).
-
-> 쉽게 말하면: 질문이 들어오면 (1) 주민번호·전화번호 같은 개인정보를 가려 버리고, (2) 보험·법률과 무관한 주제(주식·연애 등)면 아예 막는다. 막힌 질문은 사용자에게 `DOMAIN_BLOCKED` 오류로 안내된다.
-
-**생성 가드레일** — 단정 금액표현 → "참고 추정 범위" 치환(`guards.py:53-57`, 동기 함수). 서버 `message`의 `text`가 "참고 추정 범위 ..."로 나가는 것과 정합적이다.
-
-> 쉽게 말하면: "무조건 500만 원 받습니다" 같은 단언을 "참고 추정 범위: ..."처럼 조심스러운 표현으로 바꿔, 확정처럼 들리지 않게 한다.
-
-**출력 가드레일** — 고지문 삽입 + (선택) LLM Judge(`guards.py:61-69`):
-
-```python
-async def guard_output(
-    text: str, *, run_judge: bool = True, chunks: list | None = None
-) -> OutputGuardResult:
-    final = text or ""
-    if DISCLAIMER not in final:
-        final = f"> {DISCLAIMER}\n\n{final}"
-
-    judge_failures: list[str] = []
-    if run_judge and chunks:
-        ...
-```
-
-여기가 **챗봇 ↔ 리포트의 핵심 차이**다. `guard_output`의 기본값은 `run_judge=True`이지만:
-
-- **리포트 워커**는 `run_judge=True`로 LLM Judge(AI가 답변의 인용이 근거와 맞는지 다시 한 번 검사하는 심판 역할) 인용 검증을 수행한다(`src/report_worker/nodes/agents.py:564`):
-  ```python
-  state.get("report", ""), run_judge=True, chunks=state.get("retrieved_clauses", [])
-  ```
-- **챗봇**은 문서상 `run_judge=False`로 호출해 **LLM Judge를 건너뛴다.** LLM Judge는 리포트 전용이며, 챗봇 출력 가드레일은 **고지문 삽입·단정표현 치환만** 수행한다(`.claude/docs/chatbot-events.md:124`, `.claude/docs/contracts.md:189`). 이유는 온라인 대화의 지연을 낮추기 위함으로, `run_judge=False`면 추가 `ai_client.chat_json` 왕복이 없다.
-
-> 쉽게 말하면: 리포트는 시간이 좀 걸려도 되니 AI 심판(LLM Judge)에게 한 번 더 검수받지만, 챗봇은 실시간 대화라 빨라야 하므로 그 검수 단계를 생략한다. 대신 안내문 붙이기와 단정 표현 바꾸기는 챗봇도 그대로 한다.
-
-즉 챗봇 구현 시 출력 단계는 `await guard_output(text, run_judge=False)`로 호출하게 되며(기본값 True를 명시적으로 False로 덮어써야 함), `judge_failures`는 항상 빈 리스트가 된다.
-
-> 참고: 테스트 `tests/test_guardrail.py:40`이 `guard_output("리포트 본문", run_judge=False, chunks=None)` 경로를 검증하고 있어, 챗봇이 쓸 `run_judge=False` 분기는 이미 테스트 커버되어 있다.
-
-### 5-3. `src/core/ai_client` — LLM 라우터(비스트리밍)
-
-Ollama EXAONE(별도 GPU 노드, `OLLAMA_BASE_URL` HTTP)를 호출하는 공용 클라이언트(`.claude/docs/12_chatbot.md:8`, `README.md:20`). Ollama는 언어 모델을 서버로 띄워 HTTP로 부르게 해 주는 실행 환경이고, EXAONE은 그 위에서 돌리는 언어 모델 계열이다. 공개 코루틴(비동기로 호출되는 함수)은 `chat`·`chat_json`·`embed`·`close_client`(`src/core/ai_client.py:59,69,101,135`).
-
-챗봇의 LLM 생성 단계가 쓸 `chat()`은 **처음부터 비스트리밍**이다(`src/core/ai_client.py:82-94`):
-
-```python
-model = opts.pop("model", None) or settings.llm_model
-payload: dict[str, Any] = {
-    "model": model,
-    "messages": messages,
-    "stream": False,
-    **opts,
-}
-client = _get_chat_client()
-try:
-    resp = await client.post("/chat/completions", json=payload)
-    resp.raise_for_status()
-    data = resp.json()
-    return data["choices"][0]["message"]["content"]
-```
-
-- `"stream": False`(`ai_client.py:86`)라 완성 텍스트를 1회 반환 — 챗봇의 "완성 응답 1회" 전제와 그대로 맞는다.
-- HTTP/형식 오류 시 `AiClientError`를 던지므로(`ai_client.py:95-98`), 챗봇은 이를 잡아 `error` 이벤트 `INTERNAL`로 매핑하게 된다(§4-2).
-- **모델은 미정**(`settings.llm_model`)이다. 코드상 `llm_model` 기본값이 빈 문자열(`src/core/config.py:61`, `llm_model: str = ""  # 예: EXAONE 계열`)이라 env 주입 전에는 미정이다. "모델 미정" 표기는 `src/chatbot/README.md:20`·`.claude/docs/contracts.md:194`에 있다(참고로 `12_chatbot.md:8`은 AI 라우터를 "Ollama EXAONE"로 명시하므로 '미정' 근거로는 부적절).
-- `chat_json`은 리포트·챗봇·가드레일이 공유하는 JSON 모드(답을 정해진 JSON 형식으로 받는 방식) 헬퍼(`ai_client.py:101-106`)지만, 챗봇 본류 응답은 자유형 텍스트이므로 `chat()`을 쓰게 된다.
-
-> 쉽게 말하면: `chat()`은 "AI에게 대화를 던지고 완성된 답 한 덩어리를 받아 오는" 창구다. 어떤 모델을 쓸지는 아직 비워 뒀고(환경변수로 나중에 주입), 문제가 생기면 오류를 던져 챗봇이 `INTERNAL` 오류로 안내하게 된다.
-
-### 5-4. 공유 계약 모델
-
-RAG·가드레일 결과 모델(`Chunk`·`Citation`·`RagResult`·`InputGuardResult`·`OutputGuardResult`)은 `core.contracts`가 단일 출처로, 리포트·챗봇이 동일 스키마를 공유한다(`src/core/contracts.py:92-143`). 단 **챗봇 고유의 WS 메시지 계약(`ChatClientMessage`/`ChatServerMessage`)만 아직 이 파일에 추가되지 않았다**(§1-3) — 챗봇 구현의 첫 작업이 이 계약 신설이 되어야 한다.
-
-> 쉽게 말하면: 데이터의 "모양 약속서"는 한 파일(`core.contracts`)에 모아 두고 리포트·챗봇이 같이 쓴다. 다만 챗봇 전용 메시지 약속 두 개만 아직 안 넣었으니, 그걸 넣는 게 챗봇 구현의 첫 단추다.
-
----
-
-### 종합 정직성 노트
-
-- **챗봇 본체(app.py, WS 핸들러, 세션·JWT·Redis·PG 연동)는 전부 미구현**이다. 존재하는 건 도크스트링 1줄(`__init__.py`), Dockerfile, README뿐이다.
-- **WS 메시지 계약 모델 2종은 문서가 "코드 계약"이라 부르지만 실제 코드에 없다.** 문서-코드 불일치로 기록해 둔다.
-- 반면 **조립 재료인 RAG·가드레일·ai_client 3개 공용 모듈은 구현·테스트되어 있어**, 챗봇 구현은 이들을 FastAPI WebSocket 위에서 4단계 순차 호출로 엮고, `guard_output`을 `run_judge=False`로 부르는 조립 작업으로 수렴한다.
-
----
-
 # core 공용 인프라 — "어떻게 동작하는가"의 배관
 
 > 출처: AI 엔진 아키텍처 문서 세트 · 최종 점검일 2026-07-15 · 브랜치 `11-feature-langgraph-멀티에이전트-구현`
@@ -4247,9 +3815,9 @@ RAG·가드레일 결과 모델(`Chunk`·`Citation`·`RagResult`·`InputGuardRes
 > 모든 워커와 공용 모듈이 함께 쓰는 여섯 개의 밑바탕 부품(AI 호출·환경설정·DB 연결·Kafka 소비/발행·로깅)이 각각 무엇을 하고 어떻게 동작하는지를 코드 근거와 함께 설명하는 문서다.
 
 > 🌱 **쉽게 말하면**
-> `src/core`는 건물로 치면 전기·수도·가스 같은 **기본 배관**이다. OCR 워커든 리포트 워커든 챗봇이든, 방(기능)마다 따로 우물을 파지 않고 이 공용 배관에서 물을 끌어 쓴다. 이 배관에는 여섯 개의 관이 있다 — AI 모델에게 말을 거는 관(`ai_client`), 설정값을 한곳에 모아두는 관(`config`), 데이터베이스와 연결을 유지하는 관(`db`), 일감을 받아오는 관(Kafka `consumer`), 결과를 내보내는 관(Kafka `producer`), 무슨 일이 있었는지 기록하는 관(`logging`)이다. 이 관들이 튼튼해야 위층의 모든 기능이 안정적으로 돈다. 그래서 "다른 모두가 여기에 의존하니 가장 먼저 튼튼하게 만든다"는 원칙이 붙어 있다.
+> `src/core`는 건물로 치면 전기·수도·가스 같은 **기본 배관**이다. OCR 워커든 리포트 워커든, 방(기능)마다 따로 우물을 파지 않고 이 공용 배관에서 물을 끌어 쓴다. 이 배관에는 여섯 개의 관이 있다 — AI 모델에게 말을 거는 관(`ai_client`), 설정값을 한곳에 모아두는 관(`config`), 데이터베이스와 연결을 유지하는 관(`db`), 일감을 받아오는 관(Kafka `consumer`), 결과를 내보내는 관(Kafka `producer`), 무슨 일이 있었는지 기록하는 관(`logging`)이다. 이 관들이 튼튼해야 위층의 모든 기능이 안정적으로 돈다. 그래서 "다른 모두가 여기에 의존하니 가장 먼저 튼튼하게 만든다"는 원칙이 붙어 있다.
 
-`src/core`는 모든 워커(`ocr_worker`·`report_worker`·`chatbot`)와 공용 모듈(`rag`·`guardrail`)이 의존하는 **토대**다. `README.md`가 명시하듯 "다른 모두가 여기에 의존하므로 가장 먼저 안정화"하는 계층이며(`src/core/README.md:3`), 담당하는 모듈은 `config`(환경설정 단일 출처)·`contracts`(메시지 계약)·`kafka/`(consumer/producer)·`db`(asyncpg 풀)·`ai_client`(OpenAI 호환 추론)·`logging`(구조적 로깅)이다(`src/core/README.md:7-14`).
+`src/core`는 모든 워커(`ocr_worker`·`report_worker`)와 공용 모듈(`rag`·`guardrail`)이 의존하는 **토대**다. `README.md`가 명시하듯 "다른 모두가 여기에 의존하므로 가장 먼저 안정화"하는 계층이며(`src/core/README.md:3`), 담당하는 모듈은 `config`(환경설정 단일 출처)·`contracts`(메시지 계약)·`kafka/`(consumer/producer)·`db`(asyncpg 풀)·`ai_client`(OpenAI 호환 추론)·`logging`(구조적 로깅)이다(`src/core/README.md:7-14`).
 
 아래는 각 모듈이 **무엇을 하고, 무슨 설정을 참조하고, 어떻게 동작하며, 상태가 어떻게 바뀌는지**를 코드 근거와 함께 정리한 것이다.
 
@@ -4367,7 +3935,7 @@ except (KeyError, IndexError, TypeError) as exc:
 
 핵심 사항:
 - 모델은 `opts["model"]`로 호출할 때마다 바꿔 끼울(오버라이드) 수 있고, 안 주면 `settings.llm_model`(예: EXAONE 계열)이 기본값이 된다.
-- **항상 `stream: False`** — 챗봇도 비스트리밍(완성 응답 1회)이라는 아키텍처와 딱 맞는다.
+- **항상 `stream: False`** — 비스트리밍(완성 응답 1회) 아키텍처와 딱 맞는다.
 - `**opts`로 `temperature`(답의 무작위성·창의성 정도) 등 임의의 OpenAI 호환 파라미터를 그대로 실어 보낸다.
 - POST 경로는 `/chat/completions`이고, 여기에 `base_url`(`settings.ai_base_url`, 기본 `http://localhost:11434/v1`)이 앞에 붙어 완전한 주소가 된다.
 - HTTP 오류(`httpx.HTTPError`, `raise_for_status()` 포함)는 `AiClientError("chat 호출 실패")`로, 응답 구조 파싱 실패(`KeyError`/`IndexError`/`TypeError`)는 `AiClientError("chat 응답 형식이 올바르지 않음")`으로 감싸서 던진다. 원인이 된 예외는 `from exc`로 함께 매달아(체이닝) 남긴다.
@@ -4382,7 +3950,7 @@ except (KeyError, IndexError, TypeError) as exc:
 
 시그니처: `async def chat_json(messages: list[dict[str, str]], **opts: Any) -> Any`(`src/core/ai_client.py:101`).
 
-docstring이 밝히듯 "리포트·챗봇·가드레일이 공유하는 JSON 모드 헬퍼"로, LLM이 ```` ```json ```` 코드펜스나 잡음을 섞어도 관용적으로 파싱한다(`src/core/ai_client.py:102-117`). 동작(`src/core/ai_client.py:118-132`):
+docstring이 밝히듯 "리포트·가드레일이 공유하는 JSON 모드 헬퍼"로, LLM이 ```` ```json ```` 코드펜스나 잡음을 섞어도 관용적으로 파싱한다(`src/core/ai_client.py:102-117`). 동작(`src/core/ai_client.py:118-132`):
 
 ```python
 raw = await chat(messages, **opts)
@@ -4498,7 +4066,6 @@ database_url: str = "postgresql://postgres:postgres@localhost:5432/ai_engine"
 db_pool_min_size: int = 2
 db_pool_max_size: int = 10
 rds_ca_path: str | None = None  # RDS TLS CA 번들 경로. 로컬 PG면 비움(SSL 끔)
-redis_url: str = "redis://localhost:6379/0"
 ```
 
 **Kafka**(`src/core/config.py:42-49`):

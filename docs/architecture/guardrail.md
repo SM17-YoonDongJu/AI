@@ -21,9 +21,9 @@
 
 ## 1. 3단계 개요
 
-가드레일은 **독립 서비스가 아니라 공용 Python 모듈**이다. `report_worker`(05, Kafka 워커)와 `chatbot`(12, FastAPI)이 **함수 호출**로 공유하며, 모듈 자체는 Frontend·Spring Boot·Kafka와 직접 통신하지 않는다(`.claude/docs/06_guardrail.md:9`, `src/guardrail/README.md:3`). 개인정보보호·법적 안전성이 도메인 핵심 제약이라 반드시 거쳐야 하는 경로로 설계됐고, 단계별 함수로 잘게 쪼개 두어 호출하는 쪽이 필요한 것만 골라 조립한다(`README.md:3`).
+가드레일은 **독립 서비스가 아니라 공용 Python 모듈**이다. `report_worker`(05)가 **함수 호출**로 사용하며, 모듈 자체는 Frontend·Spring Boot·Kafka와 직접 통신하지 않는다(`.claude/docs/06_guardrail.md:9`, `src/guardrail/README.md:3`). 개인정보보호·법적 안전성이 도메인 핵심 제약이라 반드시 거쳐야 하는 경로로 설계됐고, 단계별 함수로 잘게 쪼개 두어 호출하는 쪽이 필요한 것만 골라 조립한다(`README.md:3`).
 
-> 쉽게 말하면: 가드레일은 "스스로 켜져 있는 서버"가 아니라 "필요할 때 꺼내 쓰는 앱 안의 부품"이다. 리포트 워커와 챗봇이라는 두 프로그램이 이 부품을 각자 가져다 쓴다. 부품이므로 카프카(메시지 우체통)나 스프링 같은 외부 시스템과 직접 대화하지 않는다.
+> 쉽게 말하면: 가드레일은 "스스로 켜져 있는 서버"가 아니라 "필요할 때 꺼내 쓰는 앱 안의 부품"이다. 리포트 워커가 이 부품을 가져다 쓴다. 부품이므로 카프카(메시지 우체통)나 스프링 같은 외부 시스템과 직접 대화하지 않는다.
 
 실제 구현은 `src/guardrail/guards.py` **단 하나의 파일(96줄)**에 3개 진입 함수로 담겨 있다. 모듈 상단 docstring(파일 맨 위에 붙는 설명문)이 3단계를 요약한다(`guards.py:1-9`):
 
@@ -396,7 +396,7 @@ async def output_guardrail(state: ReportState) -> dict[str, Any]:
 ```
 
 - 입력: `state["report"]`(바로 앞 `report_compose`가 만든 통합 Markdown, `agents.py:556-557`)와 `chunks=state["retrieved_clauses"]`(RAG가 채운 검색 조각, `state.py:32`).
-- `run_judge=True`로 고정 → **리포트 경로에서는 항상 심사관을 켠다**(챗봇은 이 노드를 쓰지 않으므로 LLM Judge 미적용, `06_guardrail.md:25`·`:41`, `README.md:11`).
+- `run_judge=True`로 고정 → **리포트 경로에서는 항상 심사관을 켠다**.
 - 결과로 `report`(고지문 붙은 최종본)와 `judge_failures`를 state에 합쳐 넣는다(`state.py:48`의 `judge_failures: list[str]` 칸).
 - 그래프 순서: `report_compose → output_guardrail → persist → END`(`graph.py:66-69`).
 
@@ -463,7 +463,6 @@ START → load_context → input_guardrail
 
 - 계좌번호 마스킹은 주석("연속 10자리 이상")과 실제 정규식(하이픈 3덩이)이 서로 맞지 않고(`guards.py:31-32`), 하이픈 없이 쭉 이어진 계좌 숫자열은 가려지지 않는다.
 - `reports.status = 'BLOCKED'`는 Spring status enum 계약에 아직 반영되지 않은 신설값이다(`agents.py:642-643` TODO).
-- 챗봇(12) 연동 코드는 이번 조사 범위(`report_worker`)에 들어 있지 않다. docs상 챗봇은 입력·생성·출력은 쓰되 LLM Judge만 빼는 것으로 설계됐지만(`06_guardrail.md:37-41`), 실제 챗봇 호출부는 본 문서가 다루는 파일에 포함되지 않아 확인할 수 없다.
 
 **총평:** 가드레일은 "3단계 뼈대 + 결정론 규칙(마스킹·치환·고지문) + LLM Judge 관찰"까지는 실제로 작동한다. 하지만 문서가 약속한 고급 기능(NER 기반 PII 탐지, 인용 강제 검증, 환각 섹션 자동 삭제)은 아직 프롬프트 지침에 머물거나 미구현으로 남아 있다.
 

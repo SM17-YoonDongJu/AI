@@ -1,6 +1,6 @@
 # Deploy — dev push(=병합) 시 테스트 통과 후 변경된 서비스만 ECR 빌드→push→배포.
 # 배포 경로는 서비스별로 갈린다:
-#   - report·chatbot·corpus: k8s — K8s-manifests의 image.tag를 이번 커밋 sha7로 커밋하면
+#   - report·corpus: k8s — K8s-manifests의 image.tag를 이번 커밋 sha7로 커밋하면
 #     Argo CD가 감지해 롤링 업데이트한다. CI는 클러스터·서버에 접속하지 않는다.
 #   - ocr(GPU EC2): SSM으로 호스트 compose를 재시작한다. 대상 인스턴스 변수가 비어 있으면
 #     빌드만 하고 배포를 건너뛴다(계정 이전 직후처럼 호스트가 아직 없는 구간).
@@ -19,7 +19,7 @@ on:
   workflow_dispatch:
     inputs:
       services:
-        description: "빌드할 서비스(쉼표 구분: ocr,corpus,report,chatbot). 비우면 전부."
+        description: "빌드할 서비스(쉼표 구분: ocr,corpus,report). 비우면 전부."
         required: false
         default: ""
 
@@ -51,7 +51,6 @@ jobs:
             ocr: ['src/ocr_worker/**','migrations/ai/**']
             corpus: ['src/corpus_worker/**','migrations/corpus/**']
             report: ['src/report_worker/**','src/rag/**','src/guardrail/**']
-            chatbot: ['src/chatbot/**','src/rag/**','src/guardrail/**']
       - id: set
         shell: bash
         run: |
@@ -59,12 +58,12 @@ jobs:
           # pick이 그 목록만 본다. 수동 실행은 services 입력, push는 paths-filter 결과를 쓴다.
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             sel=$(echo "${{ inputs.services }}" | tr -d ' ')
-            [ -n "$sel" ] || sel="ocr,corpus,report,chatbot"
+            [ -n "$sel" ] || sel="ocr,corpus,report"
           else
             # paths-filter의 changes는 걸린 필터 이름 배열이다(예: ["shared","report"]).
             sel=$(echo '${{ steps.filter.outputs.changes }}' | tr -d '[]" ')
             # 공용 코드가 걸리면 서비스 필터와 무관하게 전부 다시 빌드한다.
-            case ",$sel," in *,shared,*) sel="ocr,corpus,report,chatbot" ;; esac
+            case ",$sel," in *,shared,*) sel="ocr,corpus,report" ;; esac
           fi
           echo "selected: ${sel:-<none>}"
           pick() { case ",$sel," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
@@ -72,14 +71,13 @@ jobs:
           items=()
           add() { items+=("$1"); }
           # entry: service|dockerfile|repo|tag|target|svc|compose_src|manifest
-          # 서비스별 전용 저장소(brbs/ocr·brbs/corpus·brbs/report·brbs/chatbot)에 :dev·:<sha7> 태그로 push한다.
+          # 서비스별 전용 저장소(brbs/ocr·brbs/corpus·brbs/report)에 :dev·:<sha7> 태그로 push한다.
           # manifest: K8s-manifests의 값 파일 경로. 비어 있지 않으면 Argo CD 경로(매니페스트 태그 커밋),
           #   비어 있으면 SSM 경로(target=ocr: GPU EC2)로 배포한다.
           # compose_src: SSM 배포 시 호스트에 기록할 "레포 내" compose(우리 소유라 코드 기반).
           pick ocr     && add '{"service":"ocr","dockerfile":"src/ocr_worker/Dockerfile","repo":"brbs/ocr","tag":"dev","target":"ocr","svc":"ocr-worker","compose_src":"deploy/docker-compose.ocr.yml","manifest":""}'
           pick corpus  && add '{"service":"corpus","dockerfile":"src/corpus_worker/Dockerfile","repo":"brbs/corpus","tag":"dev","target":"k8s","svc":"corpus-worker","compose_src":"","manifest":"envs/dev/etl-corpus.values.yaml"}'
           pick report  && add '{"service":"report","dockerfile":"src/report_worker/Dockerfile","repo":"brbs/report","tag":"dev","target":"k8s","svc":"report","compose_src":"","manifest":"envs/dev/report.values.yaml"}'
-          pick chatbot && add '{"service":"chatbot","dockerfile":"src/chatbot/Dockerfile","repo":"brbs/chatbot","tag":"dev","target":"k8s","svc":"chatbot","compose_src":"","manifest":"envs/dev/chatbot.values.yaml"}'
           json=$(IFS=,; echo "[${items[*]}]")
           echo "matrix={\"include\":$json}" >> "$GITHUB_OUTPUT"
           echo "will build: $json"
@@ -128,13 +126,13 @@ jobs:
           tags: |
             ${{ secrets.AWS_ECR_REGISTRY }}/${{ matrix.repo }}:${{ matrix.tag }}
             ${{ secrets.AWS_ECR_REGISTRY }}/${{ matrix.repo }}:${{ steps.v.outputs.sha7 }}
-          # 부팅 로그(·chatbot /health)에 찍어 새 이미지가 실제로 떴는지 확인한다.
+          # 부팅 로그에 찍어 새 이미지가 실제로 떴는지 확인한다.
           build-args: |
             GIT_COMMIT=${{ github.sha }}
           cache-from: type=gha,scope=${{ matrix.service }}
           cache-to: type=gha,mode=max,scope=${{ matrix.service }}
 
-      # ── Argo CD 경로 (report·chatbot) ──────────────────────────────────────────────
+      # ── Argo CD 경로 (report·corpus) ──────────────────────────────────────────────
       # 클러스터에 직접 배포하지 않고 K8s-manifests의 dev 이미지 태그만 바꿔 커밋한다.
       # 실제 반영(Sync·롤링 재시작)은 Argo CD가 레포를 보고 3분 안에 한다.
       # brbs-manifests-ci 앱 토큰. K8s-manifests 한 레포의 contents 쓰기로만 범위를 좁힌다.
@@ -184,7 +182,7 @@ jobs:
             -m "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}" \
             -m "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
 
-          # report·chatbot이 matrix로 동시에 돌고 백엔드 CI도 같은 main에 push한다. 파일이 달라 내용
+          # report·corpus가 matrix로 동시에 돌고 백엔드 CI도 같은 main에 push한다. 파일이 달라 내용
           # 충돌은 없지만 push 순서 경합이 생기므로, 거절되면 최신 main 위로 다시 올려서 재시도한다.
           for attempt in 1 2 3; do
             if git push origin HEAD:main; then
@@ -283,7 +281,7 @@ jobs:
             exit 1
           fi
 
-      # Argo CD 경로(report·chatbot)는 실패할 때만 알린다. 이 잡의 성공은 매니페스트 커밋까지라서,
+      # Argo CD 경로(report·corpus)는 실패할 때만 알린다. 이 잡의 성공은 매니페스트 커밋까지라서,
       # 실제 반영 결과(배포 완료·Sync 실패·Degraded)는 Argo CD가 DEPLOYMENT 채널로 보낸다(K8s-manifests PR #11).
       - name: Notify deploy result
         if: always() && (matrix.manifest == '' || job.status != 'success')

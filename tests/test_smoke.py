@@ -6,7 +6,6 @@
 
 
 def test_packages_importable() -> None:
-    import chatbot  # noqa: F401
     import core  # noqa: F401
     import guardrail  # noqa: F401
     import ocr_worker  # noqa: F401

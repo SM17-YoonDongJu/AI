@@ -101,7 +101,7 @@ async def chat(messages: list[dict[str, str]], **opts: Any) -> str:
 async def chat_json(messages: list[dict[str, str]], **opts: Any) -> Any:
     """chat 결과를 JSON으로 파싱한다(코드펜스 제거 + 중괄호 폴백).
 
-    리포트·챗봇·가드레일이 공유하는 JSON 모드 헬퍼. LLM이 ```json 펜스나 잡음을 섞어도
+    리포트·가드레일이 공유하는 JSON 모드 헬퍼. LLM이 ```json 펜스나 잡음을 섞어도
     관용적으로 파싱하고, 파싱 불가 시에만 `{}`를 반환한다. `chat()`의 HTTP/형식 오류
     (`AiClientError`)는 삼키지 않고 그대로 전파한다(호출자가 판단).
 

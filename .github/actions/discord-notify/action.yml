@@ -11,7 +11,7 @@ inputs:
     description: success | failure | cancelled
     required: true
   service:
-    description: 서비스 이름 (ocr / report / chatbot / ci)
+    description: 서비스 이름 (ocr / corpus / report / ci)
     required: true
   environment:
     description: 배포 환경 (dev / prod)

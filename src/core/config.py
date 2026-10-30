@@ -1,6 +1,6 @@
 """환경설정 단일 출처 (pydantic-settings) — 정본(canonical) 슈퍼셋.
 
-전 워커·모듈(OCR·RAG·리포트·챗봇·가드레일)이 공유하는 설정을 한 곳에 모은다. 모델·엔드포인트는
+전 워커·모듈(OCR·RAG·리포트·가드레일)이 공유하는 설정을 한 곳에 모은다. 모델·엔드포인트는
 코드에 하드코딩하지 않고 env로 주입하며, 시크릿(DB 비밀번호 등)은 코드·로그·커밋에 두지 않는다.
 아래 기본값은 로컬 개발(docker-compose.dev)용이며 실제 값이 아니다.
 
@@ -51,7 +51,6 @@ class Settings(BaseSettings):
     db_pool_min_size: int = 2
     db_pool_max_size: int = 10
     rds_ca_path: str | None = None  # RDS TLS CA 번들 경로. 로컬 PG면 비움(SSL 끔)
-    redis_url: str = "redis://localhost:6379/0"
 
     # --- SQS (AWS SQS Standard 큐 / 로컬 LocalStack) ---
     # 큐는 전체 URL로 지정한다(토픽명이 아님). 자격증명은 표준 AWS 체인(워커 IAM Role) —
