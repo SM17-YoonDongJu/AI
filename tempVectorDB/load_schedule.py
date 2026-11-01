@@ -2,7 +2,8 @@
 
 버전별(개정판) 원문 마크다운을 "## 신체부위" 헤더 단위로 청킹해, 계약 체결일 기준 버전
 매칭이 가능하도록 (version_label, applies_from, applies_to) 메타와 함께 적재한다.
-임베딩은 policy_chunks·case_chunks 와 동일한 qwen3-embedding 1024d 로, 벡터공간을 맞춘다.
+임베딩은 doc_embedder(기본 Ollama qwen3-embedding:0.6b, EMBED_PROVIDER=voyage면 Voyage
+voyage-4-large, 1024d)다. policy_chunks·case_chunks·쿼리 쪽과 같은 모델이어야 벡터공간이 맞는다.
 
 입력:
   - 매니페스트(YAML): 버전별 version_label·applies_from·applies_to·source_url·파일 경로.
@@ -18,6 +19,7 @@
 실행:
   python tempVectorDB/load_schedule.py --manifest tempVectorDB/schedule_manifest.yaml
   # --manifest 생략 시 schedule_manifest.example.yaml 을 읽는다(스모크용).
+  # Voyage로 적재: EMBED_PROVIDER=voyage VOYAGE_API_KEY=... 를 앞에 붙인다.
 
 원문 데이터가 아직 미확보라면, 매니페스트가 가리키는 마크다운 파일만 채우면 그대로 돌아간다.
 """
@@ -35,13 +37,12 @@ import re
 import asyncpg
 import httpx
 import yaml
+from doc_embedder import EmbedConfig, embed_batch
 from kiwipiepy import Kiwi
 
 DATABASE_URL = os.environ.get(
     "DATABASE_URL", "postgresql://postgres:postgres@localhost:5433/aiengine"
 )
-OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434").rstrip("/")
-EMBED_MODEL = os.environ.get("EMBED_MODEL", "qwen3-embedding:0.6b")
 BATCH = 32
 
 _DEFAULT_MANIFEST = pathlib.Path(__file__).with_name("schedule_manifest.example.yaml")
@@ -140,13 +141,6 @@ def _iter_records(manifest_path: pathlib.Path):
                 }
 
 
-async def _embed_batch(client: httpx.AsyncClient, texts: list[str]) -> list[str]:
-    resp = await client.post(f"{OLLAMA_URL}/api/embed", json={"model": EMBED_MODEL, "input": texts})
-    resp.raise_for_status()
-    embs = resp.json()["embeddings"]
-    return ["[" + ",".join(map(str, e)) + "]" for e in embs]
-
-
 async def main() -> None:
     parser = argparse.ArgumentParser(description="후유장해분류표 → schedule_chunks 적재")
     parser.add_argument(
@@ -156,6 +150,8 @@ async def main() -> None:
         help="버전 매니페스트 YAML 경로 (기본: schedule_manifest.example.yaml)",
     )
     args = parser.parse_args()
+    # 키 누락 등 설정 오류는 매니페스트를 읽거나 DB에 붙기 전에 드러낸다.
+    embed_config = EmbedConfig.from_env()
 
     records = list(_iter_records(args.manifest))
     # chunk_id 중복 제거(파일 간 혹시 모를 충돌).
@@ -165,13 +161,14 @@ async def main() -> None:
     if not records:
         print("적재할 청크가 없습니다(매니페스트 files 를 확인하세요).")
         return
+    print(f"임베딩: {embed_config.describe()}")
 
     conn = await asyncpg.connect(DATABASE_URL)
     done = 0
     async with httpx.AsyncClient(timeout=120) as client:
         for i in range(0, len(records), BATCH):
             batch = records[i : i + BATCH]
-            embs = await _embed_batch(client, [b["content"] for b in batch])
+            embs = await embed_batch(client, embed_config, [b["content"] for b in batch])
             rows = []
             for b, emb in zip(batch, embs, strict=True):
                 toks = " ".join(t.form for t in _kiwi.tokenize(b["content"][:2000]))

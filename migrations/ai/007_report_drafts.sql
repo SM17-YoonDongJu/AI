@@ -1,4 +1,4 @@
--- 012_report_drafts.sql — report_drafts 테이블 신설 (contracts.md §4).
+-- 007_report_drafts.sql — report_drafts 테이블 신설 (contracts.md §4).
 --
 -- report_worker가 쓰는 AI 리포트 초안(JSONB, 영구 보존 — 손해사정사 검수 근거).
 -- 원래 007번으로 추가됐었으나, RAG 마이그레이션(#11)이 007~011을 먼저 점유하면서 파일이

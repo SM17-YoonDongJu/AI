@@ -9,11 +9,13 @@
 """
 
 from functools import lru_cache
+from typing import Literal
 
 from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# 임베딩 차원은 계약상 고정값(qwen3:embedding 1024d, BGE-M3 폴백도 1024d).
+# 임베딩 차원은 계약상 고정값 — 코퍼스 벡터 컬럼 halfvec(1024)와 같아야 한다.
+# qwen3-embedding은 1024d이고, voyage-4-large는 요청의 output_dimension으로 1024를 맞춘다.
 DEFAULT_EMBEDDING_DIM = 1024
 
 # CD 스모크: shared(core) 변경으로 3개 서비스 배포 경로 검증(값·동작 무변경). 재트리거 6.
@@ -121,14 +123,35 @@ class Settings(BaseSettings):
     # NER 확률 임계값. 마스킹은 recall 우선이라 낮게; 과잉 마스킹 시 상향(노션 §2).
     ner_score_threshold: float = 0.5
 
-    # --- AI 서빙 (OpenAI 호환: Ollama/vLLM/TEI) — 모델 미정, env 주입 ---
-    ai_base_url: str = "http://localhost:11434/v1"  # 챗 추론 엔드포인트
-    ai_api_key: str = "not-needed"  # OpenAI 호환 인증(로컬은 미사용)
-    llm_model: str = ""  # 예: qwen3.6:35b-a3b (Qwen3 MoE — EXAONE은 라이선스상 상업 사용 불가)
-    embedding_base_url: str = "http://localhost:11434/v1"  # 임베딩 엔드포인트(별도 노드 가능)
-    embedding_model: str = ""  # 예: qwen3:embedding (1024d)
+    # --- AI 서빙 — 챗·임베딩 provider 스위치(env), 모델·엔드포인트도 env 주입 ---
+    # 챗 기본값은 Claude(anthropic — 공식 SDK, ai_base_url 미사용, 키는 ai_api_key)다. 로컬 Ollama
+    # 등 OpenAI 호환 서버를 쓰려면 LLM_PROVIDER=openai_compat으로 명시한다. 모델명은 기본값 없이
+    # env(LLM_MODEL)로만 받는다(하드코딩 금지).
+    # 임베딩 기본값은 아직 로컬(openai_compat)이다 — 코퍼스를 다른 모델로 재임베딩하기 전에
+    # 쿼리 쪽만 바뀌면 오류 없이 검색 결과만 틀어지므로, 재임베딩(`python -m rag.reembed`) 후
+    # env로 바꾼다.
+    # 챗과 임베딩은 업체·노드가 다를 수 있어 엔드포인트와 인증키를 분리한다.
+    llm_provider: Literal["openai_compat", "anthropic"] = "anthropic"
+    ai_base_url: str = "http://localhost:11434/v1"  # openai_compat 챗 엔드포인트
+    # 챗 인증키(시크릿). openai_compat이면 Bearer 헤더(로컬은 미사용), anthropic이면 Claude API 키.
+    ai_api_key: str = "not-needed"
+    # 예: claude-opus-5-5 (anthropic) | qwen3.6:35b-a3b (openai_compat — EXAONE은 상업 사용 불가)
+    llm_model: str = ""
+    # anthropic 전용 output_config.effort. Opus 5.5는 thinking이 항상 켜져 있어 effort가 유일한
+    # 깊이 조절이고, API 기본값이 medium이라 리포트 품질 기준(high)을 명시한다.
+    llm_effort: Literal["low", "medium", "high", "xhigh", "max"] = "high"
+    # anthropic 전용 — thinking과 응답을 합친 출력 상한. 스트리밍으로 받으므로 넉넉히 둔다.
+    llm_max_tokens: int = 64000
+    llm_timeout_seconds: float = 600.0  # anthropic 전용 SDK 요청 타임아웃(초)
+    # voyage: Voyage(MongoDB Atlas 모델 API) — 요청에 input_type·output_dimension을 싣는다.
+    embedding_provider: Literal["openai_compat", "voyage"] = "openai_compat"
+    embedding_base_url: str = "http://localhost:11434/v1"  # 임베딩 엔드포인트(별도 노드/업체 가능)
+    # 임베딩 전용 인증키(시크릿). 챗 키와 분리한다 — 운영 AI_API_KEY는 Claude 키라 임베딩
+    # 요청에 실리면 임베딩 업체로 새어 나간다. not-needed·빈값이면 인증 헤더를 붙이지 않는다.
+    embedding_api_key: str = "not-needed"
+    embedding_model: str = ""  # 예: qwen3-embedding (1024d) | voyage-4-large
     embedding_dim: int = DEFAULT_EMBEDDING_DIM
-    ai_timeout_seconds: float = 60.0  # 추론 HTTP 요청 타임아웃
+    ai_timeout_seconds: float = 60.0  # httpx 요청 타임아웃(openai_compat 챗 + 모든 임베딩)
 
     # --- VLM(Vision) 서빙 — Ollama 네이티브 /api/generate(OpenAI 호환 아님) ---
     # 다중 항목 표 문서(지급결과서·청구서·입원확인서·진료비영수증)에서 surya 라인

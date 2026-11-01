@@ -9,6 +9,9 @@ report_worker가 함수 호출로 사용하는 단일 진입점 `search()`를 �
   3. tsvector ∥ pgvector 병렬 검색 — namespace별 top_k
   4. RRF 통합 — score = Σ weight/(RRF_K + rank), 키워드·벡터 0.5:0.5
   5. 메타데이터 역추적 — 상위 청크에서 Citation 생성
+
+쿼리 임베딩이 실패하면 벡터 검색을 건너뛰고 키워드 결과만으로 통합한다(degrade). 다른 임베딩
+모델로 폴백하지 않는다 — 코퍼스를 색인한 모델과 벡터 공간이 달라 결과가 조용히 틀어진다.
 """
 
 import asyncio
@@ -30,10 +33,9 @@ logger = get_logger(__name__)
 
 DEFAULT_TOP_K = 8
 
-# BGE-M3 폴백 모델(qwen3:embedding 실패 시). 1024d로 차원 일치.
-_BGE_MODEL_NAME = "BAAI/bge-m3"
-
-# qwen3-embedding은 쿼리에 instruction 프리픽스 권장(문서는 raw 적재 → 쿼리만 비대칭 프리픽스).
+# qwen3-embedding(openai_compat)은 쿼리에 instruction 프리픽스를 권장한다(문서는 원문으로 색인 →
+# 쿼리만 비대칭 프리픽스). voyage는 input_type="query"면 업체가 자체 검색 프롬프트를 앞에 붙이므로
+# 여기서 또 붙이면 이중 프리픽스가 된다 — openai_compat일 때만 붙인다.
 _QUERY_INSTRUCT = "Instruct: 보험 약관에서 사용자 질문에 답할 수 있는 관련 조항을 검색한다\nQuery: "
 
 # namespace → 테이블.
@@ -120,8 +122,6 @@ def _version_filter(namespace: str, args: list, contract_date: datetime.date | N
 
 # RRF 통합 시 namespace+chunk_id를 합쳐 충돌을 방지하는 구분자(id에 없는 NUL 문자).
 _KEY_SEP = "\x00"
-
-_bge_model: object | None = None
 
 
 class RagError(RuntimeError):
@@ -238,43 +238,27 @@ async def _vector_search(
     return [_row_to_chunk_row(row, namespace) for row in rows]
 
 
-def _load_bge_model() -> object:
-    """BGE-M3 폴백 모델을 지연 로드한다(블로킹 — to_thread에서 호출)."""
-    global _bge_model
-    if _bge_model is None:
-        from sentence_transformers import SentenceTransformer
-
-        _bge_model = SentenceTransformer(_BGE_MODEL_NAME)
-    return _bge_model
-
-
-async def _bge_embed(text: str) -> list[float]:
-    """BGE-M3로 쿼리를 임베딩한다(폴백 경로). 차원 검증 포함."""
-    model = await asyncio.to_thread(_load_bge_model)
-    vector: list[float] = await asyncio.to_thread(
-        lambda: model.encode(text, normalize_embeddings=True).tolist()  # type: ignore[attr-defined]
-    )
-    if len(vector) != settings.embedding_dim:
-        raise RagError(f"BGE-M3 임베딩 차원 불일치: {len(vector)} != {settings.embedding_dim}")
-    return vector
+def _query_embed_input(text: str) -> str:
+    """쿼리 임베딩 입력을 만든다. openai_compat(qwen3)만 instruction 프리픽스를 붙인다."""
+    if settings.embedding_provider == "openai_compat":
+        return _QUERY_INSTRUCT + text
+    return text
 
 
 async def _embed_query(text: str) -> list[float] | None:
-    """쿼리 임베딩. qwen3:embedding 실패 시 BGE-M3 폴백, 둘 다 실패면 None(degrade).
+    """쿼리를 임베딩한다. 실패하면 None을 돌려 키워드 검색만으로 degrade한다.
+
+    다른 임베딩 모델로 폴백하지 않는다. 색인 모델과 다른 모델로 만든 쿼리 벡터는 차원(1024)이
+    같아 검사를 통과하지만 벡터 공간이 달라, 오류 없이 엉뚱한 결과를 낸다.
 
     Returns:
-        1024d 임베딩 벡터, 또는 둘 다 실패 시 None(키워드 검색만으로 진행).
+        embedding_dim 길이의 쿼리 벡터. 임베딩 호출이 실패하면(차원 불일치 포함) None.
     """
     try:
-        return await ai_client.embed(_QUERY_INSTRUCT + text)
+        return await ai_client.embed(_query_embed_input(text), input_type="query")
     except ai_client.AiClientError as exc:
-        logger.warning("rag.embed.primary_failed", exc_info=exc)
-
-    try:
-        return await _bge_embed(text)
-    # 폴백 경계: 어떤 실패(ImportError·런타임)든 키워드 검색으로 degrade(원칙 8 예외).
-    except Exception as exc:
-        logger.warning("rag.embed.fallback_failed", exc_info=exc)
+        # 예외 메시지엔 응답 본문이 섞일 수 있어 타입명만 남긴다(§9).
+        logger.warning("rag.embed.failed", error_type=type(exc).__name__)
         return None
 
 

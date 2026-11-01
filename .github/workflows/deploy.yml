@@ -50,7 +50,10 @@ jobs:
             shared: ['pyproject.toml','uv.lock','src/core/**']
             ocr: ['src/ocr_worker/**','migrations/ai/**']
             corpus: ['src/corpus_worker/**','migrations/corpus/**']
-            report: ['src/report_worker/**','src/rag/**','src/guardrail/**']
+            # guardrail.mask_pii가 OCR 마스킹 규칙(ocr_worker.masking과 그 import 체인)을 그대로 쓴다.
+            # 규칙만 바뀌어도 report가 다시 배포돼야 두 워커의 마스킹이 갈라지지 않는다.
+            # report 이미지도 migrations/ai를 싣고 기동 시 적용한다(GPU EC2가 꺼져도 자기 테이블 보장).
+            report: ['src/report_worker/**','src/rag/**','src/guardrail/**','migrations/ai/**','src/ocr_worker/masking/**','src/ocr_worker/__init__.py','src/ocr_worker/ocr.py','src/ocr_worker/storage.py']
       - id: set
         shell: bash
         run: |

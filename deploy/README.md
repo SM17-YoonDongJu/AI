@@ -57,7 +57,7 @@ dev push
 | `shared` | `pyproject.toml`, `uv.lock`, `src/core/**` | ocr · corpus · report **전부** |
 | `ocr` | `src/ocr_worker/**`, `migrations/ai/**` | ocr |
 | `corpus` | `src/corpus_worker/**`, `migrations/corpus/**` | corpus |
-| `report` | `src/report_worker/**`, `src/rag/**`, `src/guardrail/**` | report |
+| `report` | `src/report_worker/**`, `src/rag/**`, `src/guardrail/**`, `migrations/ai/**`, `src/ocr_worker/masking/**`(+ `__init__.py`·`ocr.py`·`storage.py` — `guardrail.mask_pii`가 OCR 마스킹 규칙을 재사용) | report |
 
 - 공용 코드(`src/core` 등)를 바꾸면 3개가 전부 재빌드된다.
 - 워크플로 파일(`.github/**`)만 바꾼 push는 어떤 필터에도 안 걸려 **deploy가 skip**된다.

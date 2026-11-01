@@ -85,6 +85,21 @@ _INSTANCE_ID: str = settings.instance_id or socket.gethostname()
 _DEFAULT_LEVEL_BY_ENV = {"local": "DEBUG", "dev": "INFO", "prod": "INFO"}
 # stdlib 레벨명 → OTel SeverityText.
 _SEVERITY_MAP = {"warning": "WARN", "critical": "FATAL"}
+# DEBUG에서 요청 본문(프롬프트 원문)을 그대로 남기는 외부 SDK 로거. anthropic SDK는 DEBUG일 때
+# "Request options"로 messages 전체를 찍는다 — LOG_LEVEL을 DEBUG로 올려도 PII가 새지 않게
+# 이 로거들은 INFO 미만으로 내리지 않는다.
+_BODY_LOGGING_LIBRARIES = ("anthropic", "httpx2", "httpcore2")
+
+
+def cap_sdk_body_loggers() -> None:
+    """요청 본문을 찍는 외부 SDK 로거를 INFO 미만으로 내리지 않는다(PII 방어).
+
+    `configure_logging()`이 적용하지만, anthropic SDK는 import될 때 `ANTHROPIC_LOG` env를 읽어
+    자기 로거 레벨을 다시 설정한다. 그래서 SDK를 지연 import한 직후에도 한 번 더 호출한다.
+    """
+    level = max(logging.getLogger().level, logging.INFO)
+    for name in _BODY_LOGGING_LIBRARIES:
+        logging.getLogger(name).setLevel(level)
 
 
 def _severity_processor(
@@ -194,6 +209,7 @@ def configure_logging() -> None:
     root.handlers.clear()
     root.addHandler(handler)
     root.setLevel(level)
+    cap_sdk_body_loggers()
 
     structlog.configure(
         processors=[*shared, structlog.stdlib.ProcessorFormatter.wrap_for_formatter],

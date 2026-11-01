@@ -1,18 +1,21 @@
 """순차 노드 (async, 실제 의존: db·rag·ai_client·guardrail).
 
 각 노드는 ReportState 부분 dict만 반환(LangGraph가 머지). 노드 내부 실패는 errors에
-기록하고 부분결과로 진행한다(전체 실패 회피, 이슈 #11 방침).
+기록하고 부분결과로 진행한다(전체 실패 회피, 이슈 #11 방침). 예외는 둘이다 — 컨텍스트 하드
+실패와 노드 안의 ai_client 실패(시스템 실패·거절)는 부분결과로 진행하지 않는다. graph.py가
+다음 간선에서 그래프를 멈추고(failure_route), 초안은 저장하지 않는다.
 """
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 import functools
 import json
 import re
 import uuid
-from collections.abc import Awaitable, Callable, Sequence
-from typing import Any
+from collections.abc import Awaitable, Sequence
+from typing import Any, Protocol
 
 import guardrail
 from core import ai_client, crypto, db
@@ -30,24 +33,79 @@ def _err(state: ReportState, msg: str) -> list[str]:
     return [*state.get("errors", []), msg]
 
 
-def safe_node(fn: Callable[[ReportState], Awaitable[dict[str, Any]]]):
-    """노드 예외를 삼켜 errors에 기록하고 부분결과로 진행한다(이슈 #11 방침).
+# ── 실패 단락 판정 (graph.py가 모든 간선에서 다음 노드보다 먼저 본다) ─────
+# 경로 키 = graph.py path_map의 키. LLM_* 두 값은 state["llm_failure"]의 값이기도 하다.
+CONTEXT_FAILURE = "context_failure"
+LLM_SYSTEM_FAILURE = "llm_system_failure"
+LLM_REFUSED = "llm_refused"
+# 컨텍스트 하드 실패 표식 — load_context가 남긴다(safe_node의 예외 표식, 청구·대표 문서 0건).
+# 컨텍스트 없이 LLM을 부르면 빈 리포트에 비용만 쓴다. worker도 같은 표식으로 재전달을 정한다.
+CONTEXT_FAILURE_PREFIXES = ("load_context_failed", "ocr_result_missing")
+
+
+class NodeFn(Protocol):
+    """그래프 노드 시그니처. 인자 이름 `state`까지 맞춰야 LangGraph `add_node`의 타입과 맞는다."""
+
+    __name__: str  # safe_node가 실패 표식("{노드명}_failed:…")에 쓴다
+
+    def __call__(self, state: ReportState) -> Awaitable[dict[str, Any]]: ...
+
+
+def _llm_failure_kind(exc: ai_client.AiClientError) -> str:
+    """ai_client 예외를 단락 종류로 나눈다. 문자열이 아니라 예외 타입으로 판정한다.
+
+    거절(`LlmRefusalError`)만 따로 둔다. 서버 측 폴백 모델까지 거절한 결과라 같은 입력을
+    다시 보내도 거절될 가능성이 높다. 나머지(429·5xx·타임아웃·연결 오류, 키·모델 누락,
+    max_tokens 잘림)는 재전달하면 회복될 수 있는 시스템 실패다.
+    """
+    return LLM_REFUSED if isinstance(exc, ai_client.LlmRefusalError) else LLM_SYSTEM_FAILURE
+
+
+def safe_node(fn: NodeFn) -> NodeFn:
+    """노드 예외를 삼켜 errors에 기록한다. 그래프는 예외로 죽지 않는다(이슈 #11 방침).
 
     노드 본문이 던지면 그래프 전체가 죽는 대신 {"errors": [...]}만 머지된다.
     다운스트림 노드는 전부 state.get(key, default)로 읽으므로 누락 키에 안전하다.
+
+    ai_client 예외(`AiClientError` 계열)는 부분결과로 진행하지 않는다. 종류를
+    `llm_failure`에 남기면 graph.py가 다음 간선에서 그래프를 멈춘다. 이후 LLM 호출은
+    나가지 않고 초안도 저장하지 않는다. 판정은 노드마다 똑같이 걸리므로 LLM을 부르는
+    노드가 몇 개든 같다.
     """
 
     @functools.wraps(fn)
     async def wrapper(state: ReportState) -> dict[str, Any]:
+        # 예외 메시지는 담지 않는다(타입명만) — errors는 report_compose의
+        # "7_추가확인필요" 섹션에 그대로 join돼 최종 리포트에 노출된다.
+        # 원문 파싱 실패 등의 예외 메시지엔 PII 조각이 섞일 수 있다(§9).
         try:
             return await fn(state)
+        except ai_client.AiClientError as e:  # LlmRefusalError 포함
+            return {
+                "errors": _err(state, f"{fn.__name__}_failed:{type(e).__name__}"),
+                "llm_failure": _llm_failure_kind(e),
+            }
         except Exception as e:
-            # 예외 메시지는 담지 않는다(타입명만) — errors는 report_compose의
-            # "7_추가확인필요" 섹션에 그대로 join돼 최종 리포트에 노출된다.
-            # 원문 파싱 실패 등의 예외 메시지엔 PII 조각이 섞일 수 있다(§9).
             return {"errors": _err(state, f"{fn.__name__}_failed:{type(e).__name__}")}
 
     return wrapper
+
+
+def failure_route(state: ReportState) -> str | None:
+    """그래프를 더 진행하면 안 되는 실패의 경로 키. 실패가 없으면 None.
+
+    graph.py가 종료 노드를 뺀 모든 간선에 이 판정을 건다. 어느 노드에서 실패했든 바로 다음
+    간선에서 멈춘다. 컨텍스트 실패를 먼저 본다(가장 이른 실패, 첫 간선에서 끝난다).
+
+    Args:
+        state: 현재 그래프 상태.
+
+    Returns:
+        CONTEXT_FAILURE · LLM_SYSTEM_FAILURE · LLM_REFUSED 중 하나, 또는 None.
+    """
+    if any(str(e).startswith(CONTEXT_FAILURE_PREFIXES) for e in state.get("errors", [])):
+        return CONTEXT_FAILURE
+    return state.get("llm_failure")
 
 
 def _as_str_list(v: Any) -> list[str]:
@@ -175,6 +233,45 @@ def _decrypt_pii_column(row: Any, table: str, column: str, dek: bytes) -> str | 
     return crypto.maybe_decrypt(row[column], table, column, dek)
 
 
+def _mask_free_text(raw: dict[str, str | None]) -> tuple[dict[str, str | None], list[str]]:
+    """복호화한 자유입력 원문을 외부 전송 전에 `guardrail.mask_pii`로 한 번씩 가린다(§13).
+
+    사용자가 직접 쓰는 문장이라 이름·연락처·계좌가 섞이는데, 이 값들은 RAG 쿼리(임베딩 API)와
+    리포트 프롬프트(LLM API)로 나간다. `mask_pii`는 멱등이 아니라(다시 걸면 날짜·금액까지
+    가린다) 원문에 딱 한 번만 건다. OCR `masked_text`는 OCR 워커가 같은 규칙으로 이미 가렸으므로
+    여기 넣지 않는다.
+
+    동기 함수다. NER을 켜면 CPU 추론이 끼므로 호출부가 `asyncio.to_thread`로 뗀다.
+
+    Args:
+        raw: 필드명 → 복호화한 원문. `None`(행·값 없음)은 그대로 `None`으로 둔다.
+
+    Returns:
+        (필드명 → 마스킹본 또는 `None`, 마스킹에 실패해 비운 필드명 목록).
+
+    Raises:
+        ModuleNotFoundError: `USE_NER=true`인데 transformers가 없을 때. 설정 오류라 잡지 않는다
+            — 필드를 조용히 비우면 모든 리포트가 질문 없이 만들어지는데도 아무도 모른다.
+    """
+    masked: dict[str, str | None] = {}
+    failed: list[str] = []
+    for field, text in raw.items():
+        if text is None:
+            masked[field] = None
+            continue
+        try:
+            masked[field] = guardrail.mask_pii(text)
+        except guardrail.MaskingError as exc:
+            # 마스킹 뒤에도 주민·외국인등록번호·카드가 남았다 — 원문으로 폴백하지 않고 이 필드만
+            # 외부 전송에서 뺀다. 로그엔 필드명·예외 타입만 남긴다(예외 메시지도 PII 경계, §9).
+            logger.warning(
+                "free text pii masking failed", field=field, error_type=type(exc).__name__
+            )
+            masked[field] = None
+            failed.append(field)
+    return masked, failed
+
+
 def _extract_claim_diagnosis(claim: Any, dek: bytes) -> str | None:
     """`user_claims.details`(sealed `ClaimDetails`)에서 진단명을 뽑는다.
 
@@ -284,6 +381,10 @@ async def load_context(state: ReportState) -> dict[str, Any]:
     # PII 컬럼(description·question 등)은 백엔드가 AES-256-GCM 봉투(bytea)로 넣어 둔다.
     # DEK는 프로세스당 1회 확보 후 캐시라 노드마다 받아도 비용이 없다 — 한 번 받아 재사용한다.
     #
+    # 복호화한 자유입력(question·description·additional_information)은 mask_pii를 거친 값만
+    # case_info에 담는다(§13 — LLM·임베딩은 외부 API다). 마스킹 실패는 "pii_mask_failed:<필드>"
+    # 소프트 실패로 남기고, 그 필드만 None으로 비운 채 진행한다(_mask_free_text 참고).
+    #
     # DEK 미확보·복호화 실패(PiiCryptoError)는 safe_node의 범용 캐치에 맡기지 않고 여기서
     # 직접 "input_blocked:..."로 반환한다 — route_after_input이 그 접두사를 보고 기존
     # 차단 경로(persist_blocked → status='BLOCKED')로 보낸다. 그냥 흘려보내면(safe_node가
@@ -353,12 +454,21 @@ async def load_context(state: ReportState) -> dict[str, Any]:
         masked_text = ocr["masked_text"] or ""
         entities = _parse_entities(ocr["entities"])
     else:
-        # 청구 문서 0건 + 대표 문서 행도 없음 = 컨텍스트 없음(worker가 하드 실패로 승격).
+        # 청구 문서 0건 + 대표 문서 행도 없음 = 컨텍스트 없음. 그래프는 이 노드 직후 멈추고
+        # (failure_route), worker가 하드 실패로 재전달한다.
         masked_text = ""
         entities = {}
         errors.append("ocr_result_missing")
 
     try:
+        # 자유입력 원문은 case_info에 바로 담지 않는다 — 아래에서 mask_pii를 거친 값만 담는다.
+        raw_free_text = {
+            "question": _decrypt_pii_column(rep, "reports", "question", dek),
+            "description": _decrypt_pii_column(claim, "user_claims", "description", dek),
+            "additional_information": _decrypt_pii_column(
+                claim, "user_claims", "additional_information", dek
+            ),
+        }
         case_info = {
             "accident_type": (rep["accident_type"] if rep else None)
             or (claim["accident_type"] if claim else None),
@@ -367,11 +477,6 @@ async def load_context(state: ReportState) -> dict[str, Any]:
             "diagnosis": _extract_claim_diagnosis(claim, dek)
             or (rep["treatment"] if rep else None),
             "offered_amount": (rep["offered_amount"] if rep else None),
-            "question": _decrypt_pii_column(rep, "reports", "question", dek),
-            "description": _decrypt_pii_column(claim, "user_claims", "description", dek),
-            "additional_information": _decrypt_pii_column(
-                claim, "user_claims", "additional_information", dek
-            ),
             "insurer": _decrypt_pii_column(ins, "user_insurances", "insurer_name", dek),
             "product_name": _decrypt_pii_column(ins, "user_insurances", "product_name", dek),
             # 가입일(date|None) — 표준표 버전 매칭용
@@ -386,6 +491,11 @@ async def load_context(state: ReportState) -> dict[str, Any]:
         logger.error("pii decrypt failed", report_id=state.get("report_id"), error=str(e))
         errors.append(f"input_blocked:pii_decrypt_failed:{type(e).__name__}")
         return {"errors": errors}
+    # 진입 직후 마스킹(§13): 이후 노드는 마스킹본만 본다. 마스킹에 실패한 필드는 None으로
+    # 비우고 표식만 남긴다 — 차단(input_blocked)이 아니라 그 필드 없이 리포트를 계속 만든다.
+    masked_free_text, mask_failed = await asyncio.to_thread(_mask_free_text, raw_free_text)
+    case_info.update(masked_free_text)
+    errors.extend(f"pii_mask_failed:{field}" for field in mask_failed)
     # user_insurances에는 특약별 가입금액 컬럼이 없다(실제 스키마는 coverages text[] 하나뿐) —
     # coverage_details는 채우지 않고, payment_calc가 배수 어림 폴백으로 지급액을 산출한다.
     return {
@@ -498,7 +608,10 @@ async def coverage_analysis(state: ReportState) -> dict[str, Any]:
     dx = state.get("diagnosis") or {}
     dx_name = dx.get("diagnosis") or ci.get("diagnosis") or ""
     icd = " ".join(dx.get("icd_codes") or [])
-    query = f"{dx_name} {icd} {ci.get('question', '')}".strip()
+    # question은 load_context가 마스킹한 값이다(§13). NULL이거나 마스킹 실패로 비었으면(None)
+    # "None" 글자가 쿼리에 들어가지 않게 한다 — 키워드 검색이 plainto_tsquery(AND)라 없는
+    # 단어 하나가 키워드 결과를 0건으로 만든다.
+    query = f"{dx_name} {icd} {ci.get('question') or ''}".strip()
     res = await hybrid.search(
         query,
         namespaces=["terms"],
@@ -1227,6 +1340,11 @@ async def persist(state: ReportState) -> dict[str, Any]:
 
 
 # ── 차단 경로 저장 (초안 없음, reports.status만 갱신) ───────────
+# 입력 차단(persist_blocked)과 LLM 거절(persist_refused)이 같은 Spring 상태를 쓴다. BLOCKED는
+# 사용자에게 사유 구분 없이 "처리할 수 없는 요청"으로 안내되는 종료 상태다(Spring ReportStatus).
+_MARK_BLOCKED_SQL = "UPDATE reports SET status = 'BLOCKED', updated_at = now() WHERE id = $1"
+
+
 @safe_node
 async def persist_blocked(state: ReportState) -> dict[str, Any]:
     """입력 가드레일 차단 시 reports.status만 'BLOCKED'로 갱신한다(초안 없음).
@@ -1244,10 +1362,28 @@ async def persist_blocked(state: ReportState) -> dict[str, Any]:
     rid = uuid.UUID(state["report_id"])
     pool = db.get_pool()
     async with pool.acquire() as c:
-        await c.execute(
-            "UPDATE reports SET status = 'BLOCKED', updated_at = now() WHERE id = $1",
-            rid,
-        )
+        await c.execute(_MARK_BLOCKED_SQL, rid)
+    return {"errors": state.get("errors", [])}
+
+
+# ── LLM 거절 경로 저장 (초안 없음, reports.status만 갱신) ──────────
+@safe_node
+async def persist_refused(state: ReportState) -> dict[str, Any]:
+    """LLM이 리포트 생성을 거절했을 때 reports.status만 'BLOCKED'로 갱신한다(초안 없음).
+
+    서버 측 폴백 모델까지 거절한 결과라 다시 보내도 거절될 가능성이 높다. 그래서 worker가
+    NonRetryableError로 즉시 종결(ack)한다. 이 노드가 그 전에 상태를 남기지 않으면 리포트가
+    영원히 처리 중으로 보인다.
+
+    persist_blocked와 다른 점은 실패 처리다. 여기서 기록에 실패하면 `persist_refused_failed`가
+    worker의 하드 실패로 올라가 재전달된다. 기록 없이 ack하면 무음 실패가 된다. 거절 사유(어느
+    노드가 어떤 예외로 멈췄는지)는 errors 표식으로 worker가 로그에 남긴다. reports에는 사유
+    컬럼이 없다.
+    """
+    rid = uuid.UUID(state["report_id"])
+    pool = db.get_pool()
+    async with pool.acquire() as c:
+        await c.execute(_MARK_BLOCKED_SQL, rid)
     return {"errors": state.get("errors", [])}
 
 

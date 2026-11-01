@@ -3,9 +3,11 @@
 대상:
   - prec_chunks.jsonl 중 '보험 직접관련' 버킷만 (보험금청구/구상금/자동차손배/채무부존재)
   - fss_chunks.jsonl 전체 (금감원 분쟁조정, 전부 보험)
-임베딩: qwen3-embedding:0.6b (약관 policy_chunks와 동일 1024d).
+임베딩: doc_embedder — 기본 Ollama qwen3-embedding:0.6b, EMBED_PROVIDER=voyage면 Voyage
+voyage-4-large(1024d). policy_chunks·schedule_chunks·쿼리 쪽과 같은 모델이어야 한다.
 
     python tempVectorDB/load_cases.py
+    EMBED_PROVIDER=voyage VOYAGE_API_KEY=... python tempVectorDB/load_cases.py
 """
 
 from __future__ import annotations
@@ -18,20 +20,26 @@ import re
 
 import asyncpg
 import httpx
+from doc_embedder import EmbedConfig, embed_batch
 from kiwipiepy import Kiwi
 
 CORPUS = r"C:\Users\wkdrn\test\_workspace\raw_dataset\rag_corpus"
-DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://postgres:postgres@localhost:5433/aiengine")
-OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434").rstrip("/")
-EMBED_MODEL = os.environ.get("EMBED_MODEL", "qwen3-embedding:0.6b")
+DATABASE_URL = os.environ.get(
+    "DATABASE_URL", "postgresql://postgres:postgres@localhost:5433/aiengine"
+)
 BATCH = 32
 
 _kiwi = Kiwi()
 
 # 한글 section → chunk_type enum
 _SEC = {
-    "판시사항": "holding", "판결요지": "summary", "주문": "order",
-    "이유": "reasoning", "청구취지": "fact", "참조조문": "general", "본문": "decision",
+    "판시사항": "holding",
+    "판결요지": "summary",
+    "주문": "order",
+    "이유": "reasoning",
+    "청구취지": "fact",
+    "참조조문": "general",
+    "본문": "decision",
 }
 
 
@@ -88,13 +96,20 @@ def _iter_records():
             continue
         sec = r.get("section", "")
         yield {
-            "chunk_id": r["id"], "content": r["text"], "chunk_type": _SEC.get(sec, "general"),
-            "doc_hash": str(r.get("doc_id")), "source_type": "court_precedent",
-            "institution": r.get("법원명"), "case_no": r.get("사건번호"),
-            "case_title": r.get("사건명"), "decision_date": _date(r.get("선고일자")),
-            "source_url": "https://www.law.go.kr", "accident_type": None,
+            "chunk_id": r["id"],
+            "content": r["text"],
+            "chunk_type": _SEC.get(sec, "general"),
+            "doc_hash": str(r.get("doc_id")),
+            "source_type": "court_precedent",
+            "institution": r.get("법원명"),
+            "case_no": r.get("사건번호"),
+            "case_title": r.get("사건명"),
+            "decision_date": _date(r.get("선고일자")),
+            "source_url": "https://www.law.go.kr",
+            "accident_type": None,
             "tags": [t for t in [r.get("outcome"), r.get("사건종류명")] if t],
-            "section": sec, "chunk_index": r.get("chunk_idx"),
+            "section": sec,
+            "chunk_index": r.get("chunk_idx"),
         }
     # 분쟁조정
     for line in open(os.path.join(CORPUS, "fss_chunks.jsonl"), encoding="utf-8"):
@@ -103,31 +118,33 @@ def _iter_records():
         except Exception:
             continue
         yield {
-            "chunk_id": r["id"], "content": r["text"], "chunk_type": "decision",
-            "doc_hash": str(r.get("doc_id")), "source_type": "fss_mediation",
-            "institution": "금융감독원", "case_no": None,
-            "case_title": r.get("제목"), "decision_date": _date(r.get("등록일")),
-            "source_url": "https://www.fss.or.kr", "accident_type": None,
+            "chunk_id": r["id"],
+            "content": r["text"],
+            "chunk_type": "decision",
+            "doc_hash": str(r.get("doc_id")),
+            "source_type": "fss_mediation",
+            "institution": "금융감독원",
+            "case_no": None,
+            "case_title": r.get("제목"),
+            "decision_date": _date(r.get("등록일")),
+            "source_url": "https://www.fss.or.kr",
+            "accident_type": None,
             "tags": [t for t in [r.get("outcome"), r.get("유형")] if t],
-            "section": r.get("section"), "chunk_index": r.get("chunk_idx"),
+            "section": r.get("section"),
+            "chunk_index": r.get("chunk_idx"),
         }
 
 
-async def _embed_batch(client: httpx.AsyncClient, texts: list[str]) -> list[str]:
-    resp = await client.post(f"{OLLAMA_URL}/api/embed", json={"model": EMBED_MODEL, "input": texts})
-    resp.raise_for_status()
-    embs = resp.json()["embeddings"]
-    return ["[" + ",".join(map(str, e)) + "]" for e in embs]
-
-
 async def main() -> None:
+    # 키 누락 등 설정 오류는 코퍼스를 읽고 TRUNCATE하기 전에 드러낸다.
+    embed_config = EmbedConfig.from_env()
     records = list(_iter_records())
     # chunk_id 중복 제거(파일 간 혹시 모를 충돌)
     uniq = {}
     for r in records:
         uniq[r["chunk_id"]] = r
     records = list(uniq.values())
-    print(f"적재 대상: {len(records)} 청크 (임베딩 시작)")
+    print(f"적재 대상: {len(records)} 청크 (임베딩 시작: {embed_config.describe()})")
 
     conn = await asyncpg.connect(DATABASE_URL)
     await conn.execute("TRUNCATE case_chunks")
@@ -135,16 +152,30 @@ async def main() -> None:
     async with httpx.AsyncClient(timeout=120) as client:
         for i in range(0, len(records), BATCH):
             batch = records[i : i + BATCH]
-            embs = await _embed_batch(client, [b["content"] for b in batch])
+            embs = await embed_batch(client, embed_config, [b["content"] for b in batch])
             rows = []
             for b, emb in zip(batch, embs):
                 toks = " ".join(t.form for t in _kiwi.tokenize(b["content"][:2000]))
-                rows.append((
-                    b["chunk_id"], b["content"], toks, emb, b["chunk_type"], b["doc_hash"],
-                    b["source_type"], b["institution"], b["case_no"], b["case_title"],
-                    b["decision_date"], b["source_url"], b["accident_type"], b["tags"],
-                    b["section"], b["chunk_index"],
-                ))
+                rows.append(
+                    (
+                        b["chunk_id"],
+                        b["content"],
+                        toks,
+                        emb,
+                        b["chunk_type"],
+                        b["doc_hash"],
+                        b["source_type"],
+                        b["institution"],
+                        b["case_no"],
+                        b["case_title"],
+                        b["decision_date"],
+                        b["source_url"],
+                        b["accident_type"],
+                        b["tags"],
+                        b["section"],
+                        b["chunk_index"],
+                    )
+                )
             await conn.executemany(
                 """INSERT INTO case_chunks
                    (chunk_id, content, content_tokens, embedding, chunk_type, doc_hash,
