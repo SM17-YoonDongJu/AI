@@ -10,7 +10,7 @@
 | `contracts.py` | **워커 간 메시지·결과 계약(단일 출처)**. SQS 페이로드와 RAG·가드레일 결과 모델 | `OcrJob`, `ReportJob`, `DocType`, `Chunk`, `Citation`, `RagResult`, `InputGuardResult`, `OutputGuardResult` |
 | `sqs/` | boto3 SQS 래퍼. 롱폴링·역직렬화·ack(DeleteMessage)·poison 스킵·우아한 종료 | `SqsConsumer`, `SqsProducer`, `get_sqs_client()` |
 | `db.py` | asyncpg 풀 lifecycle(pgvector 타입 등록 포함)과 멱등 SQL 마이그레이션 적용 | `db_pool()`, `init_pool()`/`get_pool()`/`close_pool()`, `run_migrations()` |
-| `ai_client.py` | **OpenAI 호환** 추론 클라이언트(Ollama/vLLM 무관). 임베딩 차원 검증 포함 | `chat()`, `chat_json()`, `embed()`, `close_client()` |
+| `ai_client.py` | 추론 클라이언트. 챗은 OpenAI 호환(Ollama/vLLM) 또는 Claude(공식 anthropic SDK), 임베딩은 OpenAI 호환 또는 Voyage — env provider 스위치. 챗 키(`AI_API_KEY`)와 임베딩 키(`EMBEDDING_API_KEY`)는 분리. 임베딩 차원 검증 포함 | `chat()`, `chat_json()`, `embed()`, `embed_batch()`, `close_client()` |
 | `crypto.py` | AES-256-GCM PII 컬럼 복호화(Spring 암호화 봉투 포맷). DEK 조회 | `decrypt_pii()`, `maybe_decrypt()`, `get_pii_dek()` |
 | `exceptions.py` | 공용 예외 계층. `NonRetryableError`는 SQS 컨슈머가 **첫 시도에 즉시 ack**하는 결정적 실패 표식 | `AppError`, `NonRetryableError`, `UnreadableFileError`, `PiiCryptoError` 등 |
 | `logging.py` | structlog JSON 로깅. 출력 직전 **PII 자동 마스킹**(주민·카드·전화·이메일), 요청 컨텍스트 바인딩 | `configure_logging()`, `get_logger()`, `bind_context()`, `log_event()` |
@@ -33,8 +33,9 @@ DLQ는 쓰지 않는다. 핸들러는 반드시 **멱등**해야 한다(at-least
 | `DATABASE_URL`, `RDS_CA_PATH` | PostgreSQL 접속(RDS면 TLS CA 경로) |
 | `SQS_OCR_JOB_QUEUE_URL`, `SQS_REPORT_JOB_QUEUE_URL` | 큐 전체 URL |
 | `SQS_ENDPOINT_URL` | 로컬 LocalStack(`http://localhost:4566`). prod은 비움 |
-| `AI_BASE_URL`, `LLM_MODEL` | 챗 추론 엔드포인트·모델 |
-| `EMBEDDING_BASE_URL`, `EMBEDDING_MODEL`, `EMBEDDING_DIM` | 임베딩(기본 1024d) |
+| `LLM_PROVIDER`, `AI_BASE_URL`, `AI_API_KEY`, `LLM_MODEL` | 챗 provider(기본 `anthropic` · `openai_compat`)·엔드포인트(openai_compat 전용)·키·모델(기본값 없음) |
+| `LLM_EFFORT`, `LLM_MAX_TOKENS`, `LLM_TIMEOUT_SECONDS` | anthropic 전용(effort·출력 상한·SDK 타임아웃) |
+| `EMBEDDING_PROVIDER`, `EMBEDDING_BASE_URL`, `EMBEDDING_API_KEY`, `EMBEDDING_MODEL`, `EMBEDDING_DIM` | 임베딩 provider(`openai_compat`·`voyage`)·엔드포인트·키·모델·차원(기본 1024d). 바꾸면 코퍼스 전체 재임베딩(`python -m rag.reembed`) |
 | `VLM_BASE_URL`, `VLM_MODEL`, `VLM_GROUNDING_MODEL` | OCR 보조 VLM |
 | `PII_ENC_KEY` / `PII_KMS_KEY_ARN` | PII 복호화 키(local·dev는 env, 그 외 KMS) |
 | `SERVICE_NAME`, `ENV`, `LOG_LEVEL` | 로깅 메타 |

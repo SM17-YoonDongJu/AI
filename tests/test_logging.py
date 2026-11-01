@@ -1,7 +1,11 @@
 """core.logging 검증 — PII 마스킹(방어선)·컨텍스트 전파·구성 스모크."""
 
+import logging
+
+import pytest
 import structlog
 
+from core import logging as core_logging
 from core.logging import (
     bind_context,
     clear_context,
@@ -77,3 +81,40 @@ def test_configure_and_log_does_not_raise():
     log = get_logger("test")
     log.info("스모크 메시지", foo="bar")
     log_event(log, "rag.search.completed", duration_ms=12)
+
+
+@pytest.fixture
+def _restore_log_levels():  # type: ignore[no-untyped-def]
+    names = ["", "anthropic", "httpx2", "httpcore2"]
+    saved = {name: logging.getLogger(name).level for name in names}
+    yield
+    for name, level in saved.items():
+        logging.getLogger(name).setLevel(level)
+
+
+@pytest.mark.usefixtures("_restore_log_levels")
+def test_debug_level_does_not_open_sdk_body_loggers(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Arrange: 장애 대응 중 LOG_LEVEL=DEBUG로 올린 상황
+    monkeypatch.setattr(core_logging.settings, "log_level", "DEBUG")
+
+    # Act
+    configure_logging()
+
+    # Assert: 앱 로그는 DEBUG지만, 요청 본문을 찍는 SDK 로거는 INFO 미만으로 내려가지 않는다
+    assert logging.getLogger().level == logging.DEBUG
+    assert logging.getLogger("anthropic").getEffectiveLevel() == logging.INFO
+    assert logging.getLogger("httpx2").getEffectiveLevel() == logging.INFO
+    assert logging.getLogger("httpcore2").getEffectiveLevel() == logging.INFO
+
+
+@pytest.mark.usefixtures("_restore_log_levels")
+def test_cap_reapplies_after_sdk_reset_its_logger() -> None:
+    # Arrange: SDK가 import 때 ANTHROPIC_LOG=debug로 자기 로거를 DEBUG로 되돌린 상황
+    logging.getLogger().setLevel(logging.INFO)
+    logging.getLogger("anthropic").setLevel(logging.DEBUG)
+
+    # Act
+    core_logging.cap_sdk_body_loggers()
+
+    # Assert
+    assert logging.getLogger("anthropic").getEffectiveLevel() == logging.INFO

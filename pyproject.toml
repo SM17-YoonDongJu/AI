@@ -38,10 +38,9 @@ report = [
     "langgraph>=0.2",
     "langchain-core>=0.3",
     "boto3>=1.34",  # SQS ReceiveMessage/DeleteMessage(report-job 큐 소비)
-]
-# 임베딩 폴백 (BGE-M3). torch 포함 — 무겁고 플랫폼 의존적.
-embeddings = [
-    "sentence-transformers>=3.0",
+    "anthropic>=2.3",  # Claude API(LLM_PROVIDER=anthropic) — core.ai_client가 지연 import
+    # anthropic SDK의 HTTP 계층. 스트림 도중 끊김 예외를 core.ai_client가 직접 잡아 명시한다.
+    "httpx2>=2.0",
 ]
 # PII 탐지 보조 NER. 실행 시 torch 필요(배포 이미지에서 플랫폼별로 설치).
 ner = [
@@ -104,5 +103,8 @@ module = [
     "botocore.*",
     "PIL.*",
     "asyncpg",
+    "anthropic",
+    "anthropic.*",
+    "httpx2",
 ]
 ignore_missing_imports = true
