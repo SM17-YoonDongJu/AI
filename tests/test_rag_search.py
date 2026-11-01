@@ -5,6 +5,7 @@
 
 import datetime
 import sys
+from typing import Any
 
 import pytest
 
@@ -87,6 +88,25 @@ class _FakePool:
         return _CASE_KEYWORD if is_keyword else _CASE_VECTOR
 
 
+class _RecordingLogger:
+    """structlog 로거 대역 — (레벨, 이벤트, 필드)를 기록한다."""
+
+    def __init__(self) -> None:
+        self.records: list[tuple[str, str, dict[str, Any]]] = []
+
+    def info(self, event: str, **fields: Any) -> None:
+        self.records.append(("info", event, fields))
+
+    def warning(self, event: str, **fields: Any) -> None:
+        self.records.append(("warning", event, fields))
+
+
+@pytest.fixture(autouse=True)
+def _openai_compat_embedding(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Arrange: 개발자 셸의 EMBEDDING_PROVIDER가 새어 들지 않게 기본(로컬) provider로 고정한다.
+    monkeypatch.setattr(settings, "embedding_provider", "openai_compat")
+
+
 @pytest.fixture
 def fake_pool(monkeypatch: pytest.MonkeyPatch) -> _FakePool:
     pool = _FakePool()
@@ -98,7 +118,9 @@ async def test_search_returns_fused_chunks_and_citations(
     fake_pool: _FakePool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Arrange: 임베딩은 계약 차원의 0벡터
-    async def fake_embed(text: str) -> list[float]:
+    async def fake_embed(
+        text: str, *, input_type: ai_client.EmbedInputType = "query"
+    ) -> list[float]:
         return [0.0] * settings.embedding_dim
 
     monkeypatch.setattr(ai_client, "embed", fake_embed)
@@ -128,32 +150,86 @@ async def test_out_of_scope_returns_empty(monkeypatch: pytest.MonkeyPatch) -> No
     assert result.citations == []
 
 
+@pytest.mark.parametrize(
+    "error",
+    [
+        ai_client.AiClientError("embed 호출 실패"),
+        ai_client.EmbeddingDimensionError("임베딩 차원 불일치: 768 != 1024"),
+    ],
+)
 async def test_degrades_to_keyword_only_when_embedding_fails(
-    fake_pool: _FakePool, monkeypatch: pytest.MonkeyPatch
+    fake_pool: _FakePool, monkeypatch: pytest.MonkeyPatch, error: ai_client.AiClientError
 ) -> None:
-    # Arrange: 1차·폴백 임베딩 모두 실패 → 키워드 검색만으로 degrade
-    async def boom_embed(text: str) -> list[float]:
-        raise ai_client.AiClientError("primary down")
+    # Arrange: 임베딩 실패(차원 불일치 포함) → 다른 모델로 폴백하지 않고 키워드 검색만으로 degrade
+    async def boom_embed(
+        text: str, *, input_type: ai_client.EmbedInputType = "query"
+    ) -> list[float]:
+        raise error
 
-    def boom_bge() -> object:
-        raise ImportError("sentence_transformers 미설치")
-
+    log = _RecordingLogger()
     monkeypatch.setattr(ai_client, "embed", boom_embed)
-    monkeypatch.setattr(search_mod, "_load_bge_model", boom_bge)
+    monkeypatch.setattr(search_mod, "logger", log)
 
     # Act
     result = await search_mod.search("후유장해", namespaces=["terms"], top_k=8)
 
-    # Assert: 벡터 없이도 키워드 결과는 반환된다
+    # Assert: 벡터 검색 SQL 없이 키워드 결과만 반환된다
     assert len(result.ranked_chunks) > 0
     assert {chunk.namespace for chunk in result.ranked_chunks} == {"terms"}
+    assert not any("<=>" in sql for sql, _ in fake_pool.fetch_calls)
+    # 경고 로그엔 예외 타입만 남고(메시지 없음), 완료 로그는 degraded=True
+    assert ("warning", "rag.embed.failed", {"error_type": type(error).__name__}) in log.records
+    completed = [fields for _, event, fields in log.records if event == "rag.search.completed"]
+    assert completed[0]["degraded"] is True
+
+
+async def test_openai_compat_query_gets_instruction_prefix(
+    fake_pool: _FakePool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Arrange: qwen3(openai_compat)는 쿼리 instruction 프리픽스를 붙인다. input_type은 기본값이 없어
+    # search가 명시적으로 넘겨야 호출된다.
+    calls: list[tuple[str, str]] = []
+
+    async def recording_embed(text: str, *, input_type: ai_client.EmbedInputType) -> list[float]:
+        calls.append((text, input_type))
+        return [0.0] * settings.embedding_dim
+
+    monkeypatch.setattr(ai_client, "embed", recording_embed)
+
+    # Act
+    await search_mod.search("후유장해 보상", namespaces=["terms"], top_k=8)
+
+    # Assert
+    assert calls == [(search_mod._QUERY_INSTRUCT + "후유장해 보상", "query")]
+
+
+async def test_voyage_query_is_sent_without_instruction_prefix(
+    fake_pool: _FakePool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Arrange: voyage는 input_type=query에 업체가 검색 프롬프트를 붙이므로 원문만 보낸다
+    calls: list[tuple[str, str]] = []
+
+    async def recording_embed(text: str, *, input_type: ai_client.EmbedInputType) -> list[float]:
+        calls.append((text, input_type))
+        return [0.0] * settings.embedding_dim
+
+    monkeypatch.setattr(settings, "embedding_provider", "voyage")
+    monkeypatch.setattr(ai_client, "embed", recording_embed)
+
+    # Act
+    await search_mod.search("후유장해 보상", namespaces=["terms"], top_k=8)
+
+    # Assert
+    assert calls == [("후유장해 보상", "query")]
 
 
 async def test_insurer_product_filter_reaches_sql(
     fake_pool: _FakePool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Arrange
-    async def fake_embed(text: str) -> list[float]:
+    async def fake_embed(
+        text: str, *, input_type: ai_client.EmbedInputType = "query"
+    ) -> list[float]:
         return [0.0] * settings.embedding_dim
 
     monkeypatch.setattr(ai_client, "embed", fake_embed)
@@ -177,7 +253,9 @@ async def test_insurer_product_filter_skips_case_namespace(
     fake_pool: _FakePool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Arrange
-    async def fake_embed(text: str) -> list[float]:
+    async def fake_embed(
+        text: str, *, input_type: ai_client.EmbedInputType = "query"
+    ) -> list[float]:
         return [0.0] * settings.embedding_dim
 
     monkeypatch.setattr(ai_client, "embed", fake_embed)
@@ -223,7 +301,9 @@ async def test_level_search_binds_contract_date_version_filter(
     fake_pool: _FakePool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Arrange
-    async def fake_embed(text: str) -> list[float]:
+    async def fake_embed(
+        text: str, *, input_type: ai_client.EmbedInputType = "query"
+    ) -> list[float]:
         return [0.0] * settings.embedding_dim
 
     monkeypatch.setattr(ai_client, "embed", fake_embed)
@@ -247,7 +327,9 @@ async def test_level_search_defaults_to_current_version_when_no_contract_date(
     fake_pool: _FakePool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Arrange
-    async def fake_embed(text: str) -> list[float]:
+    async def fake_embed(
+        text: str, *, input_type: ai_client.EmbedInputType = "query"
+    ) -> list[float]:
         return [0.0] * settings.embedding_dim
 
     monkeypatch.setattr(ai_client, "embed", fake_embed)
@@ -268,7 +350,9 @@ async def test_contract_date_does_not_affect_terms_or_case(
     fake_pool: _FakePool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Arrange
-    async def fake_embed(text: str) -> list[float]:
+    async def fake_embed(
+        text: str, *, input_type: ai_client.EmbedInputType = "query"
+    ) -> list[float]:
         return [0.0] * settings.embedding_dim
 
     monkeypatch.setattr(ai_client, "embed", fake_embed)

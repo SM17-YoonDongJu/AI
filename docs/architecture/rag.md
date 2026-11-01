@@ -1,6 +1,7 @@
 # 공용 Hybrid RAG 검색 파이프라인 (`src/rag` · report_worker 사용)
 
 > 출처: AI 엔진 아키텍처 문서 세트 · 최종 점검일 2026-07-15 · 브랜치 `11-feature-langgraph-멀티에이전트-구현`
+> 갱신 2026-10-31: 임베딩·폴백 서술(BGE-M3 폴백 제거, provider 스위치, 재임베딩 CLI)과 `search.py` 줄 번호만 다시 맞췄다. 나머지 절은 07-15 점검 그대로다.
 > 상위: [README](./README.md) · 원본 코드 정독 + 적대적 교차검증(코드 재대조) 완료
 
 ## 🎯 한 문장 요약
@@ -52,10 +53,10 @@ report_worker가 함수 호출로 사용하는 단일 진입점 `search()`를 �
 
 ## 1. 파이프라인 개요 — 단계별 데이터 흐름
 
-`search()`는 다음 5단계를 조립한다. `src/rag/search.py:6-12`의 docstring이 공식 요약이다.
+`search()`는 다음 5단계를 조립한다. `src/rag/search.py:6-11`의 docstring이 공식 요약이다.
 
 ```python
-# src/rag/search.py:6-12
+# src/rag/search.py:6-11
 파이프라인(04):
   1. 라우터 — namespace 결정, 비신체보험 범위 외 빈 결과
   2. trigram 오타보정 — search_terms 정규 용어 치환
@@ -81,64 +82,64 @@ report_worker가 함수 호출로 사용하는 단일 진입점 `search()`를 �
                                       │
                                       ▼
               ┌──────────────────────────────────────────┐
-   (1) 라우터  │ route(query, insurance_type, namespaces)  │  search.py:307
+   (1) 라우터  │ route(query, insurance_type, namespaces)  │  search.py:291
               │  - 비신체보험 힌트 탐지 → in_scope=False   │
               │  - VALID_NAMESPACES 교집합, 순서 보존      │
               └──────────────────────────────────────────┘
                                       │
-                     in_scope=False?  ├──► RagResult(ranked_chunks=[], citations=[])  (search.py:308-310)
+                     in_scope=False?  ├──► RagResult(ranked_chunks=[], citations=[])  (search.py:292-294)
                                       │    + log_event_out_of_scope
                                       ▼ in_scope=True
               ┌──────────────────────────────────────────┐
- (2) 오타보정 │ correct_query(pool, query)                │  search.py:313
+ (2) 오타보정 │ correct_query(pool, query)                │  search.py:297
               │  Kiwi 토큰화(내용어) → search_terms         │
               │  trigram similarity>0.4 정규 용어 치환      │
               │  → keyword_query(키워드용) · embed_text(임베딩용) │
               └──────────────────────────────────────────┘
                                       │
-              candidate_k = max(top_k*3, 20)   (search.py:316)
+              candidate_k = max(top_k*3, 20)   (search.py:300)
                                       │
         ┌─────────────────────────────┴──────────────────────────────┐
         │                                                             │
         ▼ (병렬 시작)                                                  ▼
  embed_task = create_task(_embed_query(embed_text))          _keyword_search × N namespaces
-        │  qwen3:embedding → 실패 시 BGE-M3 → 실패 시 None      │  tsvector @@ plainto_tsquery
-        │                                                     │  (search.py:320-327, await gather)
+        │  ai_client.embed(input_type=query) → 실패 시 None     │  tsvector @@ plainto_tsquery
+        │                                                     │  (search.py:304-311, await gather)
         ▼                                                     │
    embedding (1024d | None)                                  │
         │                                                     │
         ▼ embedding is not None?                              │
  _vector_search × N namespaces                                │
    pgvector  embedding <=> $1  (cosine)                       │
-   (search.py:331-336)                                        │
+   (search.py:315-320)                                        │
         │  embedding is None → vector_results = [[],...]      │
-        │  (키워드만으로 degrade, search.py:337-339)            │
+        │  (키워드만으로 degrade, search.py:321-323)            │
         └─────────────────────────────┬──────────────────────┘
                                       ▼
               ┌──────────────────────────────────────────┐
-  (3.5) 인덱싱│ row_index: key(ns+chunk_id) → ChunkRow     │  search.py:342-348
+  (3.5) 인덱싱│ row_index: key(ns+chunk_id) → ChunkRow     │  search.py:326-332
               │ keyword_rankings(weight=0.5)               │
               │ vector_rankings(weight=0.5)                │
               └──────────────────────────────────────────┘
                                       ▼
               ┌──────────────────────────────────────────┐
-  (4) RRF통합 │ rrf_fuse([*keyword, *vector])             │  search.py:350
+  (4) RRF통합 │ rrf_fuse([*keyword, *vector])             │  search.py:334
               │ score = Σ weight/(60 + rank)              │  fusion.py:37
               │ 점수 내림차순, 동점 id 오름차순             │
               └──────────────────────────────────────────┘
                                       ▼
-                          top = fused[:top_k]   (search.py:351)
+                          top = fused[:top_k]   (search.py:335)
                           top_rows = [row_index[key] ...]
                                       │
         ┌─────────────────────────────┴──────────────────────────────┐
         ▼                                                             ▼
  chunks: list[Chunk]                                     (5) build_citations(top_rows)
    text, namespace, score,                                  clause_no/exhibit 역추적
-   source_ref=chunk_id, article_number,                     중복 제거   (search.py:366)
-   product_name, chunk_type  (search.py:354-365)                       │
+   source_ref=chunk_id, article_number,                     중복 제거   (search.py:350)
+   product_name, chunk_type  (search.py:338-349)                       │
         └─────────────────────────────┬──────────────────────────────┘
                                       ▼
-                    RagResult(ranked_chunks=chunks, citations=citations)   (search.py:369)
+                    RagResult(ranked_chunks=chunks, citations=citations)   (search.py:353)
                     + log_event_completed(...)
 ```
 
@@ -148,9 +149,9 @@ report_worker가 함수 호출로 사용하는 단일 진입점 `search()`를 �
 
 - **부수효과 최소화**: DB 조회(asyncpg 풀)·임베딩 호출(ai_client) 외에는 상태를 바꾸지 않는다. 반환값 외 전역 상태 변경 없음(로깅 제외).
   > 쉽게 말하면: 검색 함수는 결과만 돌려줄 뿐, 몰래 다른 데이터를 고치거나 흔적을 남기지 않는다.
-- **병렬성**: 임베딩 생성은 `asyncio.create_task`로 키워드 검색과 동시에 시작되고(`search.py:319`), 키워드 검색과 벡터 검색은 각각 namespace별로 `asyncio.gather`로 병렬 실행된다(`search.py:320-327`, `search.py:331-336`).
+- **병렬성**: 임베딩 생성은 `asyncio.create_task`로 키워드 검색과 동시에 시작되고(`search.py:303`), 키워드 검색과 벡터 검색은 각각 namespace별로 `asyncio.gather`로 병렬 실행된다(`search.py:304-311`, `search.py:315-320`).
   > 쉽게 말하면: 시간이 걸리는 작업들을 한 줄로 세워 순서대로 하지 않고, 여러 개를 동시에 돌려서 전체 시간을 줄인다.
-- **우아한 성능 저하(degrade)**: 임베딩이 실패하면 벡터 결과를 빈 리스트로 채워 키워드 검색만으로 진행한다(`search.py:337-339`).
+- **우아한 성능 저하(degrade)**: 임베딩이 실패하면 벡터 결과를 빈 리스트로 채워 키워드 검색만으로 진행한다(`search.py:321-323`).
   > 쉽게 말하면: 의미 검색이 고장 나도 검색 전체가 멈추지 않는다. 키워드 검색만으로라도 답을 준다.
 
 ---
@@ -397,7 +398,7 @@ class CorrectedQuery:
 **테이블 매핑**:
 
 ```python
-# src/rag/search.py:39-44
+# src/rag/search.py:41-46
 # namespace → 테이블.
 _NS_TABLE: dict[str, str] = {
     "terms": "policy_chunks",
@@ -409,7 +410,7 @@ _NS_TABLE: dict[str, str] = {
 **컬럼 매핑(`_NS_COLS`)** — 세 테이블 스키마가 달라 SELECT에서 별칭(AS 이름)으로 맞춰 준다.
 
 ```python
-# src/rag/search.py:46-54
+# src/rag/search.py:48-56
 # namespace별 SELECT 소스식: (clause_no, exhibit, article_number, product_name, chunk_type).
 # 세 테이블 스키마가 달라 별칭으로 정합한다. 값은 내부 상수(사용자 입력 아님).
 # level: 인용의 조항 자리에는 표 내 section(clause_no·article_number), 별표 자리에는 개정판
@@ -434,13 +435,13 @@ _NS_COLS: dict[str, tuple[str, str, str, str, str]] = {
 특기사항:
 
 - `case`의 `exhibit`은 실제 컬럼이 아니라 `NULL::text` 리터럴이다(사례엔 별표 개념이 없어서).
-- `level`의 `exhibit`에는 **개정판 라벨 `version_label`**을 실어, 인용할 때 "어느 버전 분류표인지" 되짚을 수 있게 한다(`search.py:48-49`). `level`의 `product_name`은 `NULL::text`(상품 개념 없음).
-- 이 값들은 **전부 코드 안에 박힌 내부 상수**이지 사용자 입력이 아니므로, f-string으로 조립해도 SQL 인젝션(악의적 문자열로 DB를 조작하는 공격) 위험이 없다(`search.py:47`).
+- `level`의 `exhibit`에는 **개정판 라벨 `version_label`**을 실어, 인용할 때 "어느 버전 분류표인지" 되짚을 수 있게 한다(`search.py:50-51`). `level`의 `product_name`은 `NULL::text`(상품 개념 없음).
+- 이 값들은 **전부 코드 안에 박힌 내부 상수**이지 사용자 입력이 아니므로, f-string으로 조립해도 SQL 인젝션(악의적 문자열로 DB를 조작하는 공격) 위험이 없다(`search.py:49`).
 
 SELECT 컬럼식 조립:
 
 ```python
-# src/rag/search.py:57-64
+# src/rag/search.py:59-66
 def _select_cols(namespace: str) -> str:
     """namespace의 표준 SELECT 컬럼식(별칭 포함)."""
     clause_no, exhibit, article_number, product_name, chunk_type = _NS_COLS[namespace]
@@ -533,71 +534,77 @@ async def _vector_search(
 - **명시적 캐스트 없음**(`search.py:226`): asyncpg에 halfvec/vector 코덱이 등록돼 있어 파이썬 `list[float]`을 형변환 없이 그대로 바인딩한다.
 - 파라미터: `$1=embedding`(1024차원 리스트), 그 뒤 meta·version 파라미터, 마지막 `top_k`.
 
-임베딩 생성 경로(3중 폴백):
+임베딩 생성 경로(실패하면 키워드만으로 degrade — 다른 모델로 폴백하지 않는다):
 
 ```python
-# src/rag/search.py:262-278
+# src/rag/search.py:241-262
+def _query_embed_input(text: str) -> str:
+    """쿼리 임베딩 입력을 만든다. openai_compat(qwen3)만 instruction 프리픽스를 붙인다."""
+    if settings.embedding_provider == "openai_compat":
+        return _QUERY_INSTRUCT + text
+    return text
+
+
 async def _embed_query(text: str) -> list[float] | None:
-    """쿼리 임베딩. qwen3:embedding 실패 시 BGE-M3 폴백, 둘 다 실패면 None(degrade).
+    """쿼리를 임베딩한다. 실패하면 None을 돌려 키워드 검색만으로 degrade한다.
     ...
     """
     try:
-        return await ai_client.embed(_QUERY_INSTRUCT + text)
+        return await ai_client.embed(_query_embed_input(text), input_type="query")
     except ai_client.AiClientError as exc:
-        logger.warning("rag.embed.primary_failed", exc_info=exc)
-
-    try:
-        return await _bge_embed(text)
-    # 폴백 경계: 어떤 실패(ImportError·런타임)든 키워드 검색으로 degrade(원칙 8 예외).
-    except Exception as exc:
-        logger.warning("rag.embed.fallback_failed", exc_info=exc)
+        # 예외 메시지엔 응답 본문이 섞일 수 있어 타입명만 남긴다(§9).
+        logger.warning("rag.embed.failed", error_type=type(exc).__name__)
         return None
 ```
 
-> 쉽게 말하면: 문장을 좌표로 바꿔 주는 도구가 세 겹으로 준비돼 있다. 1순위 도구가 고장 나면 2순위로, 그것도 안 되면 아예 좌표 없이(의미 검색을 건너뛰고) 키워드 검색만 한다. 어떤 경우에도 서비스는 멈추지 않는다.
+> 쉽게 말하면: 문장을 좌표로 바꾸는 도구는 하나뿐이다. 그 도구가 고장 나도 다른 도구로 좌표를 대신 만들지 않고, 좌표 없이(의미 검색을 건너뛰고) 키워드 검색만 한다. 다른 도구가 찍은 좌표는 같은 지도 위의 좌표가 아니라서 엉뚱한 문서를 가리키기 때문이다. 어떤 경우에도 서비스는 멈추지 않는다.
 
-- **1차: `ai_client.embed`** (기본 = qwen3:embedding, 1024차원). 질문에는 안내 문구(instruction 프리픽스)를 붙인다. 저장된 문서는 그대로 넣고 질문에만 이 문구를 붙이는 **비대칭 방식**이다:
+- **임베딩 호출: `ai_client.embed(text, input_type="query")`**(`search.py:258`). 어느 업체로 보낼지(provider)는 env `EMBEDDING_PROVIDER`로 고른다(`core/config.py:144`, 기본 `openai_compat`).
+  - `openai_compat`(기본 — Ollama 등 OpenAI 호환 서버, 운영 모델은 qwen3-embedding 1024차원): 질문에 안내 문구(instruction 프리픽스)를 붙인다. 저장된 문서는 그대로 넣고 질문에만 이 문구를 붙이는 **비대칭 방식**이다. 이 경로는 `input_type`을 요청에 싣지 않는다.
+  - `voyage`(voyage-4-large): 프리픽스 없이 원문을 보낸다. Voyage는 `input_type="query"`면 업체가 검색용 프롬프트를 앞에 붙이므로, 여기서 또 붙이면 이중 프리픽스가 된다(`search.py:241-245`).
 
   ```python
-  # src/rag/search.py:36-37
+  # src/rag/search.py:36-39
+  # qwen3-embedding(openai_compat)은 쿼리에 instruction 프리픽스를 권장한다(문서는 원문으로 색인 →
+  # 쿼리만 비대칭 프리픽스). voyage는 input_type="query"면 업체가 자체 검색 프롬프트를 앞에 붙이므로
+  # 여기서 또 붙이면 이중 프리픽스가 된다 — openai_compat일 때만 붙인다.
   _QUERY_INSTRUCT = "Instruct: 보험 약관에서 사용자 질문에 답할 수 있는 관련 조항을 검색한다\nQuery: "
   ```
 
-  `ai_client.embed`는 OpenAI 호환 `/embeddings` 엔드포인트를 호출하고 좌표 차원 수가 맞는지 검증한다:
+  `ai_client.embed`는 provider별 `/embeddings` 요청 본문을 만들고(voyage만 `input_type`·`output_dimension`을 싣는다), 응답 벡터의 개수와 차원을 검증한다:
   ```python
-  # src/core/ai_client.py:148-164
-  payload: dict[str, Any] = {"model": settings.embedding_model, "input": text}
-  ...
-  vector: list[float] = data["data"][0]["embedding"]
-  ...
-  if len(vector) != settings.embedding_dim:
-      raise EmbeddingDimensionError(...)
-  return vector
-  ```
-  `embedding_dim` 기본값은 1024(`core/config.py:16,64` — `DEFAULT_EMBEDDING_DIM = 1024`).
+  # src/core/ai_client.py:325-337 (_embed_payload)
+  if settings.embedding_provider == "voyage":
+      return {"model": ..., "input": texts, "input_type": input_type,
+              "output_dimension": settings.embedding_dim}
+  return {"model": settings.embedding_model, "input": texts[0] if len(texts) == 1 else texts}
 
-- **2차 폴백: BGE-M3**(`search.py:251-259`). 1차에서 `AiClientError`가 나면 `sentence_transformers`의 `BAAI/bge-m3`(1024차원, `search.py:34`)로 **컴퓨터 내부에서 직접**(로컬) 좌표를 만든다. 차원이 안 맞으면 `RagError`를 던진다. **주의**: 1차 경로에는 안내 문구(프리픽스)를 붙이지만, BGE-M3 경로에는 `_QUERY_INSTRUCT` 없이 원문 `text`만 넣는다(`search.py:274`).
-
-  ```python
-  # src/rag/search.py:251-259
-  async def _bge_embed(text: str) -> list[float]:
-      """BGE-M3로 쿼리를 임베딩한다(폴백 경로). 차원 검증 포함."""
-      model = await asyncio.to_thread(_load_bge_model)
-      vector: list[float] = await asyncio.to_thread(
-          lambda: model.encode(text, normalize_embeddings=True).tolist()  # type: ignore[attr-defined]
-      )
+  # src/core/ai_client.py:363-370 (_embed_request)
+  if len(vectors) != len(texts):
+      raise AiClientError(...)
+  for vector in vectors:
       if len(vector) != settings.embedding_dim:
-          raise RagError(f"BGE-M3 임베딩 차원 불일치: {len(vector)} != {settings.embedding_dim}")
-      return vector
+          raise EmbeddingDimensionError(...)
   ```
-  BGE 모델은 지연 로드 싱글턴이며(처음 필요할 때 한 번만 불러옴), 시간이 걸리는 로딩을 `to_thread`로 감싼다(`search.py:241-248, 253`).
+  `embedding_dim` 기본값은 1024(`core/config.py:19,150` — `DEFAULT_EMBEDDING_DIM = 1024`).
 
-- **3차: `None`(degrade)**. BGE도 실패(ImportError 포함)하면 `None`을 반환해 **벡터 검색을 통째로 건너뛰고** 키워드 검색만으로 진행한다. 주석이 "원칙 8 예외"(넓게 예외를 잡는 것을 의도적으로 허용)임을 명시(`search.py:275`).
+- **실패하면 `None`(degrade)**. `AiClientError`(HTTP 오류·응답 형식 이상·개수 불일치, 하위 클래스 `EmbeddingDimensionError` 포함)가 나면 경고 로그 `rag.embed.failed`에 **예외 타입명만** 남기고 `None`을 돌려준다(`search.py:259-262`). 그러면 **벡터 검색을 통째로 건너뛰고** 키워드 검색만으로 진행하며, 완료 로그에 `degraded=True`가 남는다(`search.py:321-323`). `AiClientError`가 아닌 예외(코드 버그 등)는 잡지 않고 그대로 올린다.
+- **다른 모델로 폴백하지 않는 이유**: 예전에는 BGE-M3(`sentence-transformers`)로 폴백했지만 2026-10-31에 제거했다. 색인한 모델(qwen3 또는 voyage)과 다른 모델로 만든 쿼리 벡터는 둘 다 1024차원이라 차원 검사를 통과하지만 벡터 공간이 다르다. 그래서 오류 없이 엉뚱한 결과를 낸다. 키워드 검색만 하는 편이 낫다. (실제로 운영 report 이미지엔 `sentence-transformers`가 설치돼 있지 않아 폴백은 늘 ImportError로 degrade됐다.)
+
+> 쉽게 말하면: 지도를 바꾸려면 책장의 좌표(문서 임베딩)와 손님 질문의 좌표(쿼리 임베딩)를 같은 지도로 맞춰야 한다. 한쪽만 바꾸면 아무 경고 없이 엉뚱한 책을 꺼내 온다.
+
+**임베딩 모델 전환 순서(주의)**: 코퍼스 세 테이블(`policy_chunks`·`case_chunks`·`schedule_chunks`)은 같은 쿼리 벡터 하나로 검색되므로 **문서 임베딩 모델 = 쿼리 임베딩 모델**이어야 한다. 모델을 바꿀 때는 다음 순서를 지킨다.
+
+1. 적재기(Policy-Chunker·`tempVectorDB/load_*.py`)도 새 모델로 맞추거나, 전환이 끝날 때까지 적재를 멈춘다.
+2. `python -m rag.reembed`(`src/rag/reembed.py`)로 **세 테이블 전부**를 새 모델(`input_type=document`)로 재임베딩한다. 사용법은 [src/rag/README](../../src/rag/README.md)에 있다.
+3. 그다음에 쿼리 쪽(report 워커)의 `EMBEDDING_PROVIDER`·`EMBEDDING_MODEL`을 바꾼다.
+
+순서가 섞이면 오류 없이 검색 결과만 틀어진다. 벡터 검색이 서로 다른 공간의 좌표끼리 거리를 재기 때문이다.
 
 ### 4.4 (d) 메타 필터 (insurer / product)
 
 ```python
-# src/rag/search.py:67-87
+# src/rag/search.py:69-89
 # insurer/product 필터가 유효한 namespace. case_chunks의 insurer/product_name은 nullable
 # 참고 메타일 뿐 필터 키가 아니라(적재기가 채우지 않음), 걸면 case 결과가 항상 0건이 된다.
 _META_FILTER_NS: frozenset[str] = frozenset({"terms"})
@@ -622,7 +629,7 @@ def _meta_filter(namespace: str, args: list, insurer: str | None, product: str |
 ```
 
 - 보험사(insurer)·상품명(product) 필터는 **`terms`(policy_chunks)에만** 적용된다(`_META_FILTER_NS = {"terms"}`). `case`·`level`에는 빈 문자열을 돌려준다(필터 없음).
-- 이유(주석 명시): `case_chunks`의 `insurer`/`product_name`은 적재기가 채우지 않는 nullable 참고 메타라, 필터로 걸면 `case` 결과가 **항상 0건**이 되어 recall(찾아 오는 비율)이 무너진다(`search.py:67-69, 75-77`).
+- 이유(주석 명시): `case_chunks`의 `insurer`/`product_name`은 적재기가 채우지 않는 nullable 참고 메타라, 필터로 걸면 `case` 결과가 **항상 0건**이 되어 recall(찾아 오는 비율)이 무너진다(`search.py:69-71, 77-79`).
   > 쉽게 말하면: 사례 서랍에는 보험사·상품명 칸이 대부분 비어 있어서, 그걸로 거르면 아무것도 안 걸린다. 그래서 약관 서랍에만 이 필터를 건다.
 - 파라미터는 `args`에 덧붙이며 `$N` 번호를 `len(args)`로 자동 계산한다 → **파라미터 바인딩**이라 인젝션 위험 없음.
 - `insurer`, `product`는 각각 값이 있을 때만 조건이 추가된다(둘 다 선택 사항).
@@ -632,7 +639,7 @@ def _meta_filter(namespace: str, args: list, insurer: str | None, product: str |
 이 절이 `level`(후유장해분류표) 버전 매칭의 핵심이다. verbatim:
 
 ```python
-# src/rag/search.py:90-118
+# src/rag/search.py:92-120
 # 버전(개정판) 필터가 유효한 namespace. 후유장해분류표(schedule_chunks)는 시행세칙 개정마다
 # 판이 갈려, 계약 체결일이 속하는 버전만 검색해야 한다.
 _VERSION_FILTER_NS: frozenset[str] = frozenset({"level"})
@@ -675,17 +682,17 @@ def _version_filter(namespace: str, args: list, contract_date: datetime.date | N
     > 표기 읽는 법: `[`는 "그 날짜 포함", `)`는 "그 날짜는 안 포함"을 뜻한다. 시작일 당일은 포함, 종료일 당일은 다음 판으로 넘어간다는 의미다.
   - `applies_to IS NULL`(현행판)도 상한 조건을 통과시켜, 계약일이 최신판 시행 이후면 현행판이 매칭된다.
   - **경계 안전성**: 개정 경계 날짜에서 이전 판(`applies_to = 경계일`)과 새 판(`applies_from = 경계일`)이 겹치지 않는다(이전 판은 `date < applies_to` 위반, 새 판은 `applies_from <= date` 만족). 즉 경계일 하루에 두 판이 동시에 걸리는 일이 없다.
-- **파라미터 재사용**: `contract_date` 하나만 덧붙이고, 같은 `$idx`를 시작·종료 두 조건에 재사용한다(`search.py:116-118`). 바인딩 파라미터라 인젝션 없음.
+- **파라미터 재사용**: `contract_date` 하나만 덧붙이고, 같은 `$idx`를 시작·종료 두 조건에 재사용한다(`search.py:118-120`). 바인딩 파라미터라 인젝션 없음.
 
 ### 4.6 (f) top_k와 후보 풀 확장
 
 ```python
-# src/rag/search.py:315-316
+# src/rag/search.py:299-300
 # RRF 통합 전 후보 풀은 넉넉히 긁는다(top_k만 긁으면 메타필터 좁은 집합에서 recall 손실).
 candidate_k = max(top_k * 3, 20)
 ```
 
-각 namespace의 키워드/벡터 검색은 `top_k`가 아니라 `candidate_k = max(top_k*3, 20)`로 넉넉하게 후보를 긁어 온 뒤(`search.py:316, 323, 333`), RRF 통합이 끝난 다음 최종적으로 `fused[:top_k]`로 자른다(`search.py:351`). 좁은 필터 조건 때문에 후보가 부족해 좋은 결과를 놓치는 걸 막기 위함이다. 기본 `top_k`는 8이다(`search.py:31` — `DEFAULT_TOP_K = 8`).
+각 namespace의 키워드/벡터 검색은 `top_k`가 아니라 `candidate_k = max(top_k*3, 20)`로 넉넉하게 후보를 긁어 온 뒤(`search.py:300, 307, 317`), RRF 통합이 끝난 다음 최종적으로 `fused[:top_k]`로 자른다(`search.py:335`). 좁은 필터 조건 때문에 후보가 부족해 좋은 결과를 놓치는 걸 막기 위함이다. 기본 `top_k`는 8이다(`search.py:34` — `DEFAULT_TOP_K = 8`).
 
 > 쉽게 말하면: 최종 8개만 필요해도 처음엔 넉넉히(최소 20개, 또는 8×3=24개) 뽑아 놓는다. 넓게 그물을 던져야 좋은 후보를 놓치지 않고, 합쳐서 순위를 다시 매긴 뒤 상위 8개만 남긴다.
 
@@ -712,7 +719,7 @@ def build_citations(rows: list[ChunkRow]) -> list[Citation]:
     return citations
 ```
 
-- 입력은 **최종 top_k의 상위 청크 행**(`top_rows`, `search.py:353,366`)이며 순서를 그대로 지킨다.
+- 입력은 **최종 top_k의 상위 청크 행**(`top_rows`, `search.py:337,350`)이며 순서를 그대로 지킨다.
 - `clause_no`·`exhibit`이 **둘 다 None**이면 건너뛴다(출처를 표시할 수 없어서).
 - `(clause_no, exhibit)` 짝으로 **중복 제거**(같은 조항/별표는 한 번만).
 - 순수 함수(부수효과 없음)라 테스트하기 쉽다.
@@ -721,13 +728,13 @@ def build_citations(rows: list[ChunkRow]) -> list[Citation]:
 
 ### 4.8 조립 본체 — 상태 전이
 
-`search()`의 본체(`search.py:281-369`)가 위 조각들을 엮는다. 상태 전이 순서:
+`search()`의 본체(`search.py:265-353`)가 위 조각들을 엮는다. 상태 전이 순서:
 
-1. **라우팅**(`search.py:307-310`): `route()` 호출. `in_scope=False`면 `log_event_out_of_scope`를 남기고 즉시 `RagResult(ranked_chunks=[], citations=[])`.
-2. **풀 획득 + 오타보정**(`search.py:312-313`): `get_pool()`로 asyncpg 풀(DB 연결 묶음)을 얻고, `correct_query`로 `corrected`를 만든다.
-3. **병렬 시작**(`search.py:319-320`): `embed_task = create_task(_embed_query(corrected.embed_text))`를 먼저 걸어 두고, 키워드 검색을 `gather`로 돌린다.
+1. **라우팅**(`search.py:291-294`): `route()` 호출. `in_scope=False`면 `log_event_out_of_scope`를 남기고 즉시 `RagResult(ranked_chunks=[], citations=[])`.
+2. **풀 획득 + 오타보정**(`search.py:296-297`): `get_pool()`로 asyncpg 풀(DB 연결 묶음)을 얻고, `correct_query`로 `corrected`를 만든다.
+3. **병렬 시작**(`search.py:303-304`): `embed_task = create_task(_embed_query(corrected.embed_text))`를 먼저 걸어 두고, 키워드 검색을 `gather`로 돌린다.
    ```python
-   # src/rag/search.py:319-328
+   # src/rag/search.py:303-312
    embed_task = asyncio.create_task(_embed_query(corrected.embed_text))
    keyword_results = await asyncio.gather(
        *(
@@ -740,10 +747,10 @@ def build_citations(rows: list[ChunkRow]) -> list[Citation]:
    embedding = await embed_task
    ```
    키워드 검색은 `corrected.keyword_query`를, 임베딩은 `corrected.embed_text`를 쓴다(3.4에서 만든 서로 다른 두 표현).
-4. **벡터 검색 또는 degrade**(`search.py:330-339`): `embedding is not None`이면 namespace별 `_vector_search`를 gather, 아니면 `vector_results = [[] for _ in decision.namespaces]`(빈 결과로 채우고 키워드만).
-5. **행 인덱싱·랭킹 구성**(`search.py:341-348`): `row_index[key]=ChunkRow`를 채우면서 각 namespace 결과를 `(키리스트, weight)` 형태로 만든다. 키워드는 `KEYWORD_WEIGHT`, 벡터는 `VECTOR_WEIGHT`.
+4. **벡터 검색 또는 degrade**(`search.py:314-323`): `embedding is not None`이면 namespace별 `_vector_search`를 gather, 아니면 `vector_results = [[] for _ in decision.namespaces]`(빈 결과로 채우고 키워드만).
+5. **행 인덱싱·랭킹 구성**(`search.py:325-332`): `row_index[key]=ChunkRow`를 채우면서 각 namespace 결과를 `(키리스트, weight)` 형태로 만든다. 키워드는 `KEYWORD_WEIGHT`, 벡터는 `VECTOR_WEIGHT`.
    ```python
-   # src/rag/search.py:342-348
+   # src/rag/search.py:326-332
    row_index: dict[str, ChunkRow] = {}
    keyword_rankings: list[tuple[list[str], float]] = []
    vector_rankings: list[tuple[list[str], float]] = []
@@ -752,11 +759,11 @@ def build_citations(rows: list[ChunkRow]) -> list[Citation]:
    for rows in vector_results:
        vector_rankings.append(([_index_row(row_index, row) for row in rows], VECTOR_WEIGHT))
    ```
-   키는 `_key(namespace, chunk_id)` = `f"{namespace}\x00{chunk_id}"`. namespace마다 chunk_id가 겹쳐도 NUL 구분자(눈에 안 보이는 특수 문자)로 충돌을 막는다(`search.py:121-122, 159-161`). `_index_row`는 `setdefault`로 **같은 키가 또 오면 먼저 넣은 행을 유지**한다(`search.py:372-376`).
-6. **RRF 통합·절단**(`search.py:350-351`): `fused = rrf_fuse([*keyword_rankings, *vector_rankings])`, `top = fused[:top_k]`.
-7. **Chunk 구성**(`search.py:353-365`): `top`의 각 `(key, score)`에 대해 `row_index[key]`로 원래 행을 찾아 `Chunk`를 만든다. `score`는 RRF 점수, `source_ref`는 `chunk_id`.
+   키는 `_key(namespace, chunk_id)` = `f"{namespace}\x00{chunk_id}"`. namespace마다 chunk_id가 겹쳐도 NUL 구분자(눈에 안 보이는 특수 문자)로 충돌을 막는다(`search.py:123-124, 159-161`). `_index_row`는 `setdefault`로 **같은 키가 또 오면 먼저 넣은 행을 유지**한다(`search.py:356-360`).
+6. **RRF 통합·절단**(`search.py:334-335`): `fused = rrf_fuse([*keyword_rankings, *vector_rankings])`, `top = fused[:top_k]`.
+7. **Chunk 구성**(`search.py:337-349`): `top`의 각 `(key, score)`에 대해 `row_index[key]`로 원래 행을 찾아 `Chunk`를 만든다. `score`는 RRF 점수, `source_ref`는 `chunk_id`.
    ```python
-   # src/rag/search.py:354-365
+   # src/rag/search.py:338-349
    chunks = [
        Chunk(
            text=row.content,
@@ -771,14 +778,14 @@ def build_citations(rows: list[ChunkRow]) -> list[Citation]:
    ]
    ```
    `zip(..., strict=True)`로 두 리스트 길이가 어긋나면 곧바로 오류를 내 방어한다.
-8. **인용 생성·로깅·반환**(`search.py:366-369`): `build_citations(top_rows)`로 출처를 만들고, `log_event_completed(...)`로 기록한 뒤, `RagResult(ranked_chunks=chunks, citations=citations)`를 돌려준다.
+8. **인용 생성·로깅·반환**(`search.py:350-353`): `build_citations(top_rows)`로 출처를 만들고, `log_event_completed(...)`로 기록한 뒤, `RagResult(ranked_chunks=chunks, citations=citations)`를 돌려준다.
 
-**로깅의 PII 방어**: 두 로그 이벤트 모두 쿼리 본문을 남기지 않는다(`search.py:379-393`). `out_of_scope`는 사유만, `completed`는 namespaces·top_k·n_chunks·degraded 플래그만 기록한다.
+**로깅의 PII 방어**: 두 로그 이벤트 모두 쿼리 본문을 남기지 않는다(`search.py:363-377`). `out_of_scope`는 사유만, `completed`는 namespaces·top_k·n_chunks·degraded 플래그만 기록한다.
 
 > 쉽게 말하면: PII(개인을 식별할 수 있는 정보)가 새지 않도록, 로그에는 사용자가 뭘 물었는지(질문 원문)를 아예 남기지 않고 "몇 개 찾았다" 같은 통계만 적는다.
 
 ```python
-# src/rag/search.py:384-393
+# src/rag/search.py:368-377
 def log_event_completed(namespaces: list[str], top_k: int, n_chunks: int, degraded: bool) -> None:
     """검색 완료 이벤트 로깅(쿼리 본문 제외)."""
     logger.info(
@@ -814,7 +821,7 @@ VECTOR_WEIGHT = 0.5
 
 - **`RRF_K = 60`**: RRF 원논문 권장값. 완충 상수로, 상위권 순위 차이는 살리되 하위 노이즈 영향을 완만하게 누른다.
   > 쉽게 말하면: 60은 순위 점수를 부드럽게 눌러 주는 완충 값이다. 1등과 2등의 차이는 살아 있게 하면서, 저 아래 순위들끼리는 점수 차이를 거의 안 나게 해서 잡음의 영향을 줄인다.
-- **키워드:벡터 = 0.5:0.5** 기본 가중치. `search.py`가 이 상수를 그대로 각 랭킹의 weight로 넘긴다(`search.py:346-348`). 즉 두 심사위원의 표를 반반으로 본다.
+- **키워드:벡터 = 0.5:0.5** 기본 가중치. `search.py`가 이 상수를 그대로 각 랭킹의 weight로 넘긴다(`search.py:330-332`). 즉 두 심사위원의 표를 반반으로 본다.
 
 ### 5.2 RRF 공식 (verbatim)
 
@@ -845,7 +852,7 @@ def rrf_fuse(
 - **정렬**: `key=lambda item: (-item[1], item[0])` — **점수 내림차순, 동점이면 id 오름차순**. 언제 돌려도 같은 순서가 나오도록(결정적) 보장한다.
 - **부수효과 없음**: 순수 함수라 단위 테스트가 쉽다(`fusion.py:3-4`).
 
-`search.py`에서의 조합: 각 namespace의 키워드 결과와 벡터 결과가 **모두 별개의 랭킹 리스트**로 들어온다. 예를 들어 namespace가 `terms`·`case` 2개면 총 4개 랭킹(키워드 2 + 벡터 2)이 `rrf_fuse`에 넘어가고(`search.py:350`), 같은 `(namespace,chunk_id)` 키가 여러 랭킹에 등장하면 점수가 합산되어 하나의 통합 순위가 된다.
+`search.py`에서의 조합: 각 namespace의 키워드 결과와 벡터 결과가 **모두 별개의 랭킹 리스트**로 들어온다. 예를 들어 namespace가 `terms`·`case` 2개면 총 4개 랭킹(키워드 2 + 벡터 2)이 `rrf_fuse`에 넘어가고(`search.py:334`), 같은 `(namespace,chunk_id)` 키가 여러 랭킹에 등장하면 점수가 합산되어 하나의 통합 순위가 된다.
 
 > 예: `terms` 키워드에서 1위, `terms` 벡터에서 2위인 청크의 점수 = `0.5/(60+1) + 0.5/(60+2)` = `0.008197 + 0.008065` = `0.016262`.
 
@@ -919,7 +926,7 @@ async def search(
 핵심 차이점(공용 함수와의 계약 차이):
 
 - **namespace 기본값이 다르다**: 공용 `search`는 `None`을 넘기면 라우터가 `["terms","case"]`를 쓰지만, 어댑터는 `namespaces or ["terms"]`로 **`["terms"]`만** 기본값으로 넘긴다(`hybrid.py:45`). 즉 리포트 노드는 기본적으로 약관만 검색한다.
-- **`source_ref` 의미가 뒤바뀐다**: 공용 `Chunk.source_ref`는 원문 위치 `chunk_id`이지만(`search.py:359`), 어댑터 dict의 `"source_ref"`는 `_fmt_citation(c)`로 만든 **사람이 읽는 인용 문자열**이다(`hybrid.py:57`). 원래 chunk_id는 `_fmt_citation` 안에서 대체값으로만 남는다.
+- **`source_ref` 의미가 뒤바뀐다**: 공용 `Chunk.source_ref`는 원문 위치 `chunk_id`이지만(`search.py:343`), 어댑터 dict의 `"source_ref"`는 `_fmt_citation(c)`로 만든 **사람이 읽는 인용 문자열**이다(`hybrid.py:57`). 원래 chunk_id는 `_fmt_citation` 안에서 대체값으로만 남는다.
 - **citations 필드도 다시 정의된다**: 공용 `RagResult.citations`는 `Citation` 객체 리스트지만, 어댑터의 `"citations"`는 각 청크의 포맷된 `source_ref` 문자열 리스트다(`hybrid.py:63`). 즉 어댑터는 공용의 `res.citations`를 **버리고** 청크에서 새로 만든다.
 - `contract_date`는 그대로 공용 함수로 넘어가(패스스루) `namespaces=["level"]` 검색 시 버전 매칭에 쓰인다(`hybrid.py:39-41, 49`).
 
@@ -950,7 +957,7 @@ async def close_pool() -> None:
 
 ### 7.1 `search()` 입력 인자
 
-공용 진입점 시그니처(`search.py:281-289`):
+공용 진입점 시그니처(`search.py:265-273`):
 
 ```python
 async def search(
@@ -967,17 +974,17 @@ async def search(
 
 | 인자 | 타입 | 기본값 | 의미 | 근거 |
 |---|---|---|---|---|
-| `query` | `str` | (필수) | 사용자 쿼리 텍스트 | `search.py:282,294` |
-| `insurance_type` | `str \| None` | `None` | 신체보험 유형 힌트. 비신체면 범위 외 빈 결과 | `search.py:283,295` |
-| `namespaces` | `list[str] \| None` | `None` | 검색 namespace. `None`이면 라우터가 `terms·case` | `search.py:284,296` |
-| `top_k` | `int` | `8`(`DEFAULT_TOP_K`) | 반환 청크 최대 개수 | `search.py:31,285,297` |
-| `insurer` | `str \| None` (키워드 전용) | `None` | 보험사 메타 필터. **terms에만 적용** | `search.py:287,298` |
-| `product` | `str \| None` (키워드 전용) | `None` | 상품명 메타 필터. **terms에만 적용** | `search.py:288,299` |
-| `contract_date` | `datetime.date \| None` (키워드 전용) | `None` | 계약 체결일. **level 버전 매칭** `applies_from <= date < applies_to`. None이면 현행판 | `search.py:289,300-302` |
+| `query` | `str` | (필수) | 사용자 쿼리 텍스트 | `search.py:266,278` |
+| `insurance_type` | `str \| None` | `None` | 신체보험 유형 힌트. 비신체면 범위 외 빈 결과 | `search.py:267,279` |
+| `namespaces` | `list[str] \| None` | `None` | 검색 namespace. `None`이면 라우터가 `terms·case` | `search.py:268,280` |
+| `top_k` | `int` | `8`(`DEFAULT_TOP_K`) | 반환 청크 최대 개수 | `search.py:34,269,281` |
+| `insurer` | `str \| None` (키워드 전용) | `None` | 보험사 메타 필터. **terms에만 적용** | `search.py:271,282` |
+| `product` | `str \| None` (키워드 전용) | `None` | 상품명 메타 필터. **terms에만 적용** | `search.py:272,283` |
+| `contract_date` | `datetime.date \| None` (키워드 전용) | `None` | 계약 체결일. **level 버전 매칭** `applies_from <= date < applies_to`. None이면 현행판 | `search.py:273,284-286` |
 
 > 표 읽는 법: "키워드 전용"이라고 적힌 인자는 반드시 이름을 붙여(`insurer=...`) 넘겨야 한다는 뜻이다. 코드의 `*` 뒤에 있는 인자들이 그렇다.
 
-`insurer`·`product`·`contract_date`는 `*` 뒤의 **키워드 전용 인자**다(`search.py:286`). `contract_date`는 `terms`·`case`에는 영향이 없다(`search.py:302`).
+`insurer`·`product`·`contract_date`는 `*` 뒤의 **키워드 전용 인자**다(`search.py:270`). `contract_date`는 `terms`·`case`에는 영향이 없다(`search.py:286`).
 
 ### 7.2 반환 계약 — `RagResult`
 
@@ -992,7 +999,7 @@ class RagResult(BaseModel):
 
 - `ranked_chunks`: RRF 통합 순위 상위 `top_k` 청크.
 - `citations`: 상위 청크에서 되짚어 만든 중복 제거 인용 근거.
-- **범위 밖/빈 결과**: 비신체보험이거나 유효 namespace가 없으면 `RagResult(ranked_chunks=[], citations=[])`(`search.py:310`).
+- **범위 밖/빈 결과**: 비신체보험이거나 유효 namespace가 없으면 `RagResult(ranked_chunks=[], citations=[])`(`search.py:294`).
 
 ### 7.3 `Chunk` 필드
 
@@ -1015,15 +1022,15 @@ class Chunk(BaseModel):
 
 | 필드 | 타입 | 소스 | 근거 |
 |---|---|---|---|
-| `text` | `str` | `row.content` (해당 테이블 content) | `search.py:355`, `contracts.py:100` |
-| `namespace` | `str` | `terms`/`case`/`level` | `search.py:356`, `contracts.py:103` |
-| `score` | `float` | RRF 통합 점수 | `search.py:357`, `contracts.py:104` |
-| `source_ref` | `str` | `row.chunk_id`(원문 위치) | `search.py:359`, `contracts.py:105` |
-| `article_number` | `str \| None` | terms=article_number, case=section, level=section | `search.py:361`, `_NS_COLS` |
-| `product_name` | `str \| None` | terms/case=product_name, level=NULL | `search.py:362` |
-| `chunk_type` | `str \| None` | schedule·clause·termination 등 | `search.py:363`, `contracts.py:109` |
+| `text` | `str` | `row.content` (해당 테이블 content) | `search.py:339`, `contracts.py:100` |
+| `namespace` | `str` | `terms`/`case`/`level` | `search.py:340`, `contracts.py:103` |
+| `score` | `float` | RRF 통합 점수 | `search.py:341`, `contracts.py:104` |
+| `source_ref` | `str` | `row.chunk_id`(원문 위치) | `search.py:343`, `contracts.py:105` |
+| `article_number` | `str \| None` | terms=article_number, case=section, level=section | `search.py:345`, `_NS_COLS` |
+| `product_name` | `str \| None` | terms/case=product_name, level=NULL | `search.py:346` |
+| `chunk_type` | `str \| None` | schedule·clause·termination 등 | `search.py:347`, `contracts.py:109` |
 
-> 주의: `contracts.py:101-102`의 주석은 `level`·`medical`을 "테이블 미존재 → 향후 확장"이라 적었지만, 이는 계약 문서가 최신화되기 전의 서술로 보인다. 실제 `search.py`의 `_NS_TABLE`/`_NS_COLS`(`search.py:40-54`)와 라우터의 `VALID_NAMESPACES`(`router.py:11`)는 `level`(schedule_chunks)을 **이미 지원**한다. `medical`만 여전히 미구현이다(정직하게 표기: contracts 주석과 실제 코드 사이에 문서 불일치 존재).
+> 주의: `contracts.py:101-102`의 주석은 `level`·`medical`을 "테이블 미존재 → 향후 확장"이라 적었지만, 이는 계약 문서가 최신화되기 전의 서술로 보인다. 실제 `search.py`의 `_NS_TABLE`/`_NS_COLS`(`search.py:42-56`)와 라우터의 `VALID_NAMESPACES`(`router.py:11`)는 `level`(schedule_chunks)을 **이미 지원**한다. `medical`만 여전히 미구현이다(정직하게 표기: contracts 주석과 실제 코드 사이에 문서 불일치 존재).
 
 ### 7.4 `Citation` 필드
 
@@ -1053,7 +1060,7 @@ class Citation(BaseModel):
 2. **contracts.py 주석 노후**: `Chunk.namespace` 주석(`contracts.py:101-102`)이 `level`을 미구현으로 적었으나 실제 코드는 지원한다. 계약 문서와 구현 사이의 문서 드리프트(문서가 코드를 못 따라간 상태).
 3. **`_select_schedule` 부재**: 프롬프트가 언급한 함수는 `hybrid.py`에 없다. schedule 선별 로직은 이 파일 범위 밖(소비 노드에 있을 것으로 추정, 본 조사 파일엔 없음).
 4. **라우터의 namespace 지능 부재**: 라우터는 쿼리 내용으로 terms/case/level을 지능적으로 켜지 않는다. "비신체 차단 + (명시값 ∩ 유효값) or 기본값"이 전부다. 세밀한 namespace 선택은 호출자 책임.
-5. **BGE 폴백의 프리픽스 비대칭**: 1차 경로는 `_QUERY_INSTRUCT` 프리픽스를 붙이지만(`search.py:269`), BGE 폴백은 원문만 임베딩(`search.py:274`)한다. 두 임베딩 모델의 쿼리 표현이 달라 폴백 시 검색 품질 특성이 미묘하게 바뀔 수 있다(버그는 아니나 알아 둘 필요 있음).
+5. **쿼리 프리픽스는 모델이 아니라 provider로 가른다**: `_QUERY_INSTRUCT`는 `embedding_provider == "openai_compat"`일 때만 붙는다(`search.py:243`). 그래서 openai_compat에 instruction 프리픽스를 쓰지 않는 모델(예: `.env.example`의 로컬 기본값 `bge-m3`)을 물려도 qwen3용 프리픽스가 붙는다. 바꾸기 전과 같은 동작이고, 운영 모델(qwen3-embedding)에는 맞는 처리다.
 6. **BM25 표기**: `_keyword_search` docstring이 "BM25"라 하지만 실제는 PostgreSQL `ts_rank`다(`search.py:197, 206`). 알고리즘 명칭이 부정확.
 7. **어댑터 계약 재정의**: `hybrid.py`의 `source_ref`/`citations`는 공용 `RagResult`와 의미가 다르다(7.2/6.2 참조). 리포트 노드는 공용의 `Citation` 객체를 받지 않고, 청크에서 새로 만든 문자열 인용을 받는다. 소비 측 코드가 공용 계약을 그대로 기대하면 안 된다.
 
@@ -1061,9 +1068,9 @@ class Citation(BaseModel):
 
 아래는 코드 대조 검증 단계에서 보강된 4가지 미세 정정으로, 위 서술의 정확도를 높인다.
 
-8. **`RagError`는 실무상 호출자에게 전파되지 않는다**: `RagError`는 공개 API(`__all__`)이고 파이프라인에서 실제로 `raise`되는 유일한 지점은 `_bge_embed`의 차원 불일치(`search.py:258`)뿐이다. 그런데 이 호출은 `_embed_query`의 넓은 `except Exception`(`search.py:273-278`)에 **즉시 잡혀 `None`(degrade)으로 흡수**된다. 따라서 §4.3의 "BGE 차원 불일치면 `RagError`를 던진다"는 함수 내부 사실일 뿐, `search()`가 `RagError`를 밖으로 전파하는 경로는 실질적으로 없다(키워드 검색만으로 degrade).
+8. **`search()`는 `RagError`를 던지지 않는다**: `RagError`는 공개 API(`__all__`)지만, 파이프라인에서 이를 `raise`하던 유일한 지점(BGE-M3 폴백의 차원 불일치)이 폴백과 함께 사라졌다. 임베딩 실패는 `None`(키워드만으로 degrade)으로 처리되고 밖으로 전파되지 않는다(`search.py:259-262`). `RagError`는 예외 계층의 기반으로 남아 있고, 재임베딩 CLI의 `ReembedAbortedError`(`src/rag/reembed.py`)가 이를 상속한다.
    > 쉽게 말하면: `RagError`는 이론상 밖으로 나올 수 있는 예외지만, 실제로는 바로 위에서 붙잡혀 "키워드만으로 계속 진행"으로 바뀌기 때문에 호출자에게까지 튀어 나오지 않는다.
-9. **`EmbeddingDimensionError`는 `AiClientError`의 서브클래스**(`ai_client.py:23`)다. 그래서 1차 임베딩(qwen3)이 **차원 불일치**로 `EmbeddingDimensionError`를 던지면 `_embed_query`의 `except ai_client.AiClientError`(`search.py:270`)에 걸려 곧바로 **BGE-M3 폴백**으로 넘어간다. 즉 "차원 불일치"도 폴백을 트리거하는 조건에 포함된다.
-10. **`embedding_model` pydantic 기본값은 빈 문자열**(`config.py:63`, `embedding_model: str = ""`)이며 env(환경변수) 주입이 전제다(주석 "예: qwen3:embedding"). §4.3의 "기본 = qwen3:embedding"은 하드코딩된 기본값이 아니라 **코드 주석이 상정하는 표준 모델**을 가리키는 표현으로, 엄밀히는 pydantic 필드 기본값과 구분된다(→ [core 섹션]의 "빈 문자열 강제 주입" 설계와 같은 맥락).
-11. **§1의 "반환값 외 전역 상태 변경 없음"은 엄밀히는 과한 서술**이다. 첫 호출 시 `_kiwi`(`typo.py:52-53`), `_bge_model`(`search.py:243-247`), `ai_client`의 임베딩 클라이언트 등 **모듈 전역 싱글턴이 지연 초기화**되어 전역 상태가 변한다. 관측 불가한 메모이제이션 캐시(한 번 만들어 재사용하려고 저장해 두는 것)라 실질적 부작용은 아니지만(멱등 — 여러 번 해도 결과가 한 번 한 것과 같음), "부수효과 없음"은 "DB·임베딩 호출 외 관측 가능한 부수효과 없음"으로 이해해야 한다(코드 docstring도 "DB·임베딩 외 부수효과 없음"으로 한정).
+9. **`EmbeddingDimensionError`는 `AiClientError`의 서브클래스**(`ai_client.py:50`)다. 그래서 임베딩이 **차원 불일치**로 `EmbeddingDimensionError`를 던지면 `_embed_query`의 `except ai_client.AiClientError`(`search.py:259`)에 걸려 **키워드 검색만으로 degrade**한다. 즉 "차원 불일치"도 degrade 조건이다.
+10. **`embedding_model` pydantic 기본값은 빈 문자열**(`config.py:149`, `embedding_model: str = ""`)이며 env(환경변수) 주입이 전제다(주석 "예: qwen3-embedding (1024d) | voyage-4-large"). §4.3에서 openai_compat의 "운영 모델은 qwen3-embedding"이라 한 것은 하드코딩된 기본값이 아니라 **운영 env가 주입하는 모델**을 가리킨다. 기본값이 있는 것은 provider(`openai_compat`)뿐이다(→ [core 섹션]의 "빈 문자열 강제 주입" 설계와 같은 맥락).
+11. **§1의 "반환값 외 전역 상태 변경 없음"은 엄밀히는 과한 서술**이다. 첫 호출 시 `_kiwi`(`typo.py:52-53`), `ai_client`의 임베딩 클라이언트 등 **모듈 전역 싱글턴이 지연 초기화**되어 전역 상태가 변한다. 관측 불가한 메모이제이션 캐시(한 번 만들어 재사용하려고 저장해 두는 것)라 실질적 부작용은 아니지만(멱등 — 여러 번 해도 결과가 한 번 한 것과 같음), "부수효과 없음"은 "DB·임베딩 호출 외 관측 가능한 부수효과 없음"으로 이해해야 한다(코드 docstring도 "DB·임베딩 외 부수효과 없음"으로 한정).
     > 쉽게 말하면: 처음 한 번은 도구들을 준비해 서랍에 넣어 두느라 내부 상태가 살짝 바뀌지만, 그건 밖에서 보이지도 않고 결과에 영향도 없다. 그래서 사실상 "깨끗한 함수"로 봐도 무방하다.
