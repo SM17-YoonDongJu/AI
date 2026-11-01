@@ -95,6 +95,14 @@ async def close_pool() -> None:
     _pool = None
 
 
+# 같은 마이그레이션 디렉터리를 여러 워커가 동시에 기동하며 적용할 수 있다(예: migrations/ai를
+# OCR·report가 각자 적용 — GPU EC2가 꺼져 있어도 report가 자기 테이블을 보장해야 해서).
+# CREATE ... IF NOT EXISTS도 동시 실행이면 카탈로그 경합(중복 키)으로 실패할 수 있으므로,
+# 디렉터리별 세션 advisory lock으로 한 번에 한 워커만 적용한다. 연결이 끊기면 서버가 잠금을 푼다.
+_MIGRATION_LOCK_SQL = "SELECT pg_advisory_lock(hashtext($1))"
+_MIGRATION_UNLOCK_SQL = "SELECT pg_advisory_unlock(hashtext($1))"
+
+
 def _load_sql_files(migrations_dir: str | Path) -> list[tuple[str, str]]:
     """``*.sql``을 파일명 오름차순으로 읽어 ``(name, sql)`` 목록으로 돌려준다(동기 I/O)."""
     directory = Path(migrations_dir)
@@ -110,7 +118,8 @@ async def run_migrations(pool: asyncpg.Pool, migrations_dir: str | Path) -> list
     DDL은 ``IF NOT EXISTS`` 기반이라 반복 적용해도 안전하다 — 별도 버전 추적 테이블은
     후속 과제로 남기고, 지금은 멱등 DDL로 충분하다. 파라미터 없는 실행이라 한 파일에
     여러 문(semicolon)을 담을 수 있다(asyncpg simple query). 파일 읽기(블로킹)는
-    스레드로 격리한다(§7).
+    스레드로 격리한다(§7). 같은 디렉터리를 여러 워커가 동시에 적용하지 않도록 디렉터리
+    이름 기준 advisory lock을 잡은 한 연결에서 순서대로 실행한다.
 
     Args:
         pool: asyncpg 연결 풀.
@@ -120,11 +129,17 @@ async def run_migrations(pool: asyncpg.Pool, migrations_dir: str | Path) -> list
         적용한 파일명 목록(적용 순서).
     """
     sql_files = await asyncio.to_thread(_load_sql_files, migrations_dir)
+    lock_key = f"migrations:{Path(migrations_dir).name}"
     applied: list[str] = []
-    for name, sql in sql_files:
-        await pool.execute(sql)
-        applied.append(name)
-        logger.info("migration applied", file=name)
+    async with pool.acquire() as conn:
+        await conn.execute(_MIGRATION_LOCK_SQL, lock_key)
+        try:
+            for name, sql in sql_files:
+                await conn.execute(sql)
+                applied.append(name)
+                logger.info("migration applied", file=name)
+        finally:
+            await conn.execute(_MIGRATION_UNLOCK_SQL, lock_key)
     return applied
 
 
