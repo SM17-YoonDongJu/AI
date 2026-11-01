@@ -8,18 +8,19 @@
 
 | 구간 | 방식 | 계약 |
 |---|---|---|
-| Spring → `ocr_worker` | Kafka `ocr-job-queue` | [`OcrJob`](#1-ocrjob) |
+| Spring → `ocr_worker` | SQS `ocr-job-queue`(Standard, `SQS_OCR_JOB_QUEUE_URL`) | [`OcrJob`](#1-ocrjob) |
 | `ocr_worker` → DB | `ocr_results` 테이블 | [`ocr_results`](#3-ocr_results-db-교차-계약) |
-| `ocr_worker` → `report_worker` | Kafka `report-job` | [`ReportJob`](#2-reportjob) |
+| `ocr_worker` → `report_worker` | SQS `report-job`(Standard, `SQS_REPORT_JOB_QUEUE_URL`) | [`ReportJob`](#2-reportjob) |
 | `report_worker` → DB | `report_drafts` 테이블 | [`report_drafts`](#4-report_drafts-db-교차-계약) |
 | `report_worker` → `rag` | Python 함수 호출 | [RAG 인터페이스](#5-rag-모듈-함수-인터페이스) |
 | `report_worker` → `guardrail` | Python 함수 호출 | [가드레일 인터페이스](#6-가드레일-모듈-함수-인터페이스) |
-| 전 워커 → `ai_client` | OpenAI 호환 HTTP | [ai_client 인터페이스](#7-ai_client-인터페이스) |
+| 전 워커 → `ai_client` | OpenAI 호환 HTTP 또는 Claude(anthropic SDK)·Voyage — env provider 스위치 | [ai_client 인터페이스](#7-ai_client-인터페이스) |
 
 공통 규약:
 - 모든 메시지는 **UTF-8 JSON**, 시각은 **ISO-8601(UTC)** 문자열.
 - 식별자는 **UUIDv4 문자열**.
-- Kafka 메시지는 pydantic으로 **역직렬화 즉시 검증**. 실패 시 DLQ.
+- SQS 메시지는 pydantic으로 **역직렬화 즉시 검증**한다. 처리 성공 후에만 삭제(ack)하고, 실패하면 삭제하지 않아 visibility timeout 뒤 재전달된다(at-least-once — 소비자는 멱등이어야 한다).
+- 결정적 실패(`core.exceptions.NonRetryableError`)는 첫 시도에 즉시 ack한다. 수신 횟수가 `SQS_MAX_RECEIVE_COUNT`(코드 기본 5, report 운영값 3)를 넘으면 컨슈머의 poison 가드가 실패 저널(`ai.ocr_job_failures`·`ai.report_job_failures` §4-1)에 terminal로 기록한 뒤 걷어낸다. 큐 redrive(DLQ)의 `maxReceiveCount`는 이 값보다 커야 저널 기록이 먼저 일어난다.
 - **PII는 계약에 절대 평문으로 싣지 않는다**(마스킹 후 값만).
 
 ---
@@ -58,7 +59,7 @@
   "uploaded_at": "2026-07-10T09:21:16.123Z"
 }
 ```
-- **토픽**: `ocr-job-queue` · **파티션 키**: `job_id` · **처리**: at-least-once, `job_id` 기준 멱등 처리.
+- **큐**: `ocr-job-queue`(SQS Standard — 순서 보장·파티션 키 없음) · **처리**: at-least-once, `job_id` 기준 멱등 처리.
 - **본 변경 범위(#33)**: 계약(필드) 추가·검증에 한정한다. 워커가 `report_id`를 자체 파생하는 현행 로직(`pipeline._derive_report_id`)을 `job.report_id` 패스스루로 바꾸고 fan-in으로 `ReportJob` 발행을 게이팅하는 작업, §2 `ReportJob` 의미 정정은 **후속(fan-in 설계 결정 필요)** 으로 분리한다.
 
 ---
@@ -81,7 +82,7 @@
 
 `ocr_quality` enum: `ok`(정상) · `needs_reupload`(재확인 필요 — surya 신뢰도가 낮은데 이름·도메인 정보가 하나도 검출되지 않은 저품질 문서). **이 신호를 실제로 소비해 리포트 생성을 건너뛰고 사용자에게 재업로드를 알리는 것은 `report_worker` + 게이트웨이 몫** — `ocr_worker`는 판정만 하고 값만 실어 발행한다(이번 범위는 여기까지).
 
-> 토픽명은 `core.contracts`에 상수로 공유된다: `OCR_JOB_TOPIC = "ocr-job-queue"`, `REPORT_JOB_TOPIC = "report-job"`.
+> 논리 큐 이름은 `core.contracts` 상수로 공유된다: `OCR_JOB_TOPIC = "ocr-job-queue"`, `REPORT_JOB_TOPIC = "report-job"`(Kafka 시절 상수명이 남은 것 — 값은 큐 이름). 실제 큐 주소는 env `SQS_OCR_JOB_QUEUE_URL`·`SQS_REPORT_JOB_QUEUE_URL`이 정한다.
 
 ```json
 {
@@ -95,7 +96,7 @@
   "ocr_quality": "ok"
 }
 ```
-- **토픽**: `report-job` · **파티션 키**: `report_id` · 멱등 처리.
+- **큐**: `report-job`(SQS Standard, 파티션 키 없음) · `report_id` 기준 멱등 처리. 재전달 한도를 다 쓰면 `ai.report_job_failures`에 terminal로 남는다(§4-1).
 
 ---
 
@@ -143,7 +144,7 @@
 ```
 
 - **이미지 마스킹 트랙(손해사정사 비식별 열람용)**: 디텍터 검출 1회 → 텍스트 마스킹 + 이미지 마스킹 2갈래. 줄 단위 검은블럭으로 렌더한 **비식별 이미지 사본은 S3**, `ocr_results`엔 **키만** 적재. **원본 이미지는 삭제 금지** — KMS·IAM·Lifecycle 자동삭제로 잠금보관(법적 보존·분쟁·재처리).
-- **PII 안전**: 좌표·confidence는 PII가 아니라 보존하나, `masked_lines`의 텍스트는 **마스킹본만**. 원문/평문 PII는 `ocr_results`·로그·타 토픽에 절대 금지.
+- **PII 안전**: 좌표·confidence는 PII가 아니라 보존하나, `masked_lines`의 텍스트는 **마스킹본만**. 원문/평문 PII는 `ocr_results`·로그·다른 큐 메시지에 절대 금지.
 - **보존**: 리포트 확정 전까지만. **손해사정사 서명 완료 이벤트** 시 즉시 삭제(개인정보 최소보존). 비식별 이미지 사본도 동일 트리거로 삭제.
 
 > **2026-06-30 (additive):** `doc_type_confidence`·`ocr_confidence`·`masked_lines`·`masked_image_s3_keys` 추가(이미지 마스킹 트랙 도입, #13 범위 확장). `masked_text`·`entities`는 불변 → `report_worker` 측 **비파괴**. 신규 컬럼은 `ocr_worker`만 기록, 비식별 이미지 소비(손해사정사 UI)는 `ocr_result_id`로 조회.
@@ -188,6 +189,25 @@
 }
 ```
 - 금액은 **단정 금지** → 항상 `estimated_range`(범위)로만 표현(가드레일 강제).
+
+---
+
+## 4-1. `report_job_failures` (DB 교차 계약 — 리포트 실패 저널)
+**report_worker → `ai.report_job_failures`(012) → Spring 읽기 전용(`app_owner` SELECT).** 재전달 한도(`SQS_MAX_RECEIVE_COUNT`, report 운영값 3)를 다 써 poison으로 걷힌 리포트를 FAILED로 표시하는 근거다. 실패한 리포트는 초안을 저장하지 않으므로(2026-11-01) 이 행이 없으면 Spring은 영원히 PROCESSING으로 본다.
+
+| 컬럼 | 의미 |
+|---|---|
+| `report_id` (uuid, UNIQUE) | 조인 키 = `core.reports.id`. 역직렬화 실패면 NULL(조인 불가 — 해당 리포트는 PROCESSING에 남는 알려진 한계) |
+| `failure_class` | `context_unavailable` · `llm_unavailable` · `persist_failed` · `schema_invalid` · `unknown` |
+| `error_type` | 예외 클래스명만(메시지 문자열 저장 금지 §9). **사용자 화면 노출 금지** |
+| `attempts`, `first_failed_at`, `last_failed_at` | 운영 조회용 |
+| `terminal` | `true` = 확정 실패(사용자 노출 기준). false→true 단방향 |
+
+**Spring 판정 순서(순서가 계약)**: ① `reports.status='BLOCKED'` → BLOCKED(입력 차단·**LLM 거절** 포함) ② `NEEDS_REUPLOAD` ③ `applicable_guarantees IS NOT NULL` → COMPLETED ④ `ai.ocr_job_failures` terminal → FAILED(기존) ⑤ **`ai.report_job_failures`에 `report_id = reports.id AND terminal` → FAILED(신규)** ⑥ 그 외 PROCESSING.
+- 종결 상태(①~③)를 저널보다 먼저 본다 — 경합으로 성공한 리포트에 terminal 행이 남을 수 있다.
+- terminal 행은 사라질 수 있다(같은 report_id의 다른 메시지가 성공하면 워커가 지움 = 회복). FAILED를 상태로 저장·캐시하지 말고 조회 시점에 파생한다.
+- `terminal=false`(재전달 중) 행과 `report_id IS NULL` 행은 무시한다. 거절은 저널에 남지 않는다(BLOCKED로 보인다).
+- 상세·조회 SQL 예: `_workspace/16_agent_report_failure_journal.md` §4.
 
 ---
 
@@ -248,11 +268,21 @@ class OutputGuardResult(BaseModel):
 ---
 
 ## 7. `ai_client` 인터페이스
-`src/core/ai_client.py` — OpenAI 호환(Ollama/vLLM/TEI). 모델·엔드포인트는 config 주입(모델 미정).
+`src/core/ai_client.py` — provider를 env로 고른다. 챗: `LLM_PROVIDER=anthropic`(기본, Claude 공식 SDK) | `openai_compat`(Ollama/vLLM). 임베딩: `EMBEDDING_PROVIDER=openai_compat`(기본 — 코퍼스 재임베딩 후 env로 전환) | `voyage`. 외부 API에는 마스킹된 텍스트만 보낸다(CODE_CONVENTIONS §13). 모델·엔드포인트·키는 config 주입. **anthropic 경로는 `chat()`의 `**opts`로 `model`만 받는다** — 샘플링 파라미터(temperature 등)는 `TypeError`(Opus 5.5에서 400).
 
 ```python
-async def chat(messages: list[dict[str, str]], **opts) -> str: ...   # 비스트리밍(완성 응답 1회)
-async def embed(text: str) -> list[float]: ...                       # len == 1024 보장
+async def chat(messages: list[dict[str, str]], **opts) -> str: ...   # 완성 응답 1회(anthropic은 내부 스트리밍)
+async def chat_json(messages: list[dict[str, str]], **opts) -> Any: ...  # JSON 파싱(실패 시 {})
+async def close_client() -> None: ...                                # 앱 종료 시 1회
+# 예외: AiClientError ⊃ EmbeddingDimensionError, LlmRefusalError(Claude 거절 — 폴백 모델까지 거절)
+
+type EmbedInputType = Literal["query", "document"]  # voyage만 요청에 실음(openai_compat은 무시)
+async def embed(text: str, *, input_type: EmbedInputType = "query") -> list[float]: ...
+    # len == 1024 보장. 검색 쿼리=query(기본), 코퍼스 적재=document
+async def embed_batch(
+    texts: list[str], *, input_type: EmbedInputType = "document"
+) -> list[list[float]]: ...
+    # 입력 순서대로 반환, 각 len == 1024. 요청당 32개씩 순차 호출, 빈 입력이면 호출 없이 []
 ```
 
 ---
