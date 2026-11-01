@@ -26,8 +26,11 @@ CI 배포 필터(`.github/workflows/deploy.yml`)도 `migrations/ai/**` → ocr �
 이미지 재빌드가 필요하다(재빌드 없인 컨테이너 재시작해도 옛 마이그레이션 그대로 — 자동으로
 안 되면 `src/core/config.py`의 "CD 스모크... 재트리거" 카운터를 올려 강제 재배포).
 
-report_worker는 마이그레이션을 실행하지 않는다(`run_migrations()` 호출 없음) —
-`core` 스키마는 backend Flyway가, `ai`/`corpus`는 위 두 워커만 관리한다.
+report_worker는 자기 소유 파일만 기동 시 적용한다 — 이미지에 `007_report_drafts.sql`·
+`012_report_job_failures.sql`만 `migrations/ai/`로 싣고 `run_migrations("migrations/ai")`를 돈다
+(GPU EC2의 OCR 워커가 꺼져 있어도 자기 테이블 보장). OCR용 003·004·006은 매 기동 `ai.ocr_results`를
+배타 잠금하므로 싣지 않는다. 같은 디렉터리 이름이라 `run_migrations`의 advisory lock으로 OCR과
+동시 적용이 직렬화된다. `core` 스키마는 backend Flyway가 관리한다.
 
 ## `ai/` 적용 순서 (ai_owner)
 
@@ -45,6 +48,7 @@ report_worker는 마이그레이션을 실행하지 않는다(`run_migrations()`
 | 009 | `009_ocr_results_claim_columns.sql` | `ai.ocr_results`에 `claim_id`/`report_id`/`attachment_id`/`doc_index`/`doc_total` 추가 |
 | 010 | `010_claim_readiness.sql` | `ai.claim_readiness`(청구 fan-in 판정) |
 | 011 | `011_ocr_results_app_owner_readonly.sql` | `ai.ocr_results` 문서 단위 상세(`attachment_id`·`doc_type`·`ocr_quality` 등)를 `app_owner`에 컬럼 한정 공개 |
+| 012 | `012_report_job_failures.sql` | `ai.report_job_failures`(리포트 실패 저널 — 재전달 한도 소진 시 terminal, Spring FAILED 판정 근거) + `app_owner` SELECT. report·OCR 둘 다 적용 |
 
 ## `corpus/` 적용 순서 (corpus_owner)
 

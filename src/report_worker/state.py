@@ -18,9 +18,10 @@ class ReportState(TypedDict, total=False):
     doc_type: str
 
     # ── load_context: DB 조회로 조립한 사고 컨텍스트 ───────
-    case_info: dict[
-        str, Any
-    ]  # accident_type, accident_date, diagnosis, offered_amount, question ...
+    # accident_type, diagnosis, offered_amount, insurer, product_name, enrolled_at, 그리고
+    # 자유입력 question·description·additional_information. 자유입력은 mask_pii 마스킹본이다
+    # (원문 없음, §13). 마스킹에 실패한 필드는 None이고 errors에 pii_mask_failed:<필드>가 남는다.
+    case_info: dict[str, Any]
     # claim_id가 있으면 청구의 전 문서를 병합한 값이다(문서 헤더로 구분 · 엔티티는 평평 병합).
     masked_text: str  # ocr_results.masked_text
     entities: dict[str, Any]  # ocr_results.entities
@@ -53,3 +54,7 @@ class ReportState(TypedDict, total=False):
 
     # ── 운영 ──────────────────────────────────────────────
     errors: list[str]  # 노드별 fallback/실패 기록 (부분결과 표기)
+    # 노드 안에서 난 ai_client 예외의 종류(safe_node가 예외 타입으로 판정). 값이 있으면 그래프가
+    # 다음 간선에서 멈추고 초안을 저장하지 않는다 — "llm_system_failure"(429·5xx·타임아웃·연결·
+    # 설정 오류·잘림 → worker가 재전달)·"llm_refused"(거절 → BLOCKED 기록 후 즉시 종결).
+    llm_failure: str
