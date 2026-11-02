@@ -173,6 +173,14 @@ jobs:
           set -euo pipefail
           # 0809509처럼 숫자로만 된 해시는 따옴표가 없으면 YAML이 숫자로 읽어 이미지 주소가 깨진다.
           yq -i '.image.tag = strenv(SHORT_SHA) | .image.tag style="double"' "$VALUES_FILE"
+          # 청크 뷰어(Policy-Chunker)는 운영 검색 코드를 report 이미지에서 받는다(K8s-manifests
+          # charts/chunk-viewer의 aiEngine.tag). report 태그와 같은 커밋에서 같이 올려야 뷰어가 운영과
+          # 같은 코드로 검색한다. 키가 있는 값 파일만 고친다 — 없는 키를 만들면 차트 쪽 변경과 겹친다.
+          VIEWER_VALUES_FILE="$(dirname "$VALUES_FILE")/chunk-viewer.values.yaml"
+          if [ "$SERVICE" = report ] && [ -f "$VIEWER_VALUES_FILE" ] \
+              && yq -e 'has("aiEngine")' "$VIEWER_VALUES_FILE" > /dev/null 2>&1; then
+            yq -i '.aiEngine.tag = strenv(SHORT_SHA) | .aiEngine.tag style="double"' "$VIEWER_VALUES_FILE"
+          fi
           if git diff --quiet; then
             echo "이미 $SHORT_SHA 태그라 커밋하지 않습니다."
             exit 0
