@@ -2,8 +2,8 @@
 
 버전별(개정판) 원문 마크다운을 "## 신체부위" 헤더 단위로 청킹해, 계약 체결일 기준 버전
 매칭이 가능하도록 (version_label, applies_from, applies_to) 메타와 함께 적재한다.
-임베딩은 doc_embedder(기본 Ollama qwen3-embedding:0.6b, EMBED_PROVIDER=voyage면 Voyage
-voyage-4-large, 1024d)다. policy_chunks·case_chunks·쿼리 쪽과 같은 모델이어야 벡터공간이 맞는다.
+임베딩은 doc_embedder(기본 Voyage voyage-4-large 1024d, EMBED_PROVIDER=ollama면 Ollama
+qwen3-embedding:0.6b)다. policy_chunks·case_chunks·쿼리 쪽과 같은 모델이어야 벡터공간이 맞는다.
 
 입력:
   - 매니페스트(YAML): 버전별 version_label·applies_from·applies_to·source_url·파일 경로.
@@ -19,7 +19,7 @@ voyage-4-large, 1024d)다. policy_chunks·case_chunks·쿼리 쪽과 같은 모�
 실행:
   python tempVectorDB/load_schedule.py --manifest tempVectorDB/schedule_manifest.yaml
   # --manifest 생략 시 schedule_manifest.example.yaml 을 읽는다(스모크용).
-  # Voyage로 적재: EMBED_PROVIDER=voyage VOYAGE_API_KEY=... 를 앞에 붙인다.
+  # Voyage(기본)는 VOYAGE_API_KEY=... 를 앞에 붙인다. Ollama로 적재하려면 EMBED_PROVIDER=ollama.
 
 원문 데이터가 아직 미확보라면, 매니페스트가 가리키는 마크다운 파일만 채우면 그대로 돌아간다.
 """

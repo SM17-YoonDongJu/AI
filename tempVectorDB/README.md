@@ -19,7 +19,8 @@ docker compose -f tempVectorDB/docker-compose.yml up -d
 별도 레포 [Policy-Chunker(insurance-chunker)](https://github.com/SM17-YoonDongJu/Policy-Chunker/tree/insurance-chunker)에서 실행:
 
 ```bash
-export EMBED_BACKEND=ollama            # ollama(qwen3-embedding) | sentence_transformers(BGE-M3)
+export EMBED_BACKEND=voyage            # voyage(voyage-4-large) | ollama(qwen3-embedding) | sentence_transformers(BGE-M3)
+export VOYAGE_API_KEY=...              # voyage일 때(시크릿 — 숨김 입력 권장)
 export DATABASE_URL=postgresql://postgres:postgres@localhost:5433/aiengine
 
 python ingest.py \
@@ -31,15 +32,15 @@ python ingest.py \
 
 > 약관 PDF는 Notion "보험 약관 파일" DB(메리츠) 에서 받는다.
 
-Policy-Chunker에는 Voyage 백엔드가 없다. Voyage로 실험하려면 아무 백엔드로 적재한 다음, 아래 "모델 전환·재임베딩"으로 세 테이블을 함께 다시 임베딩한다.
+쿼리 쪽 기본이 Voyage(voyage-4-large)라 약관도 `EMBED_BACKEND=voyage`로 적재한다(Policy-Chunker #89). 다른 모델로 적재했다면 아래 "모델 전환·재임베딩"으로 세 테이블을 함께 다시 임베딩한다.
 
 ## 판례·장해분류표 적재 (`load_cases.py` · `load_schedule.py`)
 
-두 적재기는 공용 헬퍼 `doc_embedder.py`로 문서를 임베딩한다. 기본은 로컬 Ollama이고, `EMBED_PROVIDER=voyage`면 GPU 없이 Voyage로 적재한다.
+두 적재기는 공용 헬퍼 `doc_embedder.py`로 문서를 임베딩한다. 기본은 Voyage(GPU 불필요, 쿼리 쪽 기본과 같은 모델)이고, `EMBED_PROVIDER=ollama`면 로컬 Ollama로 적재한다.
 
 | env | 기본 | 설명 |
 |---|---|---|
-| `EMBED_PROVIDER` | `ollama` | `ollama` \| `voyage` |
+| `EMBED_PROVIDER` | `voyage` | `voyage` \| `ollama` |
 | `EMBED_MODEL` | ollama `qwen3-embedding:0.6b` / voyage `voyage-4-large` | 적재 모델 |
 | `OLLAMA_URL` | `http://localhost:11434` | ollama `POST /api/embed` |
 | `VOYAGE_API_KEY` | (없음 — voyage 필수) | 시크릿. 커밋·출력 금지 |
@@ -47,13 +48,13 @@ Policy-Chunker에는 Voyage 백엔드가 없다. Voyage로 실험하려면 아�
 | `DATABASE_URL` | `postgresql://postgres:postgres@localhost:5433/aiengine` | 적재 대상 DB |
 
 ```bash
-# Ollama(기본)
-uv run python tempVectorDB/load_schedule.py --manifest tempVectorDB/schedule_manifest.yaml
-
-# Voyage — 키는 숨김 입력으로 받아 셸 기록에 남기지 않는다
+# Voyage(기본) — 키는 숨김 입력으로 받아 셸 기록에 남기지 않는다
 read -rs VOYAGE_API_KEY && export VOYAGE_API_KEY
-EMBED_PROVIDER=voyage uv run python tempVectorDB/load_schedule.py --manifest tempVectorDB/schedule_manifest.yaml
-EMBED_PROVIDER=voyage uv run python tempVectorDB/load_cases.py
+uv run python tempVectorDB/load_schedule.py --manifest tempVectorDB/schedule_manifest.yaml
+uv run python tempVectorDB/load_cases.py
+
+# Ollama
+EMBED_PROVIDER=ollama uv run python tempVectorDB/load_schedule.py --manifest tempVectorDB/schedule_manifest.yaml
 ```
 
 적재기는 테이블 하나만 채운다. 모델을 바꿨다면 나머지 테이블도 같은 모델로 맞춘다(아래).
