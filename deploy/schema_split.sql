@@ -317,9 +317,13 @@ BEGIN
         ) ON core.reports TO ai_owner';
     END IF;
 
-    -- report_worker(#11)가 리포트(재)생성 시 DELETE + 전량 INSERT로 교체하는 패턴(SELECT는 안 씀).
+    -- report_worker(#11)가 리포트(재)생성 시 DELETE + 전량 INSERT로 교체하는 패턴.
+    -- 행을 읽지는 않지만 `DELETE ... WHERE report_id = $1`이 조건에서 report_id를 읽으므로 그 컬럼의
+    -- SELECT가 필요하다. PostgreSQL은 WHERE에서 읽는 컬럼에 SELECT 권한을 요구하고, 없으면 리포트
+    -- 저장이 permission denied로 실패한다(2026-11-02 재현 후 dev에 적용).
     IF to_regclass('core.report_issues') IS NOT NULL THEN
         EXECUTE 'GRANT INSERT, DELETE ON core.report_issues TO ai_owner';
+        EXECUTE 'GRANT SELECT (report_id) ON core.report_issues TO ai_owner';
     END IF;
 
     -- 기존 FK(user_insurances.ocr_result_id, report_attachments.ocr_result_id →
@@ -335,6 +339,10 @@ $$;
 -- 5. 역할별 기본 search_path — 각자 자기 스키마만 무자격(unqualified) 이름으로 접근되게 한다.
 --    크로스 스키마 조회(core.user_insurances 등)는 쿼리에서 항상 스키마를 명시한다(암묵적 해석에
 --    기대지 않음 — 이미 나온 4번 GRANT는 스키마 한정 SQL을 쓸 때만 의미가 있다).
+--    예외: report_worker는 아직 core·corpus 테이블을 스키마 없이 부른다(nodes/agents.py, rag).
+--    그래서 report의 DATABASE_URL에 `options=-csearch_path=ai,corpus,core,public`을 붙여 쓴다
+--    (Secrets Manager app/report-dev). 접속 옵션이 아래 롤 기본값보다 우선하므로 이 절을 적용해도
+--    report에는 영향이 없다. 반대로 그 옵션을 빼면 report는 core·corpus 테이블을 못 찾는다.
 -- ---------------------------------------------------------------------------------------------
 ALTER ROLE app_owner    SET search_path = core, public;
 ALTER ROLE ai_owner      SET search_path = ai, public;
