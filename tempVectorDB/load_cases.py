@@ -3,11 +3,11 @@
 대상:
   - prec_chunks.jsonl 중 '보험 직접관련' 버킷만 (보험금청구/구상금/자동차손배/채무부존재)
   - fss_chunks.jsonl 전체 (금감원 분쟁조정, 전부 보험)
-임베딩: doc_embedder — 기본 Ollama qwen3-embedding:0.6b, EMBED_PROVIDER=voyage면 Voyage
-voyage-4-large(1024d). policy_chunks·schedule_chunks·쿼리 쪽과 같은 모델이어야 한다.
+임베딩: doc_embedder — 기본 Voyage voyage-4-large(1024d), EMBED_PROVIDER=ollama면 Ollama
+qwen3-embedding:0.6b. policy_chunks·schedule_chunks·쿼리 쪽과 같은 모델이어야 한다.
 
-    python tempVectorDB/load_cases.py
-    EMBED_PROVIDER=voyage VOYAGE_API_KEY=... python tempVectorDB/load_cases.py
+    VOYAGE_API_KEY=... python tempVectorDB/load_cases.py
+    EMBED_PROVIDER=ollama python tempVectorDB/load_cases.py
 """
 
 from __future__ import annotations

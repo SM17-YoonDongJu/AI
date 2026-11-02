@@ -268,7 +268,7 @@ class OutputGuardResult(BaseModel):
 ---
 
 ## 7. `ai_client` 인터페이스
-`src/core/ai_client.py` — provider를 env로 고른다. 챗: `LLM_PROVIDER=anthropic`(기본, Claude 공식 SDK) | `openai_compat`(Ollama/vLLM). 임베딩: `EMBEDDING_PROVIDER=openai_compat`(기본 — 코퍼스 재임베딩 후 env로 전환) | `voyage`. 외부 API에는 마스킹된 텍스트만 보낸다(CODE_CONVENTIONS §13). 모델·엔드포인트·키는 config 주입. **anthropic 경로는 `chat()`의 `**opts`로 `model`만 받는다** — 샘플링 파라미터(temperature 등)는 `TypeError`(Opus 5.5에서 400).
+`src/core/ai_client.py` — provider를 env로 고른다. 챗: `LLM_PROVIDER=anthropic`(기본, Claude 공식 SDK) | `openai_compat`(Ollama/vLLM). 임베딩: `EMBEDDING_PROVIDER=voyage`(기본, voyage-4-large — 코퍼스도 같은 모델로 적재) | `openai_compat`(Ollama 등). 외부 API에는 마스킹된 텍스트만 보낸다(CODE_CONVENTIONS §13). 모델·엔드포인트·키는 config 주입. **anthropic 경로는 `chat()`의 `**opts`로 `model`만 받는다** — 샘플링 파라미터(temperature 등)는 `TypeError`(Opus 5.5에서 400).
 
 ```python
 async def chat(messages: list[dict[str, str]], **opts) -> str: ...   # 완성 응답 1회(anthropic은 내부 스트리밍)

@@ -74,11 +74,12 @@ def test_environment_still_accepts_full_name(monkeypatch: pytest.MonkeyPatch) ->
     assert cfg.environment == "prod"
 
 
-def test_ai_provider_defaults_keep_local_path(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_ai_provider_defaults_are_claude_and_voyage(monkeypatch: pytest.MonkeyPatch) -> None:
     # Arrange: 코드 기본값 검증 — 개발자 셸·.env 값이 새어 들지 않게 격리
     monkeypatch.delenv("LLM_PROVIDER", raising=False)
     monkeypatch.delenv("EMBEDDING_PROVIDER", raising=False)
     monkeypatch.delenv("EMBEDDING_API_KEY", raising=False)
+    monkeypatch.delenv("EMBEDDING_BASE_URL", raising=False)
     monkeypatch.delenv("LLM_EFFORT", raising=False)
     monkeypatch.delenv("LLM_MAX_TOKENS", raising=False)
     monkeypatch.delenv("LLM_TIMEOUT_SECONDS", raising=False)
@@ -86,9 +87,10 @@ def test_ai_provider_defaults_keep_local_path(monkeypatch: pytest.MonkeyPatch) -
     # Act
     cfg = Settings(_env_file=None)
 
-    # Assert: 챗 기본은 Claude. 임베딩은 재임베딩 전이라 로컬 기본을 유지한다
+    # Assert: 챗 기본은 Claude, 임베딩 기본은 Voyage(코퍼스와 같은 모델 계열)
     assert cfg.llm_provider == "anthropic"
-    assert cfg.embedding_provider == "openai_compat"
+    assert cfg.embedding_provider == "voyage"
+    assert cfg.embedding_base_url == "https://ai.mongodb.com/v1"
     assert cfg.embedding_api_key == "not-needed"
     assert cfg.llm_effort == "high"
     assert cfg.llm_max_tokens == 64000

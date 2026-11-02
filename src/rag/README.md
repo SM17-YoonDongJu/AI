@@ -41,8 +41,8 @@ result.citations      # list[Citation] — clause_no(조항/사례 번호)·exhi
 ## 임베딩과 장애 시 동작
 
 - 쿼리 임베딩은 `core.ai_client.embed(text, input_type="query")`이다(1024d). 업체는 env `EMBEDDING_PROVIDER`로 고른다.
-  - `openai_compat`(기본, Ollama qwen3-embedding): 쿼리에 instruction 프리픽스(`_QUERY_INSTRUCT`)를 붙인다. 문서는 원문으로 색인한다.
-  - `voyage`(voyage-4-large): 프리픽스 없이 원문을 보낸다. Voyage가 `input_type=query`에 검색용 프롬프트를 직접 붙이기 때문이다.
+  - `voyage`(기본, voyage-4-large): 프리픽스 없이 원문을 보낸다. Voyage가 `input_type=query`에 검색용 프롬프트를 직접 붙이기 때문이다.
+  - `openai_compat`(Ollama qwen3-embedding 등): 쿼리에 instruction 프리픽스(`_QUERY_INSTRUCT`)를 붙인다. 문서는 원문으로 색인한다.
 - 임베딩이 실패하면(`AiClientError`, 차원 불일치 포함) **키워드 검색만으로 degrade**한다. 경고 로그 `rag.embed.failed`에는 예외 타입만 남기고, 완료 로그(`rag.search.completed`)에 `degraded=True`를 남긴다. 검색 자체는 실패시키지 않는다.
 - **다른 모델로 폴백하지 않는다.** 색인 모델과 다른 모델로 쿼리를 임베딩하면 둘 다 1024d라 차원 검사는 통과하지만 벡터 공간이 달라 결과가 조용히 틀어진다. 그래서 예전의 BGE-M3 폴백을 없앴다.
 

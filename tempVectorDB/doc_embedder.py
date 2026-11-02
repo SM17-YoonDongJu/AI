@@ -1,11 +1,11 @@
-"""tempVectorDB 적재기 공용 문서 임베딩 — Ollama(기본) | Voyage.
+"""tempVectorDB 적재기 공용 문서 임베딩 — Voyage(기본) | Ollama.
 
 load_cases.py·load_schedule.py가 같이 쓴다. 적재기는 독립 스크립트라 src(core.ai_client)를
 import하지 않는다. 적재 모델은 쿼리 쪽(src/rag — EMBEDDING_PROVIDER·EMBEDDING_MODEL)과 같아야
 벡터 공간이 맞는다. 다르면 오류 없이 검색 결과만 틀어진다.
 
 env:
-    EMBED_PROVIDER   ollama(기본) | voyage
+    EMBED_PROVIDER   voyage(기본, 쿼리 쪽 core.config 기본과 같다) | ollama
     EMBED_MODEL      기본 ollama=qwen3-embedding:0.6b, voyage=voyage-4-large
     OLLAMA_URL       ollama 엔드포인트(기본 http://localhost:11434) — POST /api/embed
     VOYAGE_API_KEY   voyage 인증키(필수, 시크릿 — 커밋·출력 금지)
@@ -44,7 +44,7 @@ class EmbedConfig:
         Raises:
             ValueError: EMBED_PROVIDER가 ollama·voyage가 아니거나, voyage인데 키가 없는 경우.
         """
-        provider = os.environ.get("EMBED_PROVIDER", "ollama").strip().lower()
+        provider = os.environ.get("EMBED_PROVIDER", "voyage").strip().lower()
         if provider not in _DEFAULT_MODELS:
             raise ValueError(f"EMBED_PROVIDER는 ollama 또는 voyage여야 한다: {provider!r}")
         config = cls(

@@ -559,9 +559,9 @@ async def _embed_query(text: str) -> list[float] | None:
 
 > 쉽게 말하면: 문장을 좌표로 바꾸는 도구는 하나뿐이다. 그 도구가 고장 나도 다른 도구로 좌표를 대신 만들지 않고, 좌표 없이(의미 검색을 건너뛰고) 키워드 검색만 한다. 다른 도구가 찍은 좌표는 같은 지도 위의 좌표가 아니라서 엉뚱한 문서를 가리키기 때문이다. 어떤 경우에도 서비스는 멈추지 않는다.
 
-- **임베딩 호출: `ai_client.embed(text, input_type="query")`**(`search.py:258`). 어느 업체로 보낼지(provider)는 env `EMBEDDING_PROVIDER`로 고른다(`core/config.py:144`, 기본 `openai_compat`).
-  - `openai_compat`(기본 — Ollama 등 OpenAI 호환 서버, 운영 모델은 qwen3-embedding 1024차원): 질문에 안내 문구(instruction 프리픽스)를 붙인다. 저장된 문서는 그대로 넣고 질문에만 이 문구를 붙이는 **비대칭 방식**이다. 이 경로는 `input_type`을 요청에 싣지 않는다.
-  - `voyage`(voyage-4-large): 프리픽스 없이 원문을 보낸다. Voyage는 `input_type="query"`면 업체가 검색용 프롬프트를 앞에 붙이므로, 여기서 또 붙이면 이중 프리픽스가 된다(`search.py:241-245`).
+- **임베딩 호출: `ai_client.embed(text, input_type="query")`**(`search.py:258`). 어느 업체로 보낼지(provider)는 env `EMBEDDING_PROVIDER`로 고른다(`core/config.py:148`, 기본 `voyage`).
+  - `openai_compat`(Ollama 등 OpenAI 호환 서버, 예전 운영 모델은 qwen3-embedding 1024차원): 질문에 안내 문구(instruction 프리픽스)를 붙인다. 저장된 문서는 그대로 넣고 질문에만 이 문구를 붙이는 **비대칭 방식**이다. 이 경로는 `input_type`을 요청에 싣지 않는다.
+  - `voyage`(기본, voyage-4-large): 프리픽스 없이 원문을 보낸다. Voyage는 `input_type="query"`면 업체가 검색용 프롬프트를 앞에 붙이므로, 여기서 또 붙이면 이중 프리픽스가 된다(`search.py:241-245`).
 
   ```python
   # src/rag/search.py:36-39
