@@ -103,7 +103,7 @@ class _RecordingLogger:
 
 @pytest.fixture(autouse=True)
 def _openai_compat_embedding(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Arrange: 개발자 셸의 EMBEDDING_PROVIDER가 새어 들지 않게 기본(로컬) provider로 고정한다.
+    # Arrange: 셸의 EMBEDDING_PROVIDER가 새어 들지 않게 로컬(openai_compat)로 고정한다.
     monkeypatch.setattr(settings, "embedding_provider", "openai_compat")
 
 

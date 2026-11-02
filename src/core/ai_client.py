@@ -1,7 +1,7 @@
 """추론 클라이언트 — 챗(OpenAI 호환 | Claude)·임베딩(OpenAI 호환 | Voyage).
 
-provider는 env(`LLM_PROVIDER`·`EMBEDDING_PROVIDER`)로 고르고, 기본값은 기존 로컬 경로(Ollama 등
-OpenAI 호환 httpx)다 — env를 바꾸지 않으면 코드 머지만으로 런타임 동작이 바뀌지 않는다.
+provider는 env(`LLM_PROVIDER`·`EMBEDDING_PROVIDER`)로 고르고, 기본값은 챗 anthropic(Claude)·
+임베딩 voyage다. 로컬 Ollama 등 OpenAI 호환 서버(httpx)는 `openai_compat`으로 명시한다.
 base_url·모델명·인증키는 config에서 주입한다(하드코딩 금지). 챗과 임베딩은 서로 다른 노드·
 업체일 수 있어 엔드포인트와 **인증키를 분리**한다 — 챗 키(운영에선 Claude API 키)가 임베딩
 업체로 새면 안 된다. 모든 호출은 async-first다(httpx.AsyncClient·anthropic.AsyncAnthropic).

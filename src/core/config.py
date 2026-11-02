@@ -127,9 +127,10 @@ class Settings(BaseSettings):
     # 챗 기본값은 Claude(anthropic — 공식 SDK, ai_base_url 미사용, 키는 ai_api_key)다. 로컬 Ollama
     # 등 OpenAI 호환 서버를 쓰려면 LLM_PROVIDER=openai_compat으로 명시한다. 모델명은 기본값 없이
     # env(LLM_MODEL)로만 받는다(하드코딩 금지).
-    # 임베딩 기본값은 아직 로컬(openai_compat)이다 — 코퍼스를 다른 모델로 재임베딩하기 전에
-    # 쿼리 쪽만 바뀌면 오류 없이 검색 결과만 틀어지므로, 재임베딩(`python -m rag.reembed`) 후
-    # env로 바꾼다.
+    # 임베딩 기본값은 Voyage다 — 코퍼스(policy·case·schedule_chunks)를 voyage-4-large로 적재한다.
+    # 로컬 Ollama 등을 쓰려면 EMBEDDING_PROVIDER=openai_compat과 EMBEDDING_BASE_URL을 명시한다.
+    # 쿼리 모델이 코퍼스 모델과 다르면 오류 없이 검색 결과만 틀어지므로, 모델을 바꿀 때는
+    # 재임베딩(`python -m rag.reembed`) 후 env로 바꾼다.
     # 챗과 임베딩은 업체·노드가 다를 수 있어 엔드포인트와 인증키를 분리한다.
     llm_provider: Literal["openai_compat", "anthropic"] = "anthropic"
     ai_base_url: str = "http://localhost:11434/v1"  # openai_compat 챗 엔드포인트
@@ -144,8 +145,8 @@ class Settings(BaseSettings):
     llm_max_tokens: int = 64000
     llm_timeout_seconds: float = 600.0  # anthropic 전용 SDK 요청 타임아웃(초)
     # voyage: Voyage(MongoDB Atlas 모델 API) — 요청에 input_type·output_dimension을 싣는다.
-    embedding_provider: Literal["openai_compat", "voyage"] = "openai_compat"
-    embedding_base_url: str = "http://localhost:11434/v1"  # 임베딩 엔드포인트(별도 노드/업체 가능)
+    embedding_provider: Literal["openai_compat", "voyage"] = "voyage"
+    embedding_base_url: str = "https://ai.mongodb.com/v1"  # 임베딩 엔드포인트(별도 노드/업체 가능)
     # 임베딩 전용 인증키(시크릿). 챗 키와 분리한다 — 운영 AI_API_KEY는 Claude 키라 임베딩
     # 요청에 실리면 임베딩 업체로 새어 나간다. not-needed·빈값이면 인증 헤더를 붙이지 않는다.
     embedding_api_key: str = "not-needed"
