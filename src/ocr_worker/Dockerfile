@@ -39,13 +39,16 @@ FROM python:3.12-slim AS runtime
 # PADDLE_PDX_CACHE_HOME: paddlex 모델 캐시(official_models/<모델명>)를 이미지 안으로.
 # HF_HOME: NER 모델(HuggingFace) 캐시를 이미지 안으로.
 # OMP_NUM_THREADS: torch(NER) 스레드 상한 — 배포 env로 OCR_CPU_THREADS와 함께 맞춘다(기본 2).
+# MALLOC_ARENA_MAX: glibc 아레나 수 상한. 스레드(asyncio.to_thread·OpenMP)마다 아레나가 생기면 해제된
+#   메모리가 흩어져 남아 작업 사이 RSS가 불어난다. 작업마다 malloc_trim(__main__._release_memory)과 짝이다.
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app/src \
     PATH="/app/.venv/bin:$PATH" \
     PADDLE_PDX_CACHE_HOME=/opt/models/paddlex \
     HF_HOME=/opt/models/huggingface \
-    OMP_NUM_THREADS=2
+    OMP_NUM_THREADS=2 \
+    MALLOC_ARENA_MAX=2
 # libgomp1: paddle 코어(libpaddle.so)가 OpenMP 런타임을 연다(모델을 만들 때 로드).
 # libgl1·libglib2.0-0: paddlex가 GUI판 opencv-contrib-python을 버전까지 고정해 끌어오고, 그 cv2가
 # import 시점에 libGL.so.1·libgthread를 연다(headless판으로 바꾸면 paddlex 고정과 충돌 — 청커와 같다).

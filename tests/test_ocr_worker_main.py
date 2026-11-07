@@ -516,3 +516,114 @@ async def test_poison_hook_swallows_claim_progress_failure(
 
     warned = [entry for entry in logs if entry["event"] == "claim_progress_advance_failed"]
     assert [entry["error_type"] for entry in warned] == ["RuntimeError"]  # 타입만 남긴다(§9)
+
+
+# ── 작업 사이 메모리 반납(_with_memory_release·_release_memory) ──────
+# 검출 최고점(A4 약 3.9GB) 뒤 glibc가 해제된 힙을 붙들면 작업 사이 RSS가 높게 남는다. 작업이 끝날
+# 때마다(성공·실패 모두) 반납하되, 반납은 최선 노력이라 작업 결과를 바꾸면 안 된다.
+async def test_memory_release_runs_after_successful_job(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Arrange
+    calls: list[str] = []
+    monkeypatch.setattr(ocr_main, "_release_memory", lambda: calls.append("release"))
+
+    async def handler(_job_: OcrJob) -> None:
+        calls.append("handle")
+
+    # Act
+    await ocr_main._with_memory_release(handler)(_job())
+
+    # Assert
+    assert calls == ["handle", "release"]
+
+
+async def test_memory_release_runs_after_failed_job_and_keeps_the_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Arrange: 실패한 작업도 최고점을 지났을 수 있다 — 반납하되 예외(재전달 신호)는 그대로 올린다.
+    calls: list[str] = []
+    monkeypatch.setattr(ocr_main, "_release_memory", lambda: calls.append("release"))
+
+    async def handler(_job_: OcrJob) -> None:
+        raise RuntimeError("boom")
+
+    # Act / Assert
+    with pytest.raises(RuntimeError, match="boom"):
+        await ocr_main._with_memory_release(handler)(_job())
+    assert calls == ["release"]
+
+
+async def test_memory_release_failure_does_not_change_job_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Arrange
+    def broken_release() -> None:
+        raise OSError("trim failed")
+
+    monkeypatch.setattr(ocr_main, "_release_memory", broken_release)
+    handled: list[str] = []
+
+    async def handler(job: OcrJob) -> None:
+        handled.append(str(job.job_id))
+
+    # Act
+    with capture_logs() as logs:
+        await ocr_main._with_memory_release(handler)(_job())
+
+    # Assert: 작업은 성공으로 끝나고, 반납 실패는 경고로만 남는다.
+    assert handled
+    assert any(entry["event"] == "memory_release_failed" for entry in logs)
+
+
+def test_release_memory_trims_glibc_heap(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Arrange
+    trims: list[int] = []
+
+    class FakeLibc:
+        def malloc_trim(self, pad: int) -> int:
+            trims.append(pad)
+            return 1
+
+    monkeypatch.setattr(ocr_main.ctypes, "CDLL", lambda _name: FakeLibc())
+
+    # Act
+    ocr_main._release_memory()
+
+    # Assert
+    assert trims == [0]
+
+
+def test_release_memory_is_noop_without_glibc(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Arrange: macOS·musl처럼 libc.so.6(또는 malloc_trim)이 없으면 할 일이 없다.
+    def no_glibc(_name: str) -> object:
+        raise OSError("libc.so.6 not found")
+
+    monkeypatch.setattr(ocr_main.ctypes, "CDLL", no_glibc)
+
+    # Act / Assert: 예외 없이 끝난다.
+    ocr_main._release_memory()
+
+
+async def test_run_wraps_consumer_handler_with_memory_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Arrange: _run이 소비자에 넘기는 핸들러를 실제로 불러, 작업 뒤 반납이 일어나는지 본다.
+    recorder = _RunRecorder()
+    recorder.install(monkeypatch, Settings(_env_file=None))
+    released: list[bool] = []
+    monkeypatch.setattr(ocr_main, "_release_memory", lambda: released.append(True))
+
+    class CapturingConsumer:
+        def __init__(self, **kwargs: Any) -> None:
+            self.handler = kwargs["handler"]
+
+        async def run(self) -> None:
+            await self.handler(_job())
+
+    monkeypatch.setattr(ocr_main, "SqsConsumer", CapturingConsumer)
+
+    # Act
+    async with asyncio.timeout(_TIMEOUT_S):
+        await ocr_main._run()
+
+    # Assert
+    assert released == [True]

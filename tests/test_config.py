@@ -1,5 +1,7 @@
 """config.py 환경설정 테스트."""
 
+import math
+
 import pytest
 from pydantic import ValidationError
 
@@ -10,6 +12,7 @@ from core.config import (
     Settings,
     get_settings,
 )
+from ocr_worker.ocr import PDF_RENDER_DPI
 
 
 def test_embedding_dim_default_is_contract_value() -> None:
@@ -190,6 +193,28 @@ def test_vlm_budget_keeps_a_nonzero_safety_margin() -> None:
 def test_vlm_concurrency_must_be_positive(monkeypatch: pytest.MonkeyPatch) -> None:
     # Arrange: 0이면 세마포어가 영원히 안 열려 VLM 단계가 예산 끝까지 멎는다 — 기동 시점에 거른다.
     monkeypatch.setenv("VLM_CONCURRENCY", "0")
+
+    # Act / Assert
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+
+def test_ocr_det_limit_default_does_not_downscale_a4_pages() -> None:
+    # Arrange: A4(297mm)를 PDF_RENDER_DPI로 렌더한 긴 변. 검출 상한이 이보다 작으면 A4 쪽도 줄어
+    # 단어 상자가 긴 줄로 합쳐지고 한국어 인식이 무너진다(합성 측정 53/60 → 32·42/60).
+    a4_long_side_px = math.ceil(297 / 25.4 * PDF_RENDER_DPI)
+
+    # Act
+    limit = Settings(_env_file=None).ocr_det_limit_side_len
+
+    # Assert: 상한은 켜져 있고(큰 사진 OOM 방지) A4는 그대로 둔다.
+    assert limit > 0
+    assert limit >= a4_long_side_px
+
+
+def test_ocr_det_limit_rejects_negative(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Arrange
+    monkeypatch.setenv("OCR_DET_LIMIT_SIDE_LEN", "-1")
 
     # Act / Assert
     with pytest.raises(ValidationError):

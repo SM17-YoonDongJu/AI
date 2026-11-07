@@ -245,6 +245,7 @@ def test_paddle_engine_from_settings_uses_ocr_settings() -> None:
         ocr_textline_orientation=False,
         ocr_cpu_threads=4,
         ocr_enable_mkldnn=False,
+        ocr_det_limit_side_len=1800,
     )
     factory = _RecordingFactory(_FakePaddleOcr())
 
@@ -260,6 +261,35 @@ def test_paddle_engine_from_settings_uses_ocr_settings() -> None:
     assert options["use_textline_orientation"] is False
     assert options["cpu_threads"] == 4
     assert options["enable_mkldnn"] is False
+    assert options["text_det_limit_type"] == "max"
+    assert options["text_det_limit_side_len"] == 1800
+
+
+def test_paddle_engine_caps_detection_input_long_side() -> None:
+    # Arrange: 큰 폰 사진은 기본값(긴 변 4000까지 그대로)으로 검출하면 OOM이 난다
+    # — 긴 변 상한(max)을 건다.
+    engine, factory = _engine(_FakePaddleOcr(), det_limit_side_len=2400)
+
+    # Act
+    engine.recognize([_page_image()])
+
+    # Assert
+    options = factory.calls[0]
+    assert options["text_det_limit_type"] == "max"
+    assert options["text_det_limit_side_len"] == 2400
+
+
+def test_paddle_engine_leaves_paddle_default_when_detection_limit_is_zero() -> None:
+    # Arrange: 0은 "상한 없음" — PaddleOCR 기본값을 쓴다(키를 넘기지 않는다).
+    engine, factory = _engine(_FakePaddleOcr(), det_limit_side_len=0)
+
+    # Act
+    engine.recognize([_page_image()])
+
+    # Assert
+    options = factory.calls[0]
+    assert "text_det_limit_type" not in options
+    assert "text_det_limit_side_len" not in options
 
 
 def test_ocr_processor_default_engine_is_paddle_built_from_settings(

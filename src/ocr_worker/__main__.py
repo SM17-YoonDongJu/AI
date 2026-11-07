@@ -21,6 +21,8 @@
 
 import asyncio
 import contextlib
+import ctypes
+import gc
 from collections.abc import Awaitable, Callable
 
 import asyncpg
@@ -101,7 +103,7 @@ async def _run() -> None:
         consumer: SqsConsumer[OcrJob] = SqsConsumer(
             queue_url=settings.sqs_ocr_job_queue_url,
             schema=OcrJob,
-            handler=pipeline.handle,
+            handler=_with_memory_release(pipeline.handle),
             settings=settings,
             on_poison=_poison_journal(pool, pipeline),
         )
@@ -141,6 +143,41 @@ async def _run() -> None:
             # VLM 공유 httpx 클라이언트(연결 풀)를 닫는다 — 소비 루프가 멈춘 뒤라 진행 중인
             # VLM 호출이 없다.
             await close_vlm_client()
+
+
+def _release_memory() -> None:
+    """문서 하나를 끝낸 뒤 해제된 힙을 OS로 돌려준다(glibc ``malloc_trim``).
+
+    검출 최고점(A4 한 쪽 약 3.9GB)이 지나도 glibc가 해제된 메모리를 붙들고 있으면 작업 사이
+    RSS가 높게 남아, 같은 노드의 다른 파드 몫을 깎는다. 최고점 자체는 줄이지 못한다 — 그건
+    ``ocr_det_limit_side_len``이 맡는다. glibc가 아니면(macOS·musl) 할 일이 없다.
+    """
+    gc.collect()
+    try:
+        malloc_trim = ctypes.CDLL("libc.so.6").malloc_trim
+    except (OSError, AttributeError):
+        return
+    malloc_trim(0)
+
+
+def _with_memory_release(
+    handler: Callable[[OcrJob], Awaitable[None]],
+) -> Callable[[OcrJob], Awaitable[None]]:
+    """핸들러가 끝날 때마다(성공·실패 모두) ``_release_memory``를 스레드에서 부른다.
+
+    반납은 최선 노력이다 — 반납이 실패해도 작업 결과(ack·재전달)는 바꾸지 않는다.
+    """
+
+    async def handle(job: OcrJob) -> None:
+        try:
+            await handler(job)
+        finally:
+            try:
+                await asyncio.to_thread(_release_memory)
+            except Exception as exc:  # 최선 노력 — 원래 예외·결과를 덮지 않는다
+                logger.warning("memory_release_failed", error_type=type(exc).__name__)
+
+    return handle
 
 
 def _poison_journal(

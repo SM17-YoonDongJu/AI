@@ -63,6 +63,7 @@ uv run python -m ocr_worker
 - `.[ocr]` extra: `paddleocr` 3.7.x·`paddlepaddle` 3.2.x(CPU 휠, PyPI — 3.3.x는 x86 oneDNN에서 검출이 죽어 제외), `.[ner]` extra: `transformers<5`·CPU `torch`(linux는 pytorch-cpu 인덱스만 — CUDA 휠 차단). OCR 이미지는 둘 다 깐다(`USE_NER=true`)
 - 무거운 의존성(paddleocr·paddle·pymupdf·PIL·boto3)은 **lazy import**한다. 모델 없이도 오케스트레이션과 엔진 어댑터(가짜 `predict`)를 테스트할 수 있다.
 - 배포: `src/ocr_worker/Dockerfile`(python:3.12-slim, CPU 전용). 모델(PP-OCRv5 검출 server·mobile, 한국어 인식, 줄 방향, NER)은 빌드 때 `/opt/models`에 넣고(런타임 다운로드·egress 없음, `/root/.cache` PVC에 가리지 않음) 빌드 스모크가 같은 프로세스에서 OCR → NER → OCR을 실제로 돌려 본다(`ocr_worker.build_check`). paddle CPU 휠이 linux x86_64뿐이라 Apple Silicon에선 `--platform linux/amd64`로 빌드한다. 지금은 EC2의 `deploy/docker-compose.ocr.yml`(SSM, GPU 예약 없음)이고 k8s로 옮길 예정이다. 스레드는 `OCR_CPU_THREADS`·`OMP_NUM_THREADS`(이미지 기본 2)
+- 메모리: 최고점은 검출 단계다(A4 200DPI 한 쪽 약 3.9GB). PaddleOCR 기본값은 긴 변 4000px까지 그대로 검출해 1200만 화소 폰 사진이 7GiB에서도 OOM이 났다(2026-11-08 측정). `OCR_DET_LIMIT_SIDE_LEN`(기본 2400)이 검출 입력의 긴 변을 묶어 모든 입력의 최고점을 A4 수준으로 맞춘다 — A4(2339)보다 낮추면 단어 상자가 긴 줄로 합쳐져 한국어 인식이 무너진다. 작업마다 `malloc_trim`으로 해제된 힙을 돌려주고(`MALLOC_ARENA_MAX=2`), 작업 사이 RSS는 약 1.5~1.8GB다
 - 루트 파일시스템을 읽기 전용으로 두면 `/tmp`에 쓰기 가능한 볼륨(emptyDir 등)이 있어야 한다. paddle 모델 로드가 임시 디렉터리를 찾고, 없으면 `OcrError("PaddleOCR 모델 로드 실패")`로 죽는다(`docker run --read-only`로 확인, `/tmp` tmpfs만 주면 통과)
 - 배포 확인: `scripts/check_ocr_deploy.sh`
 

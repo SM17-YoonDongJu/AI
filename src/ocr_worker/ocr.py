@@ -144,6 +144,7 @@ class PaddleOcrEngine:
         textline_orientation: bool,
         cpu_threads: int,
         enable_mkldnn: bool = True,
+        det_limit_side_len: int = 0,
         factory: Callable[..., Any] | None = None,
     ) -> None:
         """엔진을 구성한다(모델은 아직 로드하지 않는다).
@@ -154,15 +155,24 @@ class PaddleOcrEngine:
             textline_orientation: 줄 방향 분류(뒤집힌 줄 보정) 사용 여부.
             cpu_threads: paddle 추론 스레드 수.
             enable_mkldnn: x86 oneDNN 가속 사용 여부(``ocr_enable_mkldnn`` 설정 주석 참고).
+            det_limit_side_len: 검출 입력의 긴 변 상한(픽셀). 큰 사진의 검출 메모리를 묶는다
+                (``ocr_det_limit_side_len`` 설정 주석 참고). 0이면 PaddleOCR 기본값(긴 변
+                4000까지 그대로).
             factory: ``PaddleOCR`` 생성 함수(주입 — 테스트는 가짜 predict 객체를 돌려준다).
                 ``None``이면 ``paddleocr.PaddleOCR``.
         """
+        det_limit: dict[str, object] = (
+            {"text_det_limit_type": "max", "text_det_limit_side_len": det_limit_side_len}
+            if det_limit_side_len > 0
+            else {}
+        )
         self._options: dict[str, object] = {
             "text_detection_model_name": det_model,
             "text_recognition_model_name": rec_model,
             "use_textline_orientation": textline_orientation,
             "cpu_threads": cpu_threads,
             "enable_mkldnn": enable_mkldnn,
+            **det_limit,
             **_FIXED_PADDLE_OPTIONS,
         }
         self._factory: Callable[..., Any] = factory or _create_paddle_ocr
@@ -179,6 +189,7 @@ class PaddleOcrEngine:
             textline_orientation=settings.ocr_textline_orientation,
             cpu_threads=settings.ocr_cpu_threads,
             enable_mkldnn=settings.ocr_enable_mkldnn,
+            det_limit_side_len=settings.ocr_det_limit_side_len,
         )
 
     def load(self) -> None:
