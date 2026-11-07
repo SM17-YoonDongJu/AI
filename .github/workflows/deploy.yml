@@ -1,9 +1,10 @@
 # Deploy — dev push(=병합) 시 테스트 통과 후 변경된 서비스만 ECR 빌드→push→배포.
-# 배포 경로는 서비스별로 갈린다:
-#   - report·corpus: k8s — K8s-manifests의 image.tag를 이번 커밋 sha7로 커밋하면
-#     Argo CD가 감지해 롤링 업데이트한다. CI는 클러스터·서버에 접속하지 않는다.
-#   - ocr(GPU EC2): SSM으로 호스트 compose를 재시작한다. 대상 인스턴스 변수가 비어 있으면
-#     빌드만 하고 배포를 건너뛴다(계정 이전 직후처럼 호스트가 아직 없는 구간).
+# 배포 경로:
+#   - report·corpus·ocr: k8s — K8s-manifests의 image.tag를 이번 커밋 sha7로 커밋하면
+#     Argo CD가 감지해 다시 띄운다. CI는 클러스터·서버에 접속하지 않는다.
+#     ocr은 brbs-etl 노드의 ocr-worker Deployment다(K8s-manifests charts/ocr-worker).
+#   - SSM 경로(GPU EC2 호스트 compose)는 지금 쓰는 서비스가 없다. ocr을 GPU EC2로 되돌릴 때를
+#     위해 남겨 둔다 — matrix의 manifest를 비우면 그 경로로 간다.
 # 테스트는 ci.yml을 workflow_call로 재사용해 게이팅한다(needs: test). 워크플로 간 needs는
 # 불가하므로 "재사용 호출"로 잇는다. push 직접 트리거라 workflow_run의 기본브랜치 제약도 없다.
 #
@@ -76,9 +77,9 @@ jobs:
           # entry: service|dockerfile|repo|tag|target|svc|compose_src|manifest
           # 서비스별 전용 저장소(brbs/ocr·brbs/corpus·brbs/report)에 :dev·:<sha7> 태그로 push한다.
           # manifest: K8s-manifests의 값 파일 경로. 비어 있지 않으면 Argo CD 경로(매니페스트 태그 커밋),
-          #   비어 있으면 SSM 경로(target=ocr: GPU EC2)로 배포한다.
+          #   비어 있으면 SSM 경로(target=ocr: GPU EC2)로 배포한다. 지금은 셋 다 Argo CD 경로다.
           # compose_src: SSM 배포 시 호스트에 기록할 "레포 내" compose(우리 소유라 코드 기반).
-          pick ocr     && add '{"service":"ocr","dockerfile":"src/ocr_worker/Dockerfile","repo":"brbs/ocr","tag":"dev","target":"ocr","svc":"ocr-worker","compose_src":"deploy/docker-compose.ocr.yml","manifest":""}'
+          pick ocr     && add '{"service":"ocr","dockerfile":"src/ocr_worker/Dockerfile","repo":"brbs/ocr","tag":"dev","target":"k8s","svc":"ocr-worker","compose_src":"","manifest":"envs/dev/ocr-worker.values.yaml"}'
           pick corpus  && add '{"service":"corpus","dockerfile":"src/corpus_worker/Dockerfile","repo":"brbs/corpus","tag":"dev","target":"k8s","svc":"corpus-worker","compose_src":"","manifest":"envs/dev/etl-corpus.values.yaml"}'
           pick report  && add '{"service":"report","dockerfile":"src/report_worker/Dockerfile","repo":"brbs/report","tag":"dev","target":"k8s","svc":"report","compose_src":"","manifest":"envs/dev/report.values.yaml"}'
           json=$(IFS=,; echo "[${items[*]}]")
@@ -205,8 +206,9 @@ jobs:
           echo "::error::K8s-manifests main에 push하지 못했습니다."
           exit 1
 
-      # ── SSM 경로 (ocr) ─────────────────────────────────────────────────────────────
-      # ocr만 호스트 compose다(GPU EC2). 나머지는 위 Argo CD 경로로 끝난다.
+      # ── SSM 경로 (GPU EC2 호스트 compose) ──────────────────────────────────────────
+      # 지금은 이 경로를 타는 서비스가 없다(ocr도 위 Argo CD 경로로 옮겼다). ocr을 GPU EC2로 되돌릴 때
+      # matrix의 ocr 항목을 target=ocr·compose_src·빈 manifest로 바꾸면 다시 이 경로로 간다.
       - name: Resolve deploy target
         id: t
         if: matrix.manifest == ''
@@ -292,7 +294,7 @@ jobs:
             exit 1
           fi
 
-      # Argo CD 경로(report·corpus)는 실패할 때만 알린다. 이 잡의 성공은 매니페스트 커밋까지라서,
+      # Argo CD 경로(report·corpus·ocr)는 실패할 때만 알린다. 이 잡의 성공은 매니페스트 커밋까지라서,
       # 실제 반영 결과(배포 완료·Sync 실패·Degraded)는 Argo CD가 DEPLOYMENT 채널로 보낸다(K8s-manifests PR #11).
       - name: Notify deploy result
         if: always() && (matrix.manifest == '' || job.status != 'success')
