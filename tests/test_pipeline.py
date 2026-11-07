@@ -436,7 +436,7 @@ async def test_vlm_not_called_for_non_table_doc_type() -> None:
 
 
 async def test_vlm_success_replaces_masked_text_for_table_doc_type() -> None:
-    # Arrange: 지급결과안내문(표 문서 유형) + PII 없는 VLM 마크다운 표 결과. surya 원문
+    # Arrange: 지급결과안내문(표 문서 유형) + PII 없는 VLM 마크다운 표 결과. OCR 엔진 원문
     # 단어(지급결정·내역 등)를 재사용해 groundedness 체크를 통과하게 한다(환각 아님).
     pool = FakePool(existing=None)
     producer = FakeProducer()
@@ -461,7 +461,7 @@ async def test_vlm_success_replaces_masked_text_for_table_doc_type() -> None:
 
 
 async def test_vlm_failure_falls_back_to_surya_masked_text() -> None:
-    # Arrange: VLM 연결 실패 — surya 기반 masked_text로 계속 진행해야 한다(job 안 죽음).
+    # Arrange: VLM 연결 실패 — OCR 엔진 기반 masked_text로 계속 진행해야 한다(job 안 죽음).
     pool = FakePool(existing=None)
     producer = FakeProducer()
     processor = FakeProcessor(_result(*_PAYOUT_TEXTS))
@@ -471,19 +471,19 @@ async def test_vlm_failure_falls_back_to_surya_masked_text() -> None:
     # Act
     await pipeline.handle(_job())
 
-    # Assert: 예외 없이 완료되고, surya 기반 텍스트가 그대로 저장됐다.
+    # Assert: 예외 없이 완료되고, OCR 엔진 기반 텍스트가 그대로 저장됐다.
     assert vlm.called is True
     insert_args = pool.insert_calls()[0][1]
     masked_text = insert_args[4]
     entities = json.loads(insert_args[6])
-    assert "지급결정" in masked_text  # surya 원문 유래(마스킹 대상 PII 없어 그대로)
+    assert "지급결정" in masked_text  # OCR 엔진 원문 유래(마스킹 대상 PII 없어 그대로)
     assert "table_markdown" not in entities
     assert len(producer.published) == 1  # 파이프라인은 정상 완료
 
 
 async def test_vlm_residual_pii_discards_table_and_falls_back() -> None:
     # Arrange: VLM 원문에 PII가 있는데 마스커가 이를 못 가리는 상황(_IdentityMasker) —
-    # surya 원문엔 PII가 없어 메인 게이트는 통과하지만, VLM 표는 폐기돼야 한다.
+    # OCR 엔진 원문엔 PII가 없어 메인 게이트는 통과하지만, VLM 표는 폐기돼야 한다.
     pool = FakePool(existing=None)
     producer = FakeProducer()
     processor = FakeProcessor(_result(*_PAYOUT_TEXTS))
@@ -493,7 +493,7 @@ async def test_vlm_residual_pii_discards_table_and_falls_back() -> None:
     # Act
     await pipeline.handle(_job())
 
-    # Assert: job은 정상 완료되고, VLM 표는 저장되지 않는다(surya 원문으로 폴백).
+    # Assert: job은 정상 완료되고, VLM 표는 저장되지 않는다(OCR 엔진 원문으로 폴백).
     insert_args = pool.insert_calls()[0][1]
     masked_text = insert_args[4]
     entities = json.loads(insert_args[6])
@@ -503,8 +503,8 @@ async def test_vlm_residual_pii_discards_table_and_falls_back() -> None:
 
 
 async def test_vlm_backfills_domain_field_surya_missed() -> None:
-    # Arrange: surya 원문엔 KCD 코드도 병명 라벨도 없어 diagnosis_name이 None이지만,
-    # VLM이 더 깨끗하게 읽은 원문엔 라벨이 있어 실제로는 값이 존재한다 — surya의
+    # Arrange: OCR 엔진 원문엔 KCD 코드도 병명 라벨도 없어 diagnosis_name이 None이지만,
+    # VLM이 더 깨끗하게 읽은 원문엔 라벨이 있어 실제로는 값이 존재한다 — OCR 엔진의
     # extract()가 못 찾은 필드를 VLM 채택 원문 재추출로 보강해야 한다.
     pool = FakePool(existing=None)
     producer = FakeProducer()
@@ -522,9 +522,9 @@ async def test_vlm_backfills_domain_field_surya_missed() -> None:
 
 
 async def test_vlm_value_overrides_field_surya_already_found() -> None:
-    # Arrange: surya가 이미 KCD 코드를 찾았어도, VLM이 채택되면 VLM 쪽 값을
-    # 우선한다 — VLM은 이미 groundedness 검증을 통과했고, 애초에 surya 신뢰도가
-    # 낮아서 호출된 것이므로 더 신뢰할 근거가 있다(실측: surya가 금액을 다른
+    # Arrange: OCR 엔진이 이미 KCD 코드를 찾았어도, VLM이 채택되면 VLM 쪽 값을
+    # 우선한다 — VLM은 이미 groundedness 검증을 통과했고, 애초에 OCR 엔진 신뢰도가
+    # 낮아서 호출된 것이므로 더 신뢰할 근거가 있다(surya 시절 실측: 엔진이 금액을 다른
     # 문서 필드로 오독해 엉뚱한 값을 채운 사례를 근거로 우선순위를 뒤집었다).
     pool = FakePool(existing=None)
     producer = FakeProducer()
@@ -542,8 +542,8 @@ async def test_vlm_value_overrides_field_surya_already_found() -> None:
 
 
 async def test_vlm_keeps_surya_value_when_vlm_text_has_no_match() -> None:
-    # Arrange: surya가 KCD를 찾았고, VLM 채택 원문엔 KCD도 병명 라벨도 없다 —
-    # 이 경우 vlm_entities는 None이라 surya 값을 그대로 유지해야 한다.
+    # Arrange: OCR 엔진이 KCD를 찾았고, VLM 채택 원문엔 KCD도 병명 라벨도 없다 —
+    # 이 경우 vlm_entities는 None이라 OCR 엔진 값을 그대로 유지해야 한다.
     pool = FakePool(existing=None)
     producer = FakeProducer()
     processor = FakeProcessor(_result("진단서 A09.9 위염 스캔 품질 낮음", confidence=0.5))
@@ -560,7 +560,7 @@ async def test_vlm_keeps_surya_value_when_vlm_text_has_no_match() -> None:
 
 
 async def test_masked_lines_unaffected_by_vlm_path() -> None:
-    # Arrange: VLM 성공 여부와 무관하게 masked_lines(이미지 마스킹 bbox)는 surya 기반 그대로.
+    # Arrange: VLM 성공 여부와 무관하게 masked_lines(이미지 마스킹 bbox)는 OCR 엔진 기반 그대로.
     pool = FakePool(existing=None)
     producer = FakeProducer()
     processor = FakeProcessor(_result(*_PAYOUT_TEXTS))
@@ -570,7 +570,7 @@ async def test_masked_lines_unaffected_by_vlm_path() -> None:
     # Act
     await pipeline.handle(_job())
 
-    # Assert: 라인 수가 surya OCR 결과(3줄)와 일치 — VLM 결과로 대체되지 않았다.
+    # Assert: 라인 수가 OCR 엔진 결과(3줄)와 일치 — VLM 결과로 대체되지 않았다.
     insert_args = pool.insert_calls()[0][1]
     masked_lines = json.loads(insert_args[5])
     assert len(masked_lines) == len(_PAYOUT_TEXTS)
@@ -579,7 +579,7 @@ async def test_masked_lines_unaffected_by_vlm_path() -> None:
 # ── 다중 페이지 VLM 합성(페이지별 독립 폴백) ─────────────────────
 async def test_vlm_partial_page_failure_keeps_other_pages() -> None:
     # Arrange: 2페이지 표 문서. 1페이지는 VLM 성공(원문 단어 재사용해 grounded),
-    # 2페이지는 VLM 호출 실패 — 실패한 페이지만 surya로 폴백하고 문서 전체가
+    # 2페이지는 VLM 호출 실패 — 실패한 페이지만 OCR 엔진 결과로 폴백하고 문서 전체가
     # 유실되지 않아야 한다(예전엔 1페이지 성공만으로 masked_text 전체가 교체돼
     # 2페이지 이후 내용이 통째로 사라졌었다).
     pool = FakePool(existing=None)
@@ -590,7 +590,7 @@ async def test_vlm_partial_page_failure_keeps_other_pages() -> None:
     vlm = _PerPageVlm(
         [
             "보험금 지급결과 안내문 지급결정 내역(표)",  # 1페이지: grounded → 채택
-            VlmClientError("연결 실패"),  # 2페이지: 실패 → surya 폴백
+            VlmClientError("연결 실패"),  # 2페이지: 실패 → OCR 엔진 폴백
         ]
     )
     pipeline = _pipeline(pool, producer, processor, vlm_transcribe=vlm)
@@ -603,7 +603,7 @@ async def test_vlm_partial_page_failure_keeps_other_pages() -> None:
     insert_args = pool.insert_calls()[0][1]
     masked_text = insert_args[4]
     assert "지급결정 내역(표)" in masked_text  # 1페이지: VLM 결과
-    assert "추가 산정 내역" in masked_text  # 2페이지: surya 폴백으로 유지(유실 안 됨)
+    assert "추가 산정 내역" in masked_text  # 2페이지: OCR 엔진 폴백으로 유지(유실 안 됨)
 
 
 async def test_vlm_table_markdown_joins_only_adopted_pages() -> None:
@@ -637,7 +637,7 @@ async def test_vlm_table_markdown_joins_only_adopted_pages() -> None:
 
 
 async def test_vlm_all_pages_fail_falls_back_to_pure_surya() -> None:
-    # Arrange: 2페이지 모두 VLM 실패 — masked_text는 전 페이지 surya 원문 그대로,
+    # Arrange: 2페이지 모두 VLM 실패 — masked_text는 전 페이지 OCR 엔진 원문 그대로,
     # table_markdown 키 자체가 없어야 한다(단일 페이지 케이스와 동일한 계약 유지).
     pool = FakePool(existing=None)
     producer = FakeProducer()
@@ -692,7 +692,7 @@ async def test_vlm_pages_run_concurrently_and_merge_in_page_order() -> None:
 
 async def test_vlm_page_budget_exceeded_falls_back_to_surya_for_unfinished_page() -> None:
     # Arrange: 2페이지 전사가 응답하지 않는다. 단건 타임아웃(180초)만으론 쪽 수에 비례해 SQS
-    # 가시성을 넘길 수 있어 단계 예산에서 끊는다 — 끝난 1페이지는 VLM, 못 끝낸 2페이지는 surya.
+    # 가시성을 넘길 수 있어 단계 예산에서 끊는다 — 끝난 1페이지는 VLM, 못 끝낸 2페이지는 OCR 엔진.
     pool = FakePool(existing=None)
     producer = FakeProducer()
     page1 = "보험금 지급결과 안내문 지급결정 내역"
@@ -726,7 +726,7 @@ async def test_vlm_page_budget_exceeded_falls_back_to_surya_for_unfinished_page(
     assert len(producer.published) == 1  # 작업은 정상 완료
 
 
-# 부분 채택 문서에서 VLM이 실패·예산 초과한 쪽은 **그 쪽의 surya 원문을 마스킹해** 합성본에
+# 부분 채택 문서에서 VLM이 실패·예산 초과한 쪽은 **그 쪽의 OCR 엔진 원문을 마스킹해** 합성본에
 # 넣는다(QA W1). 이 쪽은 문서 단위 _analyze 마스킹이 아니라 쪽 단위 마스킹을 따로 받는다 —
 # 빠지면 이름처럼 잔류 게이트(주민·카드)에 안 걸리는 PII가 그대로 저장된다. 그래서 이름·전화로 본다.
 _ADOPTED_PAGE = "보험금 지급결과 안내문 지급결정 내역"
@@ -734,7 +734,7 @@ _PII_PAGE = "수익자 성명 홍길동 연락처 010-1234-5678"
 
 
 async def test_vlm_failed_page_surya_text_stays_masked_in_partial_adoption() -> None:
-    # Arrange: 1쪽은 VLM 채택, 2쪽(PII 있음)은 VLM 실패 → 2쪽만 surya 폴백.
+    # Arrange: 1쪽은 VLM 채택, 2쪽(PII 있음)은 VLM 실패 → 2쪽만 OCR 엔진 폴백.
     pool = FakePool(existing=None)
     processor = FakeProcessor(_multi_page_result(_ADOPTED_PAGE, _PII_PAGE))
     vlm = _PerPageVlm([f"{_ADOPTED_PAGE}(표1)", VlmClientError("연결 실패")])
@@ -752,7 +752,7 @@ async def test_vlm_failed_page_surya_text_stays_masked_in_partial_adoption() -> 
 
 
 async def test_vlm_budget_exceeded_page_surya_text_stays_masked() -> None:
-    # Arrange: 2쪽(PII 있음) 전사가 응답하지 않아 쪽 예산에서 끊긴다 → 2쪽만 surya 폴백.
+    # Arrange: 2쪽(PII 있음) 전사가 응답하지 않아 쪽 예산에서 끊긴다 → 2쪽만 OCR 엔진 폴백.
     pool = FakePool(existing=None)
     processor = FakeProcessor(_multi_page_result(_ADOPTED_PAGE, _PII_PAGE))
     never = asyncio.Event()
@@ -797,7 +797,8 @@ class _PageBlindMasker(Masker):
 
 async def test_vlm_composed_text_with_residual_pii_falls_back_to_surya_only() -> None:
     # Arrange: 폴백 쪽의 쪽 단위 마스킹이 주민번호를 놓친다. 합성본은 문서 단위 잔류 검사를
-    # 받지 않았으므로 한 번 더 검사해, 걸리면 VLM 합성을 버리고 surya 단독 결과(검사 통과본)를 쓴다.
+    # 받지 않았으므로 한 번 더 검사해, 걸리면 VLM 합성을 버리고 OCR 엔진 단독 결과(검사 통과본)를
+    # 쓴다.
     pool = FakePool(existing=None)
     rrn_page = "수익자 주민번호 901010-1234567"
     processor = FakeProcessor(_multi_page_result(_ADOPTED_PAGE, rrn_page))
@@ -904,7 +905,7 @@ async def test_page_failure_waits_for_sibling_cleanup_before_failing_job() -> No
 
 # ── 저신뢰도 VLM 트리거 ──────────────────────────────────────────
 async def test_vlm_called_for_non_table_doc_type_when_confidence_low() -> None:
-    # Arrange: 진단서(표 문서 아님)지만 surya 신뢰도가 낮으면(<0.90) 문서 유형과
+    # Arrange: 진단서(표 문서 아님)지만 OCR 엔진 신뢰도가 낮으면(<0.90) 문서 유형과
     # 무관하게 VLM 보완을 시도한다.
     pool = FakePool(existing=None)
     producer = FakeProducer()
@@ -936,8 +937,8 @@ async def test_vlm_not_called_for_non_table_doc_type_when_confidence_high() -> N
 
 # ── VLM 환각 완화(groundedness) ──────────────────────────────────
 async def test_vlm_ungrounded_result_discarded_and_falls_back_to_surya() -> None:
-    # Arrange: 표 문서지만 VLM이 surya 원문과 무관한 내용을 지어낸 상황(환각) —
-    # groundedness 체크로 폐기되고 surya 기반 값이 그대로 유지돼야 한다.
+    # Arrange: 표 문서지만 VLM이 OCR 엔진 원문과 무관한 내용을 지어낸 상황(환각) —
+    # groundedness 체크로 폐기되고 OCR 엔진 기반 값이 그대로 유지돼야 한다.
     pool = FakePool(existing=None)
     producer = FakeProducer()
     processor = FakeProcessor(_result(*_PAYOUT_TEXTS))
@@ -952,14 +953,14 @@ async def test_vlm_ungrounded_result_discarded_and_falls_back_to_surya() -> None
     insert_args = pool.insert_calls()[0][1]
     masked_text = insert_args[4]
     entities = json.loads(insert_args[6])
-    assert "지급결정" in masked_text  # surya 원문 유지(VLM 결과 폐기)
+    assert "지급결정" in masked_text  # OCR 엔진 원문 유지(VLM 결과 폐기)
     assert "table_markdown" not in entities
 
 
 async def test_vlm_empty_result_treated_as_ungrounded_not_adopted() -> None:
     # Arrange — 코드리뷰 지적: 빈 VLM 응답(토큰 없음)을 grounded로 처리하면 이 페이지가
-    # "채택"으로 표시되고 검증된 surya 텍스트가 빈 문자열로 덮어써진다(실유실). 빈 결과도
-    # 실패로 취급해 surya 폴백이 유지돼야 한다.
+    # "채택"으로 표시되고 검증된 OCR 엔진 텍스트가 빈 문자열로 덮어써진다(실유실). 빈 결과도
+    # 실패로 취급해 OCR 엔진 폴백이 유지돼야 한다.
     pool = FakePool(existing=None)
     producer = FakeProducer()
     processor = FakeProcessor(_result(*_PAYOUT_TEXTS))
@@ -974,14 +975,14 @@ async def test_vlm_empty_result_treated_as_ungrounded_not_adopted() -> None:
     insert_args = pool.insert_calls()[0][1]
     masked_text = insert_args[4]
     entities = json.loads(insert_args[6])
-    assert "지급결정" in masked_text  # surya 원문 유지(빈 VLM 결과 폐기)
+    assert "지급결정" in masked_text  # OCR 엔진 원문 유지(빈 VLM 결과 폐기)
     assert "table_markdown" not in entities
 
 
 # ── "재확인 필요"(ocr_quality) 판정 ──────────────────────────────
 async def test_ocr_quality_needs_reupload_when_low_confidence_no_name_no_domain_info() -> None:
     # Arrange: 신뢰도 낮음 + 이름·도메인 정보(보험사·상품명) 전무. 저신뢰도는 VLM도
-    # 트리거하므로(문서 유형 무관) 네트워크 호출 없이 실패로 페이크해 surya 기반
+    # 트리거하므로(문서 유형 무관) 네트워크 호출 없이 실패로 페이크해 OCR 엔진 기반
     # quality_source_text가 유지되게 한다.
     pool = FakePool(existing=None)
     producer = FakeProducer()
@@ -1578,7 +1579,7 @@ class _BlankReocrEngine:
 
 
 def _misread_name_result(confidence: float) -> OcrResult:
-    """라벨(위)과 surya가 "828"로 오독한 이름(아래)이 다른 라인인 1페이지 결과."""
+    """라벨(위)과 OCR 엔진이 "828"로 오독한 이름(아래)이 다른 라인인 1페이지 결과."""
 
     def line(text: str, bbox: tuple[float, float, float, float]) -> OcrLine:
         x0, y0, x1, y1 = bbox
@@ -1599,7 +1600,7 @@ def _misread_name_result(confidence: float) -> OcrResult:
 
 
 def _default_masker_pipeline(
-    processor: FakeProcessor, s3: _RecordingS3, coverage: Any
+    processor: FakeProcessor, s3: _RecordingS3, coverage: Any, settings: Settings | None = None
 ) -> OcrPipeline:
     """이미지 마스커를 주입하지 **않은** 파이프라인(기본 구성 배선 확인용)."""
     return OcrPipeline(
@@ -1607,18 +1608,19 @@ def _default_masker_pipeline(
         producer=FakeProducer(),  # type: ignore[arg-type]
         processor=processor,  # type: ignore[arg-type]
         masker=Masker(use_ner=False),
-        # 저신뢰도는 쪽 전사도 트리거한다 — 네트워크 없이 실패시켜 surya 폴백으로 둔다.
+        # 저신뢰도는 쪽 전사도 트리거한다 — 네트워크 없이 실패시켜 OCR 엔진 결과로 폴백시킨다.
         vlm_transcribe=_RecordingVlm(error=VlmClientError("연결 실패")),
         coverage=coverage,
         upload=s3.upload,
         delete=s3.delete,
+        settings=settings,
     )
 
 
 async def test_default_image_masker_rereads_low_confidence_lines_and_verifies_them(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Arrange: surya가 이름을 "828"로 오독해 텍스트 검출로는 가릴 게 없는 저신뢰도 문서. 기본
+    # Arrange: OCR 엔진이 이름을 "828"로 오독해 텍스트 검출로는 가릴 게 없는 저신뢰도 문서. 기본
     # 구성이 vlm_client.reread_lines를 부르고, 재판독으로 찾은 라인을 **실제로** 검게 칠한 뒤 5.1
     # 커버리지가 그 라인을 재야 한다(라인 인덱스로 합친 이유). 측정은 실제 numpy 측정을 감싼다.
     reread_calls: list[int] = []
@@ -1679,6 +1681,62 @@ async def test_default_image_masker_skips_reread_for_high_confidence_document(
     # Assert: 재판독 없음 → 가릴 라인 없음 → 검증할 페이지도 없다.
     assert reread_calls == []
     assert measured == []
+
+
+# ── 저신뢰도 임계값은 설정이다(PoC 손잡이) ─────────────────────────
+# 0.90은 surya 시절 분포로 정한 값이라 PP-OCRv5에선 env(OCR_LOW_CONFIDENCE_THRESHOLD)로 다시 맞춘다.
+# 세 판정(VLM 쪽 전사·needs_reupload·라인 재판독)이 모두 같은 설정을 따라야 한다.
+async def test_vlm_gate_and_quality_follow_configured_threshold() -> None:
+    # Arrange: 평균 신뢰도 0.5인 진단서(표 문서 아님). 기본 0.90이면 저신뢰도라 VLM이 불리고
+    # (이름·도메인 정보가 없어) needs_reupload가 된다 — 임계값을 0.4로 내리면 둘 다 꺼져야 한다.
+    pool = FakePool(existing=None)
+    producer = FakeProducer()
+    processor = FakeProcessor(_result("진단서", "상병명 골절", confidence=0.5))
+    vlm = _RecordingVlm(text="진단서 상병명 골절")
+    pipeline = _pipeline(
+        pool,
+        producer,
+        processor,
+        vlm_transcribe=vlm,
+        settings=Settings(_env_file=None, ocr_low_confidence_threshold=0.4),
+    )
+
+    # Act
+    await pipeline.handle(_job())
+
+    # Assert
+    assert vlm.called is False
+    assert pool.insert_calls()[0][1][8] == "ok"
+    assert producer.published[0][1].ocr_quality == "ok"
+
+
+async def test_default_image_masker_reread_gate_follows_configured_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Arrange: 평균 신뢰도 0.95(기본 0.90이면 고신뢰라 재판독 안 함). 임계값을 0.99로 올리면 이
+    # 문서도 저신뢰도라 기본 이미지 마스커가 라인 재판독을 불러야 한다.
+    reread_calls: list[int] = []
+
+    async def fake_reread(images: Any, pages: Any) -> list[list[str | None]]:
+        reread_calls.append(len(pages))
+        return [[None, None]]
+
+    monkeypatch.setattr(pipeline_module, "reread_lines", fake_reread)
+    s3 = _RecordingS3()
+    processor = _PilProcessor(_misread_name_result(confidence=0.95), engine=_BlankReocrEngine())
+    pipeline = _default_masker_pipeline(
+        processor,
+        s3,
+        _RecordingCoverage(ratio=1.0),
+        settings=Settings(_env_file=None, ocr_low_confidence_threshold=0.99),
+    )
+
+    # Act
+    await pipeline.handle(_job())
+    await pipeline.wait_for_pending_deletes()
+
+    # Assert
+    assert reread_calls == [1]
 
 
 # ── 원본 삭제 outbox(재시도) ─────────────────────────────────────

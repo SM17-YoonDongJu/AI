@@ -31,8 +31,8 @@ Spring Boot gateway  — 별도 레포: 업로드 · JWT · S3 PutObject
    │
    │  SQS ocr-job-queue  — 문서 1건 = 1메시지
    ▼
-ocr_worker (02, GPU)
-   │  S3 원본 → surya-ocr (+VLM 표 보조) → 분류·추출
+ocr_worker (02, CPU)
+   │  S3 원본 → PaddleOCR (+VLM 표 보조) → 분류·추출
    │  → PII 마스킹 (텍스트+이미지) → ai.ocr_results
    │  → 청구 fan-in 판정 → 청구당 1건 발행
    │
@@ -68,7 +68,7 @@ Ollama / vLLM  — 외부 GPU 노드: LLM · 임베딩 · VLM
 | [`src/core`](src/core) | 설정·**계약**(`contracts.py`)·SQS 래퍼·asyncpg 풀·`ai_client`·암호화·로깅 | 라이브러리 | [README](src/core/README.md) |
 | [`src/rag`](src/rag) | Hybrid RAG: 쿼리 라우터 → trigram 오타보정 → tsvector + pgvector → RRF → 인용 역추적 | 라이브러리 | [README](src/rag/README.md) |
 | [`src/guardrail`](src/guardrail) | 입력(PII·도메인 차단) / 생성(단정 표현 치환·인용 강제) / 출력(고지문·LLM Judge) | 라이브러리 | [README](src/guardrail/README.md) |
-| [`src/ocr_worker`](src/ocr_worker) | `ocr-job-queue` 소비 → OCR·마스킹·저장 → 청구 fan-in → `report-job` 발행 | `python -m ocr_worker` (GPU) | [README](src/ocr_worker/README.md) |
+| [`src/ocr_worker`](src/ocr_worker) | `ocr-job-queue` 소비 → OCR·마스킹·저장 → 청구 fan-in → `report-job` 발행 | `python -m ocr_worker` (CPU) | [README](src/ocr_worker/README.md) |
 | [`src/report_worker`](src/report_worker) | `report-job` 소비 → LangGraph 멀티에이전트 리포트 생성 | `python -m report_worker` | [README](src/report_worker/README.md) |
 | [`src/corpus_worker`](src/corpus_worker) | Notion 약관 카탈로그 → PG 미러 동기화 + 원문 S3 스테이징 (상시 데몬) | `python -m corpus_worker` | [README](src/corpus_worker/README.md) |
 
@@ -94,13 +94,13 @@ load_context → input_guardrail ─┬─▶ persist_blocked                   
 
 ## 퀵스타트
 
-**요구사항:** Python 3.12, [uv](https://docs.astral.sh/uv/), Docker. OCR 워커는 Linux와 CUDA GPU가 필요하다(surya-ocr / PyTorch).
+**요구사항:** Python 3.12, [uv](https://docs.astral.sh/uv/), Docker. OCR 워커는 GPU가 필요 없다(PaddleOCR·NER 모두 CPU). 다만 paddlepaddle CPU 휠이 linux x86_64뿐이라 OCR 이미지는 Apple Silicon에서 `--platform linux/amd64`로 빌드한다.
 
 ```bash
 # 1) 의존성 — base + dev, 필요한 워커 extra만 추가
 uv sync                          # base + dev
 uv sync --extra report           # 리포트 워커
-uv sync --extra ocr              # OCR 워커 (GPU 노드)
+uv sync --extra ocr --extra ner  # OCR 워커 (CPU: PaddleOCR + NER)
 
 # 2) 로컬 백킹 서비스 — LocalStack(SQS, 큐 자동 생성) · PostgreSQL+pgvector
 docker compose up -d
@@ -179,7 +179,7 @@ uv run mypy src                                        # 타입 (strict)
 uv run pytest                                          # 단위 테스트
 ```
 
-- 무거운 의존성(surya, pymupdf, torch)은 **lazy import**로 분리해 두어서, GPU가 없어도 OCR 오케스트레이션을 테스트할 수 있다.
+- 무거운 의존성(paddleocr·paddle, pymupdf, torch)은 **lazy import**로 분리해 두어서, 모델 없이도 OCR 오케스트레이션과 엔진 어댑터를 테스트할 수 있다.
 - e2e 테스트(`tests/e2e`)는 LocalStack에 자체 유니크 큐를 만들어 실행한다.
 - 코드 컨벤션: **[.claude/CODE_CONVENTIONS.md](.claude/CODE_CONVENTIONS.md)**
 
@@ -190,7 +190,7 @@ uv run pytest                                          # 단위 테스트
 | 서비스 | Dockerfile | 배포 경로 |
 |---|---|---|
 | `report` | `src/report_worker/Dockerfile` (slim) | K8s-manifests의 `image.tag`를 커밋하면 **Argo CD**가 롤링 업데이트 |
-| `ocr` | `src/ocr_worker/Dockerfile` (CUDA) | GPU EC2에 **SSM**으로 호스트 compose 재시작 |
+| `ocr` | `src/ocr_worker/Dockerfile` (CPU, 모델 포함) | OCR EC2(GPU 불필요)에 **SSM**으로 호스트 compose 재시작 |
 | `corpus` | `src/corpus_worker/Dockerfile` | ETL EC2에 **SSM**으로 호스트 compose 재시작 |
 
 공용 코드(`core`, `pyproject.toml`, `uv.lock`)가 바뀌면 전 서비스를 다시 빌드한다. `migrations/ai/**`가 바뀌면 ocr을, `migrations/corpus/**`가 바뀌면 corpus를 다시 배포한다.

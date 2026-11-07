@@ -37,6 +37,7 @@ DLQ는 쓰지 않는다. 핸들러는 반드시 **멱등**해야 한다(at-least
 | `LLM_EFFORT`, `LLM_MAX_TOKENS`, `LLM_TIMEOUT_SECONDS` | anthropic 전용(effort·출력 상한·SDK 타임아웃) |
 | `EMBEDDING_PROVIDER`, `EMBEDDING_BASE_URL`, `EMBEDDING_API_KEY`, `EMBEDDING_MODEL`, `EMBEDDING_DIM` | 임베딩 provider(`openai_compat`·`voyage`)·엔드포인트·키·모델·차원(기본 1024d). 바꾸면 코퍼스 전체 재임베딩(`python -m rag.reembed`) |
 | `VLM_BASE_URL`, `VLM_MODEL` (+ `VLM_*` 튜닝: 토큰 상한·타임아웃·동시도·단계 예산) | OCR 보조 VLM — 클러스터 vLLM의 PaddleOCR-VL(OpenAI 호환). 쪽 전사·라인 재판독 |
+| `OCR_DET_MODEL`, `OCR_REC_MODEL`, `OCR_TEXTLINE_ORIENTATION`, `OCR_CPU_THREADS`, `OCR_ENABLE_MKLDNN`, `OCR_LOW_CONFIDENCE_THRESHOLD` | OCR 엔진(PaddleOCR PP-OCRv5, CPU) 모델·스레드와 저신뢰도 임계값(PoC 재보정 대상) |
 | `PII_ENC_KEY` / `PII_KMS_KEY_ARN` | PII 복호화 키(local·dev는 env, 그 외 KMS) |
 | `SERVICE_NAME`, `ENV`, `LOG_LEVEL` | 로깅 메타 |
 

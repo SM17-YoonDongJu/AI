@@ -1,7 +1,7 @@
 """OCR 워커 end-to-end 통합 테스트 (이슈 #20).
 
 실 SQS(LocalStack)·PostgreSQL 위에서 워커의 전체 소비 경로를 구동한다 — ``SqsConsumer`` →
-``OcrPipeline.handle`` → ``ocr_results`` 업서트 → ``ReportJob`` 발행. GPU(surya OCR)와 S3만
+``OcrPipeline.handle`` → ``ocr_results`` 업서트 → ``ReportJob`` 발행. OCR 엔진과 S3만
 페이크로 주입하고(그 경계는 이미 단위 테스트가 덮는다), 나머지 인프라 경계(컨슈머 검증·
 ack(DeleteMessage)·poison 스킵·프로듀서·마이그레이션·업서트 멱등)는 전부 진짜다.
 

@@ -17,7 +17,7 @@ description: 보험·법률 AI 엔진 Python 프로젝트의 토대를 세울 �
 - `src/` 레이아웃(워커중심): `src/core`, `src/rag`, `src/guardrail`, `src/ocr_worker`, `src/report_worker`, `tests/`. 워커 진입점은 각 패키지의 `__main__.py`.
 - 의존성 **그룹 분리** — 워커별 슬림 배포를 위해:
   - 기본: pydantic, pydantic-settings, asyncpg, httpx(ai_client), structlog
-  - `ocr`(optional): surya-ocr, transformers, pillow, boto3(S3·SQS)
+  - `ocr`(optional): paddleocr·paddlepaddle(CPU), NER용 CPU torch·transformers, pymupdf, pillow, boto3(S3·SQS)
   - `report`(optional): langgraph, langchain-core, boto3(SQS)
   - `dev`: ruff, pytest, pytest-asyncio
 - `ruff.toml`: line-length 100, target py312, isort 활성.

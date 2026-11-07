@@ -158,17 +158,14 @@ _REQUIRED_DOC_TYPES: frozenset[DocType] = frozenset({DocType.POLICY, DocType.DIA
 # 비식별 이미지 사본 키 공간 — 원본 키와 분리(원본은 별도 보존정책).
 _MASKED_IMAGE_CONTENT_TYPE = "image/png"
 
-# 하이브리드 VLM 보조 대상 — surya 라인 순서가 표 행/열 구조를 보존 못하는 다중
-# 항목 표 문서 유형만. 단순 라벨-값 문서(진단서·증권)는 surya만으로 충분해 제외한다.
+# 하이브리드 VLM 보조 대상 — OCR 엔진의 라인 순서가 표 행/열 구조를 보존 못하는 다중
+# 항목 표 문서 유형만. 단순 라벨-값 문서(진단서·증권)는 OCR 엔진만으로 충분해 제외한다.
+# (표 문서 목록은 surya 시절 관찰로 정했다 — PP-OCRv5에서도 같은지는 PoC 확인 대상.)
 _TABLE_DOC_TYPES: frozenset[DocType] = frozenset(
     {DocType.PAYOUT_NOTICE, DocType.CLAIM, DocType.HOSPITALIZATION_CERT, DocType.MEDICAL_RECEIPT}
 )
 
-# 표 문서와 별개로, surya 신뢰도가 낮으면(실측: 클린 PDF 0.951+ vs 실제 폰카 사진
-# 0.861-) 문서 유형 무관하게 VLM 보완을 시도한다. 표본 3건 기준 시작값 — 운영 중 재조정.
-_LOW_CONFIDENCE_THRESHOLD: float = 0.90
-
-# VLM 결과 groundedness(환각 여부 대략 검사)용 토큰 추출·임계값. surya가 오타를 내도
+# VLM 결과 groundedness(환각 여부 대략 검사)용 토큰 추출·임계값. OCR 엔진이 오타를 내도
 # 대부분의 토큰(날짜·숫자·구조어)은 겹치므로 낮게 잡아 정상 교정까지 걸리지 않게 한다.
 _TOKEN_RE = re.compile(r"[가-힣A-Za-z0-9]{2,}")
 _MIN_GROUNDED_OVERLAP = 0.3
@@ -180,7 +177,7 @@ _TABLE_PAGE_SEPARATOR = "\n\n---\n\n"
 
 
 def _looks_grounded(vlm_text: str, source_text: str) -> bool:
-    """VLM 결과가 surya 원문과 무관한 내용을 지어낸 게 아닌지 대략적으로 검사한다.
+    """VLM 결과가 OCR 엔진 원문과 무관한 내용을 지어낸 게 아닌지 대략적으로 검사한다.
 
     ``assert_no_residual``은 PII 유출만 잡고 환각(이미지에 없는 내용 생성)은 못 잡으므로
     별도 안전장치로 둔다. 완벽한 검증은 아니다 — 토큰 중복률 기반 근사치.
@@ -188,8 +185,8 @@ def _looks_grounded(vlm_text: str, source_text: str) -> bool:
     vlm_tokens = set(_TOKEN_RE.findall(vlm_text))
     if not vlm_tokens:
         # 빈 VLM 결과를 grounded로 처리하면 _extract_pages가 이 페이지를 "채택"으로
-        # 표시하고, 검증된 surya 텍스트를 빈 문자열로 덮어써버린다(실제 유실).
-        # 빈 결과는 실패로 취급해 surya 폴백을 타게 한다.
+        # 표시하고, 검증된 OCR 엔진 텍스트를 빈 문자열로 덮어써버린다(실제 유실).
+        # 빈 결과는 실패로 취급해 OCR 엔진 결과로 폴백하게 한다.
         return False
     source_tokens = set(_TOKEN_RE.findall(source_text))
     overlap = len(vlm_tokens & source_tokens) / len(vlm_tokens)
@@ -410,7 +407,7 @@ class OcrPipeline:
         self._image_masker = image_masker or ImageMasker(
             detect=self._masker.detect,
             reread=reread_lines,
-            reread_confidence_threshold=_LOW_CONFIDENCE_THRESHOLD,
+            reread_confidence_threshold=self._settings.ocr_low_confidence_threshold,
         )
         self._vlm_transcribe: VlmTranscribe = vlm_transcribe or transcribe_table
         self._coverage: CoverageFn | None = coverage
@@ -634,41 +631,42 @@ class OcrPipeline:
         result, images = await self._processor.process_with_images(job.s3_key, job.content_type)
 
         # 분류·추출·텍스트 마스킹은 CPU 바운드(정규식·NER) → 한 스레드 호출로 격리한다.
-        # surya 기반 masked_text는 자체 게이트(assert_no_residual)를 통과한 안전한
+        # OCR 엔진 기반 masked_text는 자체 게이트(assert_no_residual)를 통과한 안전한
         # 값이라, 아래 VLM 경로가 실패해도 항상 되돌아갈 수 있는 폴백으로 유지한다.
         analysis = await asyncio.to_thread(self._analyze, result, job.doc_type_hint)
 
-        # 표 문서 유형(다중 항목) 또는 surya 신뢰도가 낮으면(문서 유형 무관) VLM으로
+        # 표 문서 유형(다중 항목) 또는 OCR 신뢰도가 낮으면(문서 유형 무관) VLM으로
         # 보완한다. 페이지마다 독립적으로 채택 여부가 갈린다 — 한 페이지가 실패해도
-        # 그 페이지만 surya 결과로 폴백하고 나머지 페이지는 영향받지 않는다(과거엔
+        # 그 페이지만 OCR 엔진 결과로 폴백하고 나머지 페이지는 영향받지 않는다(과거엔
         # 1페이지 VLM 성공만으로 문서 전체 masked_text가 교체돼 2페이지 이후가 통째로
-        # 유실됐었다). masked_lines(DB 텍스트)는 항상 surya 기반 그대로 둔다 — 좌표가
-        # surya 라인에 묶여 있어 VLM 채택 여부와 무관하다. 이미지 검은블록(_image_pipeline)
-        # 은 별도로 VLM 라인 재판독을 호출해 surya가 오독한 PII 라인까지 보강한다
+        # 유실됐었다). masked_lines(DB 텍스트)는 항상 OCR 엔진 기반 그대로 둔다 — 좌표가
+        # OCR 엔진 라인에 묶여 있어 VLM 채택 여부와 무관하다. 이미지 검은블록(_image_pipeline)
+        # 은 별도로 VLM 라인 재판독을 호출해 OCR 엔진이 오독한 PII 라인까지 보강한다
         # (§ImageMasker.reread_pages, 저신뢰도일 때만 — needs_vlm과 동일 임계값 재사용).
         masked_text = analysis.masked_text
         entities = analysis.entities
-        quality_source_text = result.full_text  # 최종 품질 판정 기준 원문(기본 surya)
+        quality_source_text = result.full_text  # 최종 품질 판정 기준 원문(기본 OCR 엔진)
 
-        needs_vlm = (
-            analysis.doc_type in _TABLE_DOC_TYPES
-            or result.mean_confidence < _LOW_CONFIDENCE_THRESHOLD
-        )
+        # 표 문서와 별개로, OCR 신뢰도가 낮으면 문서 유형 무관하게 VLM 보완을 시도한다. 임계값은
+        # 설정(ocr_low_confidence_threshold)이다 — surya 시절 실측(클린 PDF 0.951+ vs 폰카 사진
+        # 0.861-, 표본 3건)으로 정한 0.90을 PP-OCRv5 신뢰도 분포에 맞춰 PoC로 재보정한다.
+        low_confidence = result.mean_confidence < self._settings.ocr_low_confidence_threshold
+        needs_vlm = analysis.doc_type in _TABLE_DOC_TYPES or low_confidence
         if needs_vlm and images:
             vlm_outcome = await self._extract_pages(images, result)
             if vlm_outcome is not None:
                 masked_text, quality_source_text, table_markdown = vlm_outcome
-                # extract()는 surya 원문에만 돌았던 상태라, surya가 못 뽑았거나(None)
+                # extract()는 OCR 엔진 원문에만 돌았던 상태라, 엔진이 못 뽑았거나(None)
                 # 잘못 뽑은 필드도 VLM이 더 깨끗하게 읽었으면 실제 값과 다를 수 있다.
                 # VLM 채택 원문에 extract()를 한 번 더 돌려, 있으면 VLM 쪽 값을
-                # 우선한다 — VLM은 이미 groundedness 검증을 통과했고 애초에 surya
+                # 우선한다 — VLM은 이미 groundedness 검증을 통과했고 애초에 OCR
                 # 신뢰도가 낮거나 표 문서라서 호출된 것이므로, 둘 다 값이 있으면
-                # VLM 쪽을 더 신뢰할 근거가 있다(실측: surya가 금액을 숫자로 오독해
-                # 엉뚱한 값을 잘못 채운 사례 확인). surya만 값이 있으면 그대로 둔다.
+                # VLM 쪽을 더 신뢰할 근거가 있다(surya 시절 실측: 엔진이 금액을 숫자로 오독해
+                # 엉뚱한 값을 잘못 채운 사례 확인). 엔진만 값이 있으면 그대로 둔다.
                 # 재평가 필요(동작은 그대로 둔다): 이 우선 규칙의 근거 실측은 Qwen(Ollama) 시절
                 # 쪽 전사다. PaddleOCR-VL은 쪽 전체를 약 1MP로 줄여 받아 작은 숫자(입원일수·
-                # 수술 여부·KCD·금액)를 surya보다 못 읽을 수 있고, 그 값이 surya 값을 덮는다 —
-                # report가 지급액 산정에 쓰는 필드라 실문서로 surya vs VLM 엔티티를 비교해
+                # 수술 여부·KCD·금액)를 OCR 엔진보다 못 읽을 수 있고, 그 값이 엔진 값을 덮는다 —
+                # report가 지급액 산정에 쓰는 필드라 실문서로 OCR 엔진 vs VLM 엔티티를 비교해
                 # 규칙을 다시 정해야 한다(_workspace/17 D7).
                 vlm_entities = extract(analysis.doc_type, quality_source_text)
                 entities = {
@@ -677,14 +675,14 @@ class OcrPipeline:
                 }
                 entities["table_markdown"] = table_markdown
 
-        # "재확인 필요" 판정: surya 신뢰도가 낮은데(문서 자체가 저품질) 사람 이름조차
+        # "재확인 필요" 판정: OCR 신뢰도가 낮은데(문서 자체가 저품질) 사람 이름조차
         # 못 찾았거나 도메인 정보가 하나도 없으면, 자동 처리로는 신뢰할 수 없다고 본다.
         has_name = any(
             span.label is PiiLabel.NAME for span in self._masker.detect(quality_source_text)
         )
         ocr_quality = (
             "needs_reupload"
-            if result.mean_confidence < _LOW_CONFIDENCE_THRESHOLD
+            if low_confidence
             and (not has_name or _missing_domain_info(analysis.doc_type, entities))
             else "ok"
         )
@@ -765,11 +763,11 @@ class OcrPipeline:
         쪽끼리 의존이 없어 **동시에** 전사한다 — 순차면 문서 처리 시간이 쪽 수에 비례해 SQS
         가시성(600초, heartbeat 없음)을 넘긴다. 동시도 상한은 ``vlm_client``의 세마포어
         (``vlm_concurrency``)가 걸고, 단계 전체는 ``vlm_page_budget_seconds``에서 끊는다(그때까지
-        못 끝낸 쪽은 다른 실패와 똑같이 surya 폴백). 결과는 완료 순서가 아니라 **페이지 순서**로
-        합친다(``gather``는 인자 순서대로 돌려준다).
+        못 끝낸 쪽은 다른 실패와 똑같이 OCR 엔진 결과로 폴백). 결과는 완료 순서가 아니라
+        **페이지 순서**로 합친다(``gather``는 인자 순서대로 돌려준다).
 
         한 페이지의 VLM 실패(호출 오류·환각·잔류PII·예산 초과)가 다른 페이지까지 막지 않는다.
-        실패한 페이지는 그 페이지의 surya 결과로 폴백해 문서 전체 내용이 유실되지
+        실패한 페이지는 그 페이지의 OCR 엔진 결과로 폴백해 문서 전체 내용이 유실되지
         않게 한다. masked_text/원문은 ``OcrResult.full_text``와 같은 "\\n" 접합을
         써서 VLM 관여 여부와 무관하게 문서 형태가 일관되게 유지된다.
 
@@ -779,12 +777,12 @@ class OcrPipeline:
 
         합성한 masked_text는 쪽별로 마스킹한 조각을 이은 것이라 ``_analyze``의 문서 단위 잔류
         검사를 받지 않았다. 그래서 한 번 더 검사하고, 걸리면 VLM 합성을 통째로 버리고 ``None``을
-        돌려준다(호출측이 잔류 검사를 이미 통과한 surya 단독 결과를 쓴다 — 작업 실패가 아니다).
+        돌려준다(호출측이 잔류 검사를 이미 통과한 OCR 엔진 단독 결과를 쓴다 — 작업 실패가 아니다).
 
         Returns:
             어느 페이지든 VLM이 채택됐으면 ``(합성 masked_text, 합성 원문,
             table_markdown)``. 전 페이지가 실패했거나 합성본이 잔류 검사에 걸리면
-            ``None``(호출측이 순수 surya 결과를 그대로 쓰게 한다).
+            ``None``(호출측이 순수 OCR 엔진 결과를 그대로 쓰게 한다).
         """
         deadline = asyncio.get_running_loop().time() + self._settings.vlm_page_budget_seconds
         tasks = [
@@ -833,7 +831,7 @@ class OcrPipeline:
     ) -> tuple[str, str] | None:
         """``_extract_table``을 쪽 전사 단계 마감(``deadline``, 루프 시각)까지만 기다린다.
 
-        마감이 지나면 진행 중인 VLM 요청을 취소하고 ``None``(surya 폴백)을 돌려준다 — 이미
+        마감이 지나면 진행 중인 VLM 요청을 취소하고 ``None``(OCR 엔진 폴백)을 돌려준다 — 이미
         끝난 다른 쪽의 결과는 그대로 쓴다(단계 전체를 취소하면 그것까지 잃는다).
         """
         try:
@@ -852,7 +850,7 @@ class OcrPipeline:
     ) -> tuple[str, str] | None:
         """VLM으로 표를 전사하고 검증·마스킹한다.
 
-        실패(호출 오류·퇴행 출력·환각·잔류PII)하면 ``None``을 반환해 surya 결과로 폴백한다.
+        실패(호출 오류·퇴행 출력·환각·잔류PII)하면 ``None``을 반환해 OCR 엔진 결과로 폴백한다.
         쪽들이 동시에 돌아 로그가 섞이므로 경고마다 ``page``를 붙인다(텍스트는 남기지 않는다).
 
         Returns:
@@ -875,7 +873,7 @@ class OcrPipeline:
         return raw, masked
 
     def _mask_table(self, raw: str) -> str | None:
-        """VLM 원문을 마스킹한다. 잔류 고민감 PII가 있으면 ``None``(surya 결과로 폴백)."""
+        """VLM 원문을 마스킹한다. 잔류 고민감 PII가 있으면 ``None``(OCR 엔진 결과로 폴백)."""
         masked = self._masker.mask(raw)
         try:
             assert_no_residual(masked)
@@ -924,7 +922,7 @@ class OcrPipeline:
             self._image_masker.redact_pages, images, result, reread_texts
         )
         if reread_texts is not None:
-            # 재판독이 surya 판정에 실제로 보탠 PII 라인 수(관측용 — 텍스트는 남기지 않는다).
+            # 재판독이 OCR 엔진 판정에 실제로 보탠 PII 라인 수(관측용 — 텍스트는 남기지 않는다).
             # 재판독 자체의 성공·실패 분포는 vlm_client가 "vlm_line_reread"로 따로 남긴다.
             logger.info(
                 "vlm_reread_pii_lines_added",

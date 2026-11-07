@@ -1,28 +1,30 @@
-"""S3 원본 → surya-ocr 텍스트/좌표 추출 (이슈 #16).
+"""S3 원본 → OCR 엔진(PaddleOCR PP-OCRv5) 텍스트/좌표 추출 (이슈 #16).
 
-파이프라인: S3 GetObject(원본) → PDF/이미지를 페이지 이미지로 렌더 → **surya-ocr**
-(전용 OCR 엔진, PyTorch, GPU)로 페이지별 라인을 추출한다. 출력은 이어붙인 한 덩어리가
-아니라 **라인 단위 ``OcrLine``(text·bbox·polygon·confidence)** 구조로 보존한다 —
-분류·추출(#17)은 텍스트를, 마스킹(#18)은 텍스트 치환과 **이미지 마스킹 좌표**를
-같은 구조에서 가져간다(검출 1회, 2트랙).
+파이프라인: S3 GetObject(원본) → PDF/이미지를 페이지 이미지로 렌더 → **OCR 엔진**
+(PaddleOCR PP-OCRv5 검출 + 한국어 인식, CPU in-process)으로 페이지별 라인을 추출한다. 출력은
+이어붙인 한 덩어리가 아니라 **라인 단위 ``OcrLine``(text·bbox·polygon·confidence)** 구조로
+보존한다 — 분류·추출(#17)은 텍스트를, 마스킹(#18)은 텍스트 치환과 **이미지 마스킹 좌표**를
+같은 구조에서 가져간다(검출 1회, 2트랙). 엔진 경계는 ``OcrEngine`` Protocol 하나다.
 
 설계 메모:
-- **무거운 의존은 격리**: surya·pymupdf·PIL은 배포(ocr extra)에만 설치되므로 전부
+- **무거운 의존은 격리**: paddleocr·paddle·pymupdf·PIL은 배포(ocr extra)에만 설치되므로 전부
   lazy import한다. 엔진·다운로드·렌더를 주입 가능한 경계로 두어 순수 오케스트레이션을
-  GPU 없이 테스트한다(``OcrProcessor`` 생성자 인자).
-- **블로킹 격리**(CODE_CONVENTIONS §7): 렌더·OCR 추론은 동기·CPU/GPU 바운드이므로
+  모델 없이 테스트한다(``OcrProcessor`` 생성자 인자, ``PaddleOcrEngine``의 ``factory``).
+- **블로킹 격리**(CODE_CONVENTIONS §7): 렌더·OCR 추론은 동기·CPU 바운드이므로
   ``asyncio.to_thread``로 워커 이벤트 루프를 막지 않는다.
-- **서빙 버전**: surya 0.17.x의 in-process API(``FoundationPredictor`` 주입)를 쓴다.
-  0.18+는 별도 추론 서버가 필요하므로 in-process 세대로 고정한다(pyproject 핀).
+- **엔진 이력**: 2026-11 이전엔 surya-ocr(PyTorch, GPU)였다. 신뢰도 임계값(0.90) 같은 실측
+  수치는 surya 시절 것이라 PP-OCRv5에선 PoC로 다시 맞춘다(``ocr_low_confidence_threshold``).
 """
 
 import asyncio
 import io
 import math
+import threading
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
+from core.config import Settings, get_settings
 from core.exceptions import OcrError, UnreadableFileError
 from core.logging import get_logger
 from ocr_worker.storage import get_object
@@ -97,54 +99,179 @@ class OcrResult:
 class OcrEngine(Protocol):
     """OCR 엔진 경계 — 페이지 이미지 목록 → 페이지별 라인 목록.
 
-    구현체는 surya를 in-process 로드한다. 테스트는 페이크로 대체한다.
+    구현체는 ``PaddleOcrEngine``(PaddleOCR in-process)이다. 테스트는 페이크로 대체한다.
     """
 
     def recognize(self, images: list[PageImage]) -> list[list[OcrLine]]: ...
 
 
-class SuryaEngine:
-    """surya-ocr(0.17.x) in-process 엔진. 모델은 첫 호출에서 lazy 로드해 재사용한다."""
+# 쪽 방향 분류·왜곡 보정은 쪽 이미지를 돌리거나 펴서 인식하므로 결과 좌표가 **원본 쪽 이미지와
+# 어긋난다** — 이미지 마스킹 검은블록·5.1 커버리지 검증·VLM 라인 재판독 crop이 모두 원본 좌표를
+# 쓰므로 그 검은블록이 엉뚱한 곳에 그려진다. PaddleOCR 3.x 기본값이 둘 다 True라 여기서 항상
+# 끈다(설정으로 열지 않는다). 줄 방향 분류(``use_textline_orientation``)는 줄 crop만 돌려 인식하고
+# 좌표는 원본 그대로라 설정으로 둔다(실제 모델로 확인: 뒤집힌 줄의 상자도 원본 위치에 나온다).
+_FIXED_PADDLE_OPTIONS: dict[str, object] = {
+    "use_doc_orientation_classify": False,
+    "use_doc_unwarping": False,
+    "device": "cpu",
+}
 
-    def __init__(self) -> None:
-        # surya 예측기(외부 객체) — lazy 로드 전 None. 경계라 Any로 둔다.
-        self._recognition: Any = None
-        self._detection: Any = None
 
-    def _ensure_loaded(self) -> None:
-        """surya 예측기를 lazy 로드한다(torch/surya는 이때 import — GPU 자동 사용)."""
-        if self._recognition is not None:
-            return
-        from surya.detection import DetectionPredictor
-        from surya.foundation import FoundationPredictor
-        from surya.recognition import RecognitionPredictor
+class PaddleOcrEngine:
+    """PaddleOCR(PP-OCRv5) in-process 엔진(CPU). 모델은 첫 호출에서 lazy 로드해 재사용한다.
 
-        self._recognition = RecognitionPredictor(FoundationPredictor())
-        self._detection = DetectionPredictor()
+    결과 매핑(PaddleOCR 3.7 ``predict`` → ``OcrLine``, 실제 모델 출력으로 형식을 확인했다):
 
-    def recognize(self, images: list[PageImage]) -> list[list[OcrLine]]:
-        """페이지 이미지들을 OCR해 페이지별 ``OcrLine`` 목록을 반환한다.
+    - ``rec_texts[i]`` → ``text``(앞뒤 공백 제거). 빈 문자열이 돼도 줄은 유지한다 — surya 때와
+      같은 의미다(검출된 줄은 좌표·신뢰도 근거로 남고, PII가 아니니 가려지지 않을 뿐이다).
+    - ``rec_polys[i]``(int16 (4,2)) → ``polygon``, 그 min/max → ``bbox``. ``rec_boxes``와 같은
+      값이지만(실측 확인) 다각형 하나에서 둘 다 만들어 어긋날 여지를 없앤다.
+    - ``rec_scores[i]`` → ``confidence``(줄 인식 확률). surya 신뢰도와 분포가 다르다 — 임계값은
+      ``ocr_low_confidence_threshold``로 재보정한다.
+
+    **스레드 안전**: 같은 인스턴스를 문서 OCR과 재OCR 검증(5.2)이 함께 쓰고
+    (``OcrProcessor.engine``), 둘 다 ``asyncio.to_thread``에서 부른다. paddle predictor는 동시 호출
+    안전을 보장하지 않으므로
+    로드와 ``predict``를 락 하나로 직렬화한다(``NerDetector``와 같은 방식). 워커는 문서를 1건씩
+    처리하므로 직렬화 비용은 없다.
+    """
+
+    def __init__(
+        self,
+        *,
+        det_model: str,
+        rec_model: str,
+        textline_orientation: bool,
+        cpu_threads: int,
+        enable_mkldnn: bool = True,
+        factory: Callable[..., Any] | None = None,
+    ) -> None:
+        """엔진을 구성한다(모델은 아직 로드하지 않는다).
+
+        Args:
+            det_model: 검출 모델 이름(PaddleX 공식 모델명, 예: ``PP-OCRv5_server_det``).
+            rec_model: 인식 모델 이름(예: ``korean_PP-OCRv5_mobile_rec``).
+            textline_orientation: 줄 방향 분류(뒤집힌 줄 보정) 사용 여부.
+            cpu_threads: paddle 추론 스레드 수.
+            enable_mkldnn: x86 oneDNN 가속 사용 여부(``ocr_enable_mkldnn`` 설정 주석 참고).
+            factory: ``PaddleOCR`` 생성 함수(주입 — 테스트는 가짜 predict 객체를 돌려준다).
+                ``None``이면 ``paddleocr.PaddleOCR``.
+        """
+        self._options: dict[str, object] = {
+            "text_detection_model_name": det_model,
+            "text_recognition_model_name": rec_model,
+            "use_textline_orientation": textline_orientation,
+            "cpu_threads": cpu_threads,
+            "enable_mkldnn": enable_mkldnn,
+            **_FIXED_PADDLE_OPTIONS,
+        }
+        self._factory: Callable[..., Any] = factory or _create_paddle_ocr
+        # PaddleOCR 파이프라인(외부 객체) — lazy 로드 전 None. 경계라 Any로 둔다(§3).
+        self._ocr: Any = None
+        self._lock = threading.Lock()
+
+    @classmethod
+    def from_settings(cls, settings: Settings) -> "PaddleOcrEngine":
+        """설정(``ocr_*``)으로 엔진을 만든다."""
+        return cls(
+            det_model=settings.ocr_det_model,
+            rec_model=settings.ocr_rec_model,
+            textline_orientation=settings.ocr_textline_orientation,
+            cpu_threads=settings.ocr_cpu_threads,
+            enable_mkldnn=settings.ocr_enable_mkldnn,
+        )
+
+    def load(self) -> None:
+        """모델을 지금 로드한다(이미지 빌드 시 모델 프리페치용 — 평소엔 첫 ``recognize``가 한다).
 
         Raises:
-            OcrError: surya 추론 실패.
+            OcrError: 모델 로드 실패(모델 파일 없음 + 내려받을 수 없음 등).
         """
-        self._ensure_loaded()
-        try:
-            predictions = self._recognition(images, det_predictor=self._detection)
-        except Exception as exc:  # 엔진 내부 예외를 도메인 예외로 변환(컨텍스트 체이닝)
-            raise OcrError("surya OCR 추론 실패") from exc
-        return [[_to_ocr_line(line) for line in page.text_lines] for page in predictions]
+        with self._lock:
+            self._ensure_loaded()
+
+    def recognize(self, images: list[PageImage]) -> list[list[OcrLine]]:
+        """페이지 이미지들을 한 쪽씩 OCR해 페이지별 ``OcrLine`` 목록을 반환한다.
+
+        Raises:
+            OcrError: 모델 로드·추론 실패, 또는 결과 형식 이상(메시지엔 개수만 싣는다).
+        """
+        with self._lock:
+            ocr = self._ensure_loaded()
+            return [_recognize_page(ocr, image) for image in images]
+
+    def _ensure_loaded(self) -> Any:
+        """PaddleOCR 파이프라인을 1회 만든다 — 반드시 ``self._lock`` 안에서 부른다."""
+        if self._ocr is None:
+            try:
+                self._ocr = self._factory(**self._options)
+            except Exception as exc:  # 외부 라이브러리 예외를 도메인 예외로 변환(컨텍스트 체이닝)
+                raise OcrError("PaddleOCR 모델 로드 실패") from exc
+        return self._ocr
 
 
-def _to_ocr_line(line: Any) -> OcrLine:
-    """surya ``TextLine`` → 내부 ``OcrLine``(좌표를 불변 튜플로 정규화)."""
-    bbox = tuple(float(value) for value in line.bbox)
-    polygon = tuple((float(point[0]), float(point[1])) for point in line.polygon)
+def _create_paddle_ocr(**options: object) -> Any:
+    """``paddleocr.PaddleOCR``를 만든다(paddleocr·paddle은 이때 lazy import)."""
+    from paddleocr import PaddleOCR
+
+    return PaddleOCR(**options)
+
+
+def _recognize_page(ocr: Any, image: PageImage) -> list[OcrLine]:
+    """한 쪽을 ``predict``하고 라인으로 바꾼다(호출측이 락을 잡고 있다)."""
+    try:
+        results = ocr.predict(_to_bgr_array(image))
+    except Exception as exc:  # 엔진 내부 예외를 도메인 예외로 변환(컨텍스트 체이닝)
+        raise OcrError("PaddleOCR 추론 실패") from exc
+    if len(results) != 1:
+        raise OcrError(f"PaddleOCR 결과 수 이상: 입력 1쪽 → 결과 {len(results)}개")
+    return _page_lines(results[0])
+
+
+def _to_bgr_array(image: PageImage) -> Any:
+    """PIL 이미지 → BGR ``uint8`` 배열.
+
+    PaddleOCR 파이프라인은 ndarray 입력을 **BGR**로 보고 그대로 쓴다(paddlex 3.7
+    ``pipelines/ocr/pipeline.py``의 ``ReadImage(format="BGR")`` — 배열은 변환 없이 통과). 각 모델
+    전처리가 다시 BGR→RGB로 바꾸므로, RGB를 그대로 넘기면 채널이 뒤바뀐 채 추론한다.
+    """
+    import numpy as np
+
+    rgb = np.asarray(image.convert("RGB"))
+    return np.ascontiguousarray(rgb[:, :, ::-1])
+
+
+def _page_lines(result: Any) -> list[OcrLine]:
+    """PaddleOCR 결과 1쪽 → ``OcrLine`` 목록(외부 미지정 데이터 경계)."""
+    try:
+        texts = result["rec_texts"]
+        scores = result["rec_scores"]
+        polys = result["rec_polys"]
+    except (KeyError, TypeError) as exc:
+        raise OcrError("PaddleOCR 결과 형식 이상") from exc
+    if not len(texts) == len(scores) == len(polys):
+        raise OcrError(
+            "PaddleOCR 결과 길이 불일치: "
+            f"texts={len(texts)} scores={len(scores)} polys={len(polys)}"
+        )
+    return [
+        _to_ocr_line(text, score, poly)
+        for text, score, poly in zip(texts, scores, polys, strict=True)
+    ]
+
+
+def _to_ocr_line(text: str | None, score: float, poly: Any) -> OcrLine:
+    """한 줄 → ``OcrLine``(좌표를 불변 float 튜플로, bbox는 다각형의 min/max)."""
+    polygon = tuple((float(point[0]), float(point[1])) for point in poly)
+    if len(polygon) < 3:
+        raise OcrError(f"PaddleOCR 다각형 이상: 꼭짓점 {len(polygon)}개")
+    xs = [x for x, _ in polygon]
+    ys = [y for _, y in polygon]
     return OcrLine(
-        text=(line.text or "").strip(),
-        bbox=bbox,  # type: ignore[arg-type]  # surya bbox는 길이 4 보장
+        text=(text or "").strip(),
+        bbox=(min(xs), min(ys), max(xs), max(ys)),
         polygon=polygon,
-        confidence=float(line.confidence) if line.confidence is not None else 0.0,
+        confidence=float(score),
     )
 
 
@@ -152,7 +279,7 @@ def render_to_images(data: bytes, content_type: str) -> list[PageImage]:
     """원본 바이트를 페이지 이미지(RGB) 목록으로 렌더한다.
 
     PDF는 ``pymupdf``로 페이지별 래스터화하고, 이미지(JPEG/PNG/TIFF)는 단일 페이지로
-    연다. 둘 다 PIL ``Image``로 통일해 surya 입력에 맞춘다(lazy import).
+    연다. 둘 다 PIL ``Image``로 통일해 OCR 엔진 입력에 맞춘다(lazy import).
 
     Args:
         data: 원본 파일 바이트.
@@ -249,11 +376,11 @@ class OcrProcessor:
         """프로세서를 구성한다.
 
         Args:
-            engine: OCR 엔진. 기본은 ``SuryaEngine``(첫 사용 시 모델 lazy 로드).
+            engine: OCR 엔진. 기본은 설정으로 만든 ``PaddleOcrEngine``(첫 사용 시 모델 lazy 로드).
             fetch: S3 다운로드 함수. 기본은 ``storage.get_object``.
             render: 바이트→이미지 렌더 함수. 기본은 ``render_to_images``.
         """
-        self._engine: OcrEngine = engine or SuryaEngine()
+        self._engine: OcrEngine = engine or PaddleOcrEngine.from_settings(get_settings())
         self._fetch = fetch or get_object
         self._render = render or render_to_images
 
@@ -262,7 +389,8 @@ class OcrProcessor:
         """이 프로세서가 쓰는 OCR 엔진.
 
         이미지 마스킹 검증(#18 5.2 재OCR 잔류 검사)이 **같은 엔진 인스턴스**를 재사용해
-        surya 모델을 두 번 로드하지 않게 하려고 노출한다(모델 로드는 수 GB·수십 초).
+        OCR 모델을 두 번 로드하지 않게 하려고 노출한다(모델 로드는 수백 MB·수십 초). 엔진이
+        ``predict``를 락으로 직렬화하므로 공유해도 안전하다.
         """
         return self._engine
 
@@ -341,7 +469,7 @@ _default_processor: OcrProcessor | None = None
 
 
 def get_processor() -> OcrProcessor:
-    """프로세스 1회 생성되는 기본 ``OcrProcessor``를 반환한다(surya 모델 재사용)."""
+    """프로세스 1회 생성되는 기본 ``OcrProcessor``를 반환한다(OCR 모델 재사용)."""
     global _default_processor
     if _default_processor is None:
         _default_processor = OcrProcessor()

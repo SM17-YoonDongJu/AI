@@ -6,7 +6,7 @@ redactor·reread를 주입해 렌더(PIL)·VLM을 배제한 채 오케스트레�
 대신 오프셋·라벨을 직접 만들어 라인 매핑 로직을 고립 검증한다.
 
 VLM 라인 재판독(예전 grounding의 대체)은 두 가지를 고정한다: 신뢰도 게이트(고신뢰 문서는
-호출조차 안 함)와, 재판독 텍스트로 찾은 PII 라인이 **라인 인덱스로** surya 판정에 더해지는지
+호출조차 안 함)와, 재판독 텍스트로 찾은 PII 라인이 **라인 인덱스로** OCR 엔진 판정에 더해지는지
 (5.1 커버리지가 그 라인을 재는 전제). 재판독 실패는 아무것도 보태지 않을 뿐 기존 판정을 깎지 않는다.
 """
 
@@ -80,7 +80,7 @@ def test_no_spans_returns_empty() -> None:
 
 
 def test_reading_order_sorts_by_visual_position_not_detection_order() -> None:
-    # 검출 순서: "value"(라벨 아래, y=10)가 "label"(y=0)보다 먼저 나옴 — surya가 흔히
+    # 검출 순서: "value"(라벨 아래, y=10)가 "label"(y=0)보다 먼저 나옴 — OCR 엔진이 흔히
     # 만드는 뒤섞인 순서. reading_order는 bbox(y0, x0) 기준으로 재정렬해야 한다.
     page = OcrPage(
         index=0,
@@ -216,7 +216,7 @@ def _identity_redactor(image: object, page: OcrPage, indices: set[int]) -> objec
 
 
 def _misread_name_page() -> OcrPage:
-    # 시각적 순서 = 검출 순서: 라벨(위) → 값(아래). surya가 이름을 "828"로 오독한 상황.
+    # 시각적 순서 = 검출 순서: 라벨(위) → 값(아래). OCR 엔진이 이름을 "828"로 오독한 상황.
     return OcrPage(
         0,
         100,
@@ -229,7 +229,7 @@ def _misread_name_page() -> OcrPage:
 
 
 def test_redact_pages_adds_reread_pii_line_that_surya_misread() -> None:
-    # Arrange: surya 텍스트로는 PII가 없지만 재판독 텍스트는 이름을 읽었다.
+    # Arrange: OCR 엔진 텍스트로는 PII가 없지만 재판독 텍스트는 이름을 읽었다.
     result = OcrResult(pages=(_misread_name_page(),))
     calls: list[set[int]] = []
 
@@ -257,16 +257,16 @@ def test_redact_pages_reread_uses_page_context_for_split_label_and_value() -> No
     masker = ImageMasker(detect=Masker(use_ner=False).detect, redactor=_identity_redactor)
 
     # Act
-    surya_only = masker.redact_pages(["img0"], result)
+    engine_only = masker.redact_pages(["img0"], result)
     with_reread = masker.redact_pages(["img0"], result, reread_texts=[[None, "홍길동"]])
 
     # Assert
-    assert surya_only[0].line_indices == set()
+    assert engine_only[0].line_indices == set()
     assert with_reread[0].line_indices == {1}
 
 
 def test_redact_pages_reread_adds_to_surya_lines_instead_of_replacing() -> None:
-    # Arrange: surya가 이미 잡은 라인(0)은 재판독이 그 라인을 달리 읽어도 그대로 가린다(합집합).
+    # Arrange: OCR 엔진이 이미 잡은 라인(0)은 재판독이 그 라인을 달리 읽어도 그대로 가린다(합집합).
     page = OcrPage(
         0,
         100,
@@ -288,7 +288,7 @@ def test_redact_pages_reread_adds_to_surya_lines_instead_of_replacing() -> None:
 
 
 def test_redact_pages_failed_reread_lines_keep_surya_text() -> None:
-    # Arrange: 재판독이 전부 실패(None) — 보탤 근거가 없을 뿐 surya 판정은 그대로다.
+    # Arrange: 재판독이 전부 실패(None) — 보탤 근거가 없을 뿐 OCR 엔진 판정은 그대로다.
     result = OcrResult(pages=(_misread_name_page(),))
     calls: list[set[int]] = []
 
@@ -370,7 +370,7 @@ async def test_reread_pages_skips_when_reread_not_provided() -> None:
 
 
 async def test_reread_pages_skips_high_confidence_document() -> None:
-    # Arrange: 고신뢰 문서는 surya 검출로 충분하다고 본다 — VLM을 아예 부르지 않는다(비용).
+    # Arrange: 고신뢰 문서는 OCR 엔진 검출로 충분하다고 본다 — VLM을 아예 부르지 않는다(비용).
     reread = _RecordingReread([["x"]])
     masker = ImageMasker(detect=lambda _t: [], reread=reread, reread_confidence_threshold=0.90)
 

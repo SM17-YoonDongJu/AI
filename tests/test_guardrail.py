@@ -245,13 +245,15 @@ def test_mask_pii_adds_ner_when_settings_enable_it(monkeypatch: pytest.MonkeyPat
 # report 이미지(`uv sync --no-dev --extra report`)에 없는 패키지를 하위 프로세스에서 import하지
 # 못하게 막고 mask_pii를 부른다. dev venv에는 pillow가 있어 평범한 import로는 회귀를 못 잡는다.
 # ocr_worker.masking의 import 체인(image_masker → ocr → storage 등)에 이 패키지가 최상위
-# import로 들어오면 report 워커가 기동부터 실패한다.
+# import로 들어오면 report 워커가 기동부터 실패한다. OCR 엔진(paddleocr·paddle)도 ocr.py에서
+# lazy import여야 한다.
 _REPORT_IMAGE_SMOKE = """
 import importlib.abc
 import sys
 
 ABSENT_IN_REPORT_IMAGE = {
     "PIL", "torch", "transformers", "surya", "fitz", "cv2", "sentence_transformers",
+    "paddle", "paddleocr", "paddlex",
 }
 
 

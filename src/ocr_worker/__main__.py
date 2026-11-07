@@ -105,7 +105,12 @@ async def _run() -> None:
             settings=settings,
             on_poison=_poison_journal(pool, pipeline),
         )
-        logger.info("ocr worker starting", queue_url=settings.sqs_ocr_job_queue_url)
+        # git_commit: 이미지 빌드 커밋(Dockerfile ARG → ENV). 새 이미지가 실제로 떴는지 확인한다.
+        logger.info(
+            "ocr worker starting",
+            queue_url=settings.sqs_ocr_job_queue_url,
+            git_commit=settings.git_commit,
+        )
         # 소비와 병행해 도는 outbox 스윕. 소비 루프와 독립적이라 gather로 묶지 않고
         # 별도 task로 띄운다 — 스윕이 죽어도 소비는 계속돼야 하고, 반대도 마찬가지다
         # (스윕 정리는 아래 finally가 맡는다).

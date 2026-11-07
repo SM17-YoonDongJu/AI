@@ -69,7 +69,7 @@
 - 경계 계약(SQS 메시지 스키마, WS 메시지)은 반드시 테스트로 고정한다.
 
 ## 13. 보안·개인정보 (도메인 필수)
-- OCR은 로컬에서만 한다(surya-ocr·VLM, 자체 GPU). 외부 OCR API로 원본 문서·이미지를 보내지 않는다. — 노션 02번 설계 근거.
+- OCR은 로컬에서만 한다(PaddleOCR 엔진 in-process, VLM은 자체 호스팅 클러스터 vLLM의 PaddleOCR-VL). 외부 OCR API로 원본 문서·이미지를 보내지 않는다. — 노션 02번 설계 근거.
 - 외부 LLM·임베딩 API(Claude·Voyage)에는 **마스킹된 텍스트만** 보낸다(2026-11-01 개정 — LLM Claude·임베딩 Voyage 전환). Spring DB에서 복호화한 자유입력 필드(`question`·`description`·`additional_information` 등)는 `guardrail.mask_pii`(OCR 입력단과 같은 규칙)를 거친 뒤에만 프롬프트·검색 쿼리에 넣는다. 진단명·KCD처럼 식별자가 아닌 건강정보는 마스킹 대상이 아니라 외부로 전송된다는 점을 전제로 한다.
 - PII는 파이프라인 진입 직후 마스킹하고, 마스킹된 텍스트만 downstream(RAG·LLM)으로 넘긴다.
 - 시크릿은 코드·로그·커밋에 두지 않는다. `pydantic-settings`로 환경변수에서 로드한다.

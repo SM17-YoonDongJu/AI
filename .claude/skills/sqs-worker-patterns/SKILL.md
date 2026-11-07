@@ -26,7 +26,7 @@ Kafka의 오프셋 커밋과 달리 SQS는 **메시지 단위 삭제(DeleteMessa
 
 ## 비동기 규칙
 - boto3는 **동기 SDK**다. `receive_message`/`delete_message`/`send_message` 전부 `asyncio.to_thread`로 이벤트 루프에서 뗀다(CODE_CONVENTIONS §7).
-- 무거운 블로킹 라이브러리(surya-ocr·PyTorch 등)도 동일하게 `asyncio.to_thread`로 격리한다.
+- 무거운 블로킹 라이브러리(PaddleOCR·NER(PyTorch) 등)도 동일하게 `asyncio.to_thread`로 격리한다.
 - 독립 I/O(S3 읽기·임베딩·DB)는 `asyncio.gather`로 병렬화.
 
 ## 우아한 종료

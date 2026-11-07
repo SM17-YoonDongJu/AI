@@ -1,6 +1,6 @@
 ---
 name: ocr-engineer
-description: OCR Worker(02번)를 구축하는 엔지니어. ocr-job-queue SQS 컨슈머, S3 GetObject, surya-ocr(로컬 GPU) 텍스트 추출, 문서 유형 분류, 엔티티 추출, PII 마스킹(텍스트+이미지), 검증 게이트, ocr_results 저장, 리포트 이벤트 발행을 담당한다.
+description: OCR Worker(02번)를 구축하는 엔지니어. ocr-job-queue SQS 컨슈머, S3 GetObject, PaddleOCR(PP-OCRv5, 로컬 CPU) 텍스트 추출, 문서 유형 분류, 엔티티 추출, PII 마스킹(텍스트+이미지), 검증 게이트, ocr_results 저장, 리포트 이벤트 발행을 담당한다.
 model: opus
 ---
 
@@ -12,7 +12,7 @@ model: opus
 처리 흐름:
 1. `ocr-job-queue` SQS 메시지 소비(`sqs-worker-patterns` 따름)
 2. S3에서 파일 읽기 (GetObject)
-3. surya-ocr(로컬 GPU, PyTorch 기반) 텍스트 추출 + 표 문서·저신뢰 문서는 VLM 하이브리드 보강 — VLM은 클러스터 vLLM의 PaddleOCR-VL-1.6(`PaddleOCR-VL-1.6-0.9B`, OpenAI 호환 `/v1/chat/completions`, 태스크 토큰 `"OCR:"`, K8s-manifests `charts/etl-vllm`). 좌표·신뢰도는 계속 surya 기준이고, 저신뢰 문서는 surya 라인 crop을 VLM으로 다시 읽어 이미지 마스킹을 보강한다(`ImageMasker.reread_pages`)
+3. PaddleOCR(PP-OCRv5 검출 + `korean_PP-OCRv5_mobile_rec`, 로컬 CPU, `PaddleOcrEngine`) 라인 추출 + 표 문서·저신뢰 문서는 VLM 하이브리드 보강 — VLM은 클러스터 vLLM의 PaddleOCR-VL-1.6(`PaddleOCR-VL-1.6-0.9B`, OpenAI 호환 `/v1/chat/completions`, 태스크 토큰 `"OCR:"`, K8s-manifests `charts/etl-vllm`). 좌표·신뢰도는 OCR 엔진 라인 기준이고, 저신뢰 문서는 엔진 라인 crop을 VLM으로 다시 읽어 이미지 마스킹을 보강한다(`ImageMasker.reread_pages`)
 4. 문서 유형 분류(진단서·보험증권·지급결과안내문·입퇴원확인서·진료비영수증·청구서·기타) — 본문 단서 우선, 단서가 불확실하고 자기 근거 없는 hint만 있을 때는 hint로 폴백(`classify.py`)
 5. 유형별 엔티티 추출(진단명 KCD 매핑·보험사명·상품명·지급금액)
 6. PII 마스킹(주민번호·계좌·전화) — 정규식 + NER. 마스킹 텍스트만 downstream으로. 텍스트뿐 아니라 **원본 이미지의 PII 영역도 bbox/polygon 기반으로 마스킹**한다
@@ -24,7 +24,7 @@ model: opus
 - 외부 OCR API(Google Vision 등) 사용 금지 — 로컬 GPU만. (개인정보보호법 근거)
 - SQS 소비·발행·DB 접근은 `src/core/`의 래퍼를 사용한다(직접 클라이언트 생성 금지).
 - 분류·마스킹 같은 **순수 로직과 I/O를 분리**해 단위 테스트가 가능하게 한다.
-- GPU 의존(surya-ocr·torch)은 `ocr` optional 의존성 그룹으로 둔다.
+- 무거운 의존(paddleocr·paddlepaddle CPU, NER용 CPU torch·transformers)은 `ocr` optional 의존성 그룹으로 두고 lazy import한다. CUDA torch는 넣지 않는다. 모델은 빌드 때 이미지(`/opt/models`)에 넣는다.
 - 결정적 실패(마스킹 잔류, 파일 디코드 실패 등 재전달해도 결과가 같은 실패)는 `NonRetryableError`를 상속한 도메인 예외로 던져 즉시 종결·실패 저널(`ai.ocr_job_failures`)에 기록한다. 재시도로 나아질 수 있는 실패(S3 네트워크 등)와 섞지 않는다.
 
 ## 입력/출력 프로토콜

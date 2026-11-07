@@ -7,7 +7,7 @@ httpx.MockTransport로 OpenAI 호환 ``/v1/chat/completions`` 응답을 가짜�
   다음. model·max_tokens·temperature 0·타임아웃(읽기/접속 분리).
 - 퇴행 출력 폐기: ``finish_reason == "length"``(잘림)·같은 줄/셀 반복 루프 → ``VlmClientError``.
   예전 Ollama 경로의 num_ctx 잘림 테스트가 막던 위험("잘린 전사를 정상처럼 채택")을 이게 덮는다.
-- 에러 변환: HTTP·연결·타임아웃·형식 오류 → ``VlmClientError``(파이프라인 surya 폴백의 전제).
+- 에러 변환: HTTP·연결·타임아웃·형식 오류 → ``VlmClientError``(파이프라인 OCR 엔진 폴백의 전제).
 - 출력 정리: 코드펜스·위첨자·HTML/OTSL 표 → pipe markdown(표 앞뒤 본문 보존).
 - 라인 재판독: 라인마다 crop 1장, 실패 라인만 ``None``, 신뢰도 낮은 라인부터, 동시도 상한,
   단계 예산. 예전 grounding 테스트가 막던 위험(VLM 실패가 작업을 죽이거나 이미지 마스킹을
@@ -291,7 +291,7 @@ async def test_vlm_error_message_carries_no_response_text() -> None:
     assert exc_info.value.__cause__ is None
 
 
-# ── transcribe_table: 에러 변환(surya 폴백의 전제) ────────────────
+# ── transcribe_table: 에러 변환(OCR 엔진 폴백의 전제) ────────────────
 async def test_transcribe_table_wraps_http_error() -> None:
     # Arrange: 5xx 응답
     def handler(request: httpx.Request) -> httpx.Response:
@@ -345,7 +345,7 @@ async def test_transcribe_table_wraps_null_content() -> None:
 
 async def test_transcribe_table_wraps_non_json_response() -> None:
     # Arrange — 코드리뷰 지적: resp.json()이 던지는 JSONDecodeError(ValueError 하위)가
-    # 그대로 전파되면 VlmClientError로 안 잡혀 pipeline._extract_pages의 surya 폴백을
+    # 그대로 전파되면 VlmClientError로 안 잡혀 pipeline._extract_pages의 OCR 엔진 폴백을
     # 못 타고 작업 자체가 실패한다(예: 앞단 프록시가 에러 페이지를 200으로 반환).
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, text="<html>error</html>")
@@ -708,7 +708,8 @@ async def test_transcribe_table_converts_normalization_failure_without_response_
 
     _install_mock(handler)
 
-    # Act: VlmClientError여야 파이프라인이 그 쪽만 surya로 폴백한다(그 밖의 예외면 작업 실패).
+    # Act: VlmClientError여야 파이프라인이 그 쪽만 OCR 엔진 결과로 폴백한다(그 밖의 예외면
+    # 작업 실패).
     with pytest.raises(vlm_client.VlmClientError) as exc_info:
         await vlm_client.transcribe_table(_image())
 

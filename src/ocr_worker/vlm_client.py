@@ -3,11 +3,13 @@
 core/ai_client.py는 텍스트 chat/embeddings 전용이라 이미지 페이로드를 다루지 않는다. VLM은
 OCR 전용 보조 단계라 core가 아닌 여기 별도 모듈로 둔다. 하는 일은 둘이다:
 
-- **쪽 전사**(``transcribe_table``): 다중 항목 표 문서·저신뢰도 문서에서 surya 라인 순서가 표
-  구조를 못 살리는 문제를 보완한다. 채택 여부(groundedness·마스킹·잔류 검사)는 파이프라인이 정한다.
-- **라인 재판독**(``reread_lines``): 저신뢰도 문서에서 surya 라인 bbox를 원본 해상도로 잘라 한 줄씩
-  다시 읽는다. surya가 PII 글자를 완전히 오독(예: 이름 → "828")하면 라인 기반 검출이 그 라인을 못
-  잡는데, ``ImageMasker``가 이 텍스트로 다시 검출해 검은블록을 보탠다(예전 Qwen grounding의 대체 —
+- **쪽 전사**(``transcribe_table``): 다중 항목 표 문서·저신뢰도 문서에서 OCR 엔진 라인 순서가
+  표 구조를 못 살리는 문제를 보완한다. 채택 여부(groundedness·마스킹·잔류 검사)는 파이프라인이
+  정한다.
+- **라인 재판독**(``reread_lines``): 저신뢰도 문서에서 OCR 엔진 라인 bbox를 원본 해상도로 잘라
+  한 줄씩 다시 읽는다. OCR 엔진이 PII 글자를 완전히 오독(예: surya 시절 이름 → "828")하면 라인
+  기반 검출이 그 라인을 못 잡는데, ``ImageMasker``가 이 텍스트로 다시 검출해 검은블록을 보탠다
+  (예전 Qwen grounding의 대체 —
   PaddleOCR-VL은 "PII를 찾아 좌표로 답하라" 같은 지시를 따르지 않는다).
 
 서빙은 OpenAI 호환 ``POST /v1/chat/completions``다. 운영은 클러스터 vLLM(K8s-manifests
@@ -23,12 +25,14 @@ PaddleOCR-VL-1.6 공식 문서·모델 카드 기준으로 알아 둘 한계(202
   권장한다. 직접 호출 예시는 element-level 인식과 text spotting만 지원한다고 적는다. 쪽 전사
   (``transcribe_table``)를 쪽 전체 ``"OCR:"``로 두는 건 팀 청커가 운영에서 쓰는 경로라서이고, 비전
   입력이 ``max_pixels``(spotting 외 태스크 기본 1280*28*28 ≈ 1.0MP)로 줄어 작은 글씨가 뭉개질 수
-  있다. 그래서 채택 전에 groundedness·마스킹·잔류 검사를 거치고 실패하면 쪽마다 surya로 폴백한다.
+  있다. 그래서 채택 전에 groundedness·마스킹·잔류 검사를 거치고 실패하면 쪽마다 OCR 엔진 결과로
+  폴백한다.
   후속 후보: 레이아웃 + 영역 crop 전사.
 - **라인 재판독은 문서화된 사용법(element-level 입력)과 맞는다** — 라인 crop이 곧 텍스트 요소다.
   crop은 작아 ``max_pixels``에 걸리지 않고, 아주 작은 crop은 모델 쪽 ``min_pixels``에 맞춰 늘어난다
   (여기서 따로 업스케일하지 않는다 — 효과를 잰 근거가 없다).
-- **출력에 신뢰도·logprob이 없다.** 그래서 신뢰도 게이트(0.90)·검증의 기준은 계속 surya다.
+- **출력에 신뢰도·logprob이 없다.** 그래서 신뢰도 게이트·검증의 기준은 계속 OCR 엔진
+  (PP-OCRv5)이다.
 - ``"Spotting:"`` 태스크(좌표 출력)는 1.6에 있지만 출력의 좌표 인코딩이 문서에 없어 쓰지 않는다.
 - 한국어는 지원 언어 목록에 명시돼 있지 않다("109 languages"). 청커가 한국어 약관에 운영 중이라
   실사용은 확인됐지만 우리 서류(진단서·영수증 사진 등)의 정확도는 따로 평가해야 한다.
@@ -90,8 +94,8 @@ VLM_LINE_PROMPT = (
     "출력하지 마세요."
 )
 
-# 라인 crop 여백(픽셀). surya bbox는 글자에 빡빡해 가장자리 획이 잘릴 수 있다. 청커의 영역 crop
-# 여백(8px)보다 작게 둔다 — 줄 간격이 좁은 서식에서 위아래 줄 획이 섞여 들어오지 않게.
+# 라인 crop 여백(픽셀). OCR 라인 bbox는 글자에 가깝게 잡혀 가장자리 획이 잘릴 수 있다. 청커의
+# 영역 crop 여백(8px)보다 작게 둔다 — 줄 간격이 좁은 서식에서 위아래 줄 획이 섞여 들어오지 않게.
 _LINE_CROP_PAD_PX = 4
 
 # 같은 줄·셀이 이만큼 연속되면 퇴행(반복 루프) 출력으로 보고 버린다(청커 VLM_LOOP_CELLS 기본값).
@@ -111,7 +115,7 @@ _NOT_FAILURES = frozenset({_REREAD_OK, _REREAD_EMPTY, _REREAD_SKIPPED})
 
 
 class VlmClientError(RuntimeError):
-    """VLM 호출 실패의 기반 예외 — 호출측은 잡아서 surya 결과로 폴백한다.
+    """VLM 호출 실패의 기반 예외 — 호출측은 잡아서 OCR 엔진 결과로 폴백한다.
 
     Attributes:
         reason: 실패 분류(고정 어휘: ``http``·``timeout``·``malformed``·``truncated``·``loop``).
@@ -198,24 +202,24 @@ async def transcribe_table(image: PageImage) -> str:
 async def reread_lines(
     images: Sequence[PageImage], pages: Sequence[OcrPage]
 ) -> list[list[str | None]]:
-    """문서의 surya 라인을 bbox crop으로 한 줄씩 다시 읽는다(이미지 마스킹 보강).
+    """문서의 OCR 엔진 라인을 bbox crop으로 한 줄씩 다시 읽는다(이미지 마스킹 보강).
 
     crop은 원본 해상도라(쪽 전체 입력은 모델이 ~1MP로 줄인다) 작은 글씨도 선명하고, 좌표는
-    surya의 정밀 bbox를 그대로 쓴다. 문서 전체를 한 번에 받는 이유는 우선순위·예산 때문이다:
+    OCR 엔진의 정밀 bbox를 그대로 쓴다. 문서 전체를 한 번에 받는 이유는 우선순위·예산 때문이다:
 
-    - **신뢰도 낮은 라인부터** 요청한다. 오독한 라인일수록 surya 신뢰도가 낮을 가능성이 크고,
+    - **신뢰도 낮은 라인부터** 요청한다. 오독한 라인일수록 OCR 신뢰도가 낮을 가능성이 크고,
       예산이 끝나면 남는 것은 신뢰도 높은 라인이다.
     - **단계 예산**(``vlm_reread_budget_seconds``)을 넘기면 남은 라인은 건너뛴다. 단건 타임아웃만
       으로는 라인 수에 비례해 SQS 가시성(600초)을 넘길 수 있다(config의 최악 경로 주석).
 
-    실패는 라인 단위로 흡수한다(fail-open): 그 라인만 ``None``이고 surya 텍스트가 유지된다 —
-    재판독은 기존 surya 판정에 **보태기만** 하므로 실패해도 surya 단독 판정보다 후퇴하지 않는다
-    (예전 grounding 대비 한계는 ``masking.image_masker`` 모듈 설명).
+    실패는 라인 단위로 흡수한다(fail-open): 그 라인만 ``None``이고 OCR 엔진 텍스트가 유지된다 —
+    재판독은 기존 OCR 엔진 판정에 **보태기만** 하므로 실패해도 OCR 엔진 단독 판정보다 후퇴하지
+    않는다(예전 grounding 대비 한계는 ``masking.image_masker`` 모듈 설명).
     대신 결과 분포(성공·빈 응답·실패 사유별 수)를 로그 1건으로 남긴다(텍스트는 남기지 않는다).
 
     Args:
         images: 원본 페이지 이미지(``pages``와 같은 순서·길이).
-        pages: 같은 문서의 surya OCR 페이지(라인 bbox·신뢰도).
+        pages: 같은 문서의 OCR 엔진 페이지(라인 bbox·신뢰도).
 
     Returns:
         페이지별·라인별 재판독 텍스트(공백 정규화된 한 줄). 실패·빈 응답·잘못된 bbox·예산
@@ -331,7 +335,7 @@ async def _chat(
             raise VlmClientError("VLM 호출 실패", reason="http") from exc
         except ValueError as exc:
             # 비-JSON 본문(json.JSONDecodeError). 여기서 변환 안 하면 pipeline._extract_pages의
-            # surya 폴백을 못 타고 작업 자체가 실패한다(예: 앞단 프록시가 에러 페이지를 200으로
+            # OCR 엔진 폴백을 못 타고 작업 자체가 실패한다(예: 앞단 프록시가 에러 페이지를 200으로
             # 반환).
             raise VlmClientError("VLM 응답 형식이 올바르지 않음", reason="malformed") from exc
     content, finish_reason = _parse_choice(body)
@@ -344,9 +348,9 @@ async def _chat(
         text = normalize_output(content)
         looping = _looping_lines(text) or _looping_cells(text)
     except (ValueError, IndexError, KeyError, TypeError) as exc:
-        # 정리 단계도 모델 출력을 다루는 경계다. 여기 예외가 그대로 새면 그 쪽만 surya로 폴백하는
-        # 대신 작업 전체가 실패한다. 원인 예외의 메시지는 응답 조각을 실을 수 있어(예: int()의
-        # "invalid literal" 메시지) 체인을 끊고 타입 이름만 남긴다(§9).
+        # 정리 단계도 모델 출력을 다루는 경계다. 여기 예외가 그대로 새면 그 쪽만 OCR 엔진 결과로
+        # 폴백하는 대신 작업 전체가 실패한다. 원인 예외의 메시지는 응답 조각을 실을 수 있어
+        # (예: int()의 "invalid literal" 메시지) 체인을 끊고 타입 이름만 남긴다(§9).
         raise VlmClientError(
             f"VLM 응답 정리 실패({type(exc).__name__})", reason="malformed"
         ) from None
@@ -445,7 +449,7 @@ _HTML_TAG_RE = re.compile(r"</?([A-Za-z][A-Za-z0-9]*)\b[^<>]*>")
 #   하나를 둔다 — "홍길동<b>입니다</b>"가 "홍길동입니다"로 붙으면 이름 경계((?![가-힣]))가 사라진다.
 #   양옆이 숫자·영문이면 붙인다: 띄우면 수 안쪽 서식에서 주민·카드가 깨지고, KCD("J20.9")·증권번호
 #   같은 영숫자 식별자가 쪼개진다. 영문↔숫자로 붙어 RRN_RE의 영문 경계에 걸리는 경우는 잔류 게이트
-#   (verify.py, 숫자 경계만 본다)가 잡아 그 쪽을 surya로 폴백시킨다.
+#   (verify.py, 숫자 경계만 본다)가 잡아 그 쪽을 OCR 엔진 결과로 폴백시킨다.
 #   알려진 대가: 한 단어 안을 서식이 가른 경우("<span>홍</span><span>길동</span>")는 "홍 길동"으로
 #   벌어져 정규식이 이름을 놓친다(태그를 그대로 두던 dev도 같은 자리에서 놓쳤다 — NER 몫).
 # - 블록 태그: 줄바꿈. 빈 문자열로 붙이면 "<p>성명: 홍길동</p><p>입원일…"이 "홍길동입원일"이 돼
