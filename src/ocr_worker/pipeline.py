@@ -107,7 +107,7 @@ from ocr_worker.masking.image_verify import CoverageFn, VerificationResult, veri
 from ocr_worker.masking.masker import Masker, get_masker
 from ocr_worker.masking.spans import PiiLabel
 from ocr_worker.masking.verify import MaskingError, assert_no_residual
-from ocr_worker.ocr import OcrProcessor, OcrResult, PageImage, get_processor
+from ocr_worker.ocr import OcrPage, OcrProcessor, OcrResult, PageImage, get_processor
 from ocr_worker.repository import (
     ClaimDocument,
     DeleteRetryState,
@@ -128,7 +128,7 @@ from ocr_worker.repository import (
     save_ocr_result,
 )
 from ocr_worker.storage import delete_object, put_object
-from ocr_worker.vlm_client import VlmClientError, ground_pii, transcribe_table
+from ocr_worker.vlm_client import VlmClientError, reread_lines, transcribe_table
 
 logger = get_logger(__name__)
 
@@ -194,6 +194,15 @@ def _looks_grounded(vlm_text: str, source_text: str) -> bool:
     source_tokens = set(_TOKEN_RE.findall(source_text))
     overlap = len(vlm_tokens & source_tokens) / len(vlm_tokens)
     return overlap >= _MIN_GROUNDED_OVERLAP
+
+
+def _has_gated_residual(masked_text: str) -> bool:
+    """마스킹본에 하드 게이트 대상 PII(주민·카드 등)가 남았는가(``assert_no_residual`` 기준)."""
+    try:
+        assert_no_residual(masked_text)
+    except MaskingError:
+        return True
+    return False
 
 
 # extract()가 doc_type 고유 필드를 아예 정의하지 않는 유형 — 항목별 데이터가 전부
@@ -383,7 +392,7 @@ class OcrPipeline:
             processor: OCR 오케스트레이터. ``None``이면 프로세스 공용 ``get_processor()``.
             masker: 텍스트 마스커. ``None``이면 프로세스 공용 ``get_masker()``.
             image_masker: 이미지 마스커. ``None``이면 텍스트 마스커의 검출을 공유하는
-                기본 구성(PIL 렌더 + 저신뢰도 VLM grounding).
+                기본 구성(PIL 렌더 + 저신뢰도 문서의 VLM 라인 재판독 보강).
             image_pipeline: 이미지 마스킹 트랙. ``None``이면 기본(PIL 렌더 → S3 업로드 →
                 마스킹 검증 → 통과 시 원본 삭제).
             vlm_transcribe: 하이브리드 VLM 표 전사 함수. ``None``이면
@@ -400,8 +409,8 @@ class OcrPipeline:
         self._masker = masker or get_masker()
         self._image_masker = image_masker or ImageMasker(
             detect=self._masker.detect,
-            ground=ground_pii,
-            ground_confidence_threshold=_LOW_CONFIDENCE_THRESHOLD,
+            reread=reread_lines,
+            reread_confidence_threshold=_LOW_CONFIDENCE_THRESHOLD,
         )
         self._vlm_transcribe: VlmTranscribe = vlm_transcribe or transcribe_table
         self._coverage: CoverageFn | None = coverage
@@ -635,8 +644,8 @@ class OcrPipeline:
         # 1페이지 VLM 성공만으로 문서 전체 masked_text가 교체돼 2페이지 이후가 통째로
         # 유실됐었다). masked_lines(DB 텍스트)는 항상 surya 기반 그대로 둔다 — 좌표가
         # surya 라인에 묶여 있어 VLM 채택 여부와 무관하다. 이미지 검은블록(_image_pipeline)
-        # 은 별도로 VLM grounding을 호출해 surya 라인 기반 검출에 없는 영역까지 보강한다
-        # (§ImageMasker.ground_pages, 저신뢰도일 때만 — needs_vlm과 동일 임계값 재사용).
+        # 은 별도로 VLM 라인 재판독을 호출해 surya가 오독한 PII 라인까지 보강한다
+        # (§ImageMasker.reread_pages, 저신뢰도일 때만 — needs_vlm과 동일 임계값 재사용).
         masked_text = analysis.masked_text
         entities = analysis.entities
         quality_source_text = result.full_text  # 최종 품질 판정 기준 원문(기본 surya)
@@ -656,6 +665,11 @@ class OcrPipeline:
                 # 신뢰도가 낮거나 표 문서라서 호출된 것이므로, 둘 다 값이 있으면
                 # VLM 쪽을 더 신뢰할 근거가 있다(실측: surya가 금액을 숫자로 오독해
                 # 엉뚱한 값을 잘못 채운 사례 확인). surya만 값이 있으면 그대로 둔다.
+                # 재평가 필요(동작은 그대로 둔다): 이 우선 규칙의 근거 실측은 Qwen(Ollama) 시절
+                # 쪽 전사다. PaddleOCR-VL은 쪽 전체를 약 1MP로 줄여 받아 작은 숫자(입원일수·
+                # 수술 여부·KCD·금액)를 surya보다 못 읽을 수 있고, 그 값이 surya 값을 덮는다 —
+                # report가 지급액 산정에 쓰는 필드라 실문서로 surya vs VLM 엔티티를 비교해
+                # 규칙을 다시 정해야 한다(_workspace/17 D7).
                 vlm_entities = extract(analysis.doc_type, quality_source_text)
                 entities = {
                     key: vlm_entities.get(key) if vlm_entities.get(key) is not None else value
@@ -748,23 +762,50 @@ class OcrPipeline:
     ) -> tuple[str, str, str] | None:
         """페이지마다 독립적으로 VLM 보완을 시도해 문서 전체를 합성한다.
 
-        한 페이지의 VLM 실패(호출 오류·환각·잔류PII)가 다른 페이지까지 막지 않는다.
+        쪽끼리 의존이 없어 **동시에** 전사한다 — 순차면 문서 처리 시간이 쪽 수에 비례해 SQS
+        가시성(600초, heartbeat 없음)을 넘긴다. 동시도 상한은 ``vlm_client``의 세마포어
+        (``vlm_concurrency``)가 걸고, 단계 전체는 ``vlm_page_budget_seconds``에서 끊는다(그때까지
+        못 끝낸 쪽은 다른 실패와 똑같이 surya 폴백). 결과는 완료 순서가 아니라 **페이지 순서**로
+        합친다(``gather``는 인자 순서대로 돌려준다).
+
+        한 페이지의 VLM 실패(호출 오류·환각·잔류PII·예산 초과)가 다른 페이지까지 막지 않는다.
         실패한 페이지는 그 페이지의 surya 결과로 폴백해 문서 전체 내용이 유실되지
         않게 한다. masked_text/원문은 ``OcrResult.full_text``와 같은 "\\n" 접합을
         써서 VLM 관여 여부와 무관하게 문서 형태가 일관되게 유지된다.
 
+        쪽 하나가 **예상 밖 예외**(VLM 실패·예산 초과가 아닌 버그 등)로 죽으면 그 예외로 작업이
+        실패한다(기존과 같다). 이때 남은 쪽 task는 취소하고 끝까지 기다린 뒤 올린다 — 안 그러면
+        실패한 작업의 VLM 요청이 예산 끝까지 계속 돌며 다음 작업과 vLLM을 나눠 쓴다.
+
+        합성한 masked_text는 쪽별로 마스킹한 조각을 이은 것이라 ``_analyze``의 문서 단위 잔류
+        검사를 받지 않았다. 그래서 한 번 더 검사하고, 걸리면 VLM 합성을 통째로 버리고 ``None``을
+        돌려준다(호출측이 잔류 검사를 이미 통과한 surya 단독 결과를 쓴다 — 작업 실패가 아니다).
+
         Returns:
             어느 페이지든 VLM이 채택됐으면 ``(합성 masked_text, 합성 원문,
-            table_markdown)``. 전 페이지가 실패했으면 ``None``(호출측이 순수
-            surya 결과를 그대로 쓰게 한다).
+            table_markdown)``. 전 페이지가 실패했거나 합성본이 잔류 검사에 걸리면
+            ``None``(호출측이 순수 surya 결과를 그대로 쓰게 한다).
         """
+        deadline = asyncio.get_running_loop().time() + self._settings.vlm_page_budget_seconds
+        tasks = [
+            asyncio.create_task(self._extract_table_by(deadline, image, page))
+            for image, page in zip(images, result.pages, strict=True)
+        ]
+        try:
+            outcomes = await asyncio.gather(*tasks)
+        finally:
+            # 성공 경로에선 모두 끝나 있어 아무 일도 없다. 한 쪽이 예외로 죽었거나 이 코루틴이
+            # 취소됐으면 남은 쪽을 취소하고 정리(예외 회수 포함)가 끝날 때까지 기다린다.
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
         masked_parts: list[str] = []
         raw_parts: list[str] = []
         table_parts: list[str] = []
         adopted = False
 
-        for image, page in zip(images, result.pages, strict=True):
-            outcome = await self._extract_table(image, page.text)
+        for page, outcome in zip(result.pages, outcomes, strict=True):
             if outcome is not None:
                 raw, masked = outcome
                 masked_parts.append(masked)
@@ -777,16 +818,42 @@ class OcrPipeline:
 
         if not adopted:
             return None
+        masked_text = "\n".join(masked_parts)
+        if await asyncio.to_thread(_has_gated_residual, masked_text):
+            logger.warning("vlm_composed_masking_residual_pii", pages=len(masked_parts))
+            return None
         return (
-            "\n".join(masked_parts),
+            masked_text,
             "\n".join(raw_parts),
             _TABLE_PAGE_SEPARATOR.join(table_parts),
         )
 
-    async def _extract_table(self, image: PageImage, source_text: str) -> tuple[str, str] | None:
+    async def _extract_table_by(
+        self, deadline: float, image: PageImage, page: OcrPage
+    ) -> tuple[str, str] | None:
+        """``_extract_table``을 쪽 전사 단계 마감(``deadline``, 루프 시각)까지만 기다린다.
+
+        마감이 지나면 진행 중인 VLM 요청을 취소하고 ``None``(surya 폴백)을 돌려준다 — 이미
+        끝난 다른 쪽의 결과는 그대로 쓴다(단계 전체를 취소하면 그것까지 잃는다).
+        """
+        try:
+            async with asyncio.timeout_at(deadline):
+                return await self._extract_table(image, page.text, page.index)
+        except TimeoutError:
+            logger.warning(
+                "vlm_page_budget_exceeded",
+                page=page.index,
+                budget_seconds=self._settings.vlm_page_budget_seconds,
+            )
+            return None
+
+    async def _extract_table(
+        self, image: PageImage, source_text: str, page_index: int
+    ) -> tuple[str, str] | None:
         """VLM으로 표를 전사하고 검증·마스킹한다.
 
-        실패(호출 오류·환각·잔류PII)하면 ``None``을 반환해 surya 결과로 폴백한다.
+        실패(호출 오류·퇴행 출력·환각·잔류PII)하면 ``None``을 반환해 surya 결과로 폴백한다.
+        쪽들이 동시에 돌아 로그가 섞이므로 경고마다 ``page``를 붙인다(텍스트는 남기지 않는다).
 
         Returns:
             성공 시 ``(VLM 원문, 마스킹된 텍스트)``. 원문은 호출측의 품질 판정(이름
@@ -794,14 +861,16 @@ class OcrPipeline:
         """
         try:
             raw = await self._vlm_transcribe(image)
-        except VlmClientError:
-            logger.warning("vlm_table_extraction_failed")
+        except VlmClientError as exc:
+            # reason은 고정 어휘(http·timeout·malformed·truncated·loop)라 그대로 남겨도 된다.
+            logger.warning("vlm_table_extraction_failed", page=page_index, reason=exc.reason)
             return None
         if not _looks_grounded(raw, source_text):
-            logger.warning("vlm_table_ungrounded")
+            logger.warning("vlm_table_ungrounded", page=page_index)
             return None
         masked = await asyncio.to_thread(self._mask_table, raw)
         if masked is None:
+            logger.warning("vlm_table_masking_residual_pii", page=page_index)
             return None
         return raw, masked
 
@@ -811,7 +880,6 @@ class OcrPipeline:
         try:
             assert_no_residual(masked)
         except MaskingError:
-            logger.warning("vlm_table_masking_residual_pii")
             return None
         return masked
 
@@ -848,12 +916,20 @@ class OcrPipeline:
         """
         if not images:
             return ImageTrackResult(keys=[], delete_original=False)
-        # grounding은 VLM I/O라 async로 먼저 끝내고, PIL 렌더(CPU 바운드)만 to_thread로
-        # 격리한다 — redact_pages 자체는 동기 함수로 유지해 블로킹 규약(§7)을 지킨다.
-        grounded_boxes = await self._image_masker.ground_pages(images, result)
+        # 라인 재판독은 VLM I/O라 async로 먼저 끝내고(저신뢰도 문서만), 검출(정규식·NER)·PIL
+        # 렌더(CPU 바운드)는 to_thread로 격리한다 — redact_pages 자체는 동기 함수로 유지해
+        # 블로킹 규약(§7)을 지킨다.
+        reread_texts = await self._image_masker.reread_pages(images, result)
         redacted_pages = await asyncio.to_thread(
-            self._image_masker.redact_pages, images, result, grounded_boxes
+            self._image_masker.redact_pages, images, result, reread_texts
         )
+        if reread_texts is not None:
+            # 재판독이 surya 판정에 실제로 보탠 PII 라인 수(관측용 — 텍스트는 남기지 않는다).
+            # 재판독 자체의 성공·실패 분포는 vlm_client가 "vlm_line_reread"로 따로 남긴다.
+            logger.info(
+                "vlm_reread_pii_lines_added",
+                lines=sum(len(page.reread_indices) for page in redacted_pages),
+            )
         pngs = await asyncio.to_thread(_encode_pngs, redacted_pages)
         keys = [_masked_image_key(job.job_id, index) for index in range(len(pngs))]
         await asyncio.gather(

@@ -2,6 +2,10 @@
 
 > 출처: AI 엔진 아키텍처 문서 세트 · 최종 점검일 2026-07-15 · 브랜치 11-feature-langgraph-멀티에이전트-구현
 
+> **주의(2026-11-05 갱신 메모) — 이 문서의 본문은 2026-07-15 시점 스냅샷이다.** 그 뒤로 워커는 구현됐고(SQS 소비, 아래 "미구현" 표는 낡았다), 메시지 브로커는 Kafka에서 **SQS**로 바뀌었다. 현재 동작의 정본은 [`src/ocr_worker/README.md`](../../src/ocr_worker/README.md)다. 엔진·VLM 구성은 이렇게 바뀌었다(이 문서의 해당 문단도 함께 고쳤다):
+> - **OCR 엔진은 surya-ocr**(워커 프로세스 안, PyTorch·GPU)다. PaddleOCR 엔진은 쓰지 않는다.
+> - **VLM 보조는 클러스터 vLLM의 PaddleOCR-VL-1.6**(`PaddleOCR-VL-1.6-0.9B`, OpenAI 호환 API)이다. 이름이 비슷하지만 위의 PaddleOCR 엔진과는 다른 것으로, 워커가 HTTP로 부른다. 표 문서·저신뢰도 문서의 쪽 전사와, 저신뢰도 문서에서 surya가 오독한 PII 라인을 다시 읽는 라인 재판독(이미지 마스킹 보강)에 쓴다. 예전 Ollama Qwen(표 전사·좌표 grounding)은 없어졌다.
+
 ## 🎯 한 문장 요약
 
 업로드된 보험 문서(진단서·보험증권 등) 이미지를 **로컬 GPU에서 글자로 바꾸고**, 문서 종류를 알아내 필요한 정보를 뽑고, 개인정보를 가린 뒤 저장하고, 다음 단계(리포트 생성)에 넘기는 Kafka 워커다.
@@ -51,7 +55,7 @@ CMD ["python", "-m", "ocr_worker"]
 
 이 워커가 (구현되면) 담당하는 일을 한 문장씩 풀면 이렇다.
 
-1. **글자로 바꾸기** — 업로드된 진단서·보험증권 등의 이미지를 **PaddleOCR**(오픈소스 OCR 엔진, 로컬 GPU에서 실행)로 읽어 텍스트로 만든다. 한국어 모델을 쓰고, 표·인감·서명 영역까지 레이아웃을 분석한다.
+1. **글자로 바꾸기** — 업로드된 진단서·보험증권 등의 이미지를 **surya-ocr**(오픈소스 OCR 엔진, 워커 프로세스 안에서 로컬 GPU로 실행)로 읽어 라인 단위(글자·좌표·신뢰도) 텍스트로 만든다. 표 문서이거나 신뢰도가 낮으면 자체 호스팅 VLM(클러스터 vLLM의 **PaddleOCR-VL-1.6**)이 쪽을 다시 전사해 표 구조를 보완한다(검증을 통과할 때만 채택).
 2. **문서 종류 알아내기** — 첫 페이지 텍스트를 보고 이 문서가 진단서인지, 보험증권인지, 지급결과안내문인지, 청구서인지, 기타인지 판정한다.
 3. **핵심 정보 뽑기(엔티티 추출)** — 종류에 맞게 진단명(KCD 코드로 매핑), 보험사명, 상품명, 지급금액 같은 항목을 골라낸다.
 
@@ -85,7 +89,7 @@ CMD ["python", "-m", "ocr_worker"]
 2. **SpringBoot**가 로그인 토큰(JWT)을 검증한 뒤, 파일을 **S3에 암호화(SSE-S3)해서 저장**하고 Kafka에 작업 메시지를 발행한다.
 3. 프론트엔드에는 곧바로 **202(접수 완료)** 를 돌려준다. 사용자는 기다리지 않는다.
 4. **OCR 워커**가 Kafka(`ocr-job-queue`)에서 그 작업 메시지를 꺼내 온다.
-5. S3에서 파일을 읽어 **PaddleOCR(로컬 GPU)** 로 텍스트를 뽑는다.
+5. S3에서 파일을 읽어 **surya-ocr(로컬 GPU)** 로 텍스트를 뽑는다(필요하면 클러스터 vLLM의 PaddleOCR-VL로 보완).
 6. **문서 유형 분류 → 엔티티 추출 → PII 마스킹**을 차례로 한다.
 7. 결과를 **PostgreSQL의 `ocr_results`** 에 저장한다.
 8. 리포트 생성 파이프라인(05번)으로 결과를 넘긴다. (`report-job` 발행)
@@ -225,23 +229,23 @@ class DocType(StrEnum):
 
 ## 📦 의존성과 배포
 
-- 이 워커는 공용 모듈 `core.kafka`(우체통 연결)·`core.db`(장부 연결), 그리고 S3와 **PaddleOCR**(`.[ocr]` extra의 `paddlepaddle-gpu`)에 의존한다.
+- 이 워커는 공용 모듈 `core.sqs`(우체통 연결)·`core.db`(장부 연결), 그리고 S3와 **surya-ocr**(`.[ocr]` extra, 0.17.x 고정)에 의존한다. VLM은 클러스터 vLLM의 **PaddleOCR-VL-1.6**을 OpenAI 호환 API로 부른다(`VLM_BASE_URL`·`VLM_MODEL`). 실패하면 그 쪽·그 라인만 surya 결과로 돌아가므로 VLM이 꺼져 있어도 워커는 돈다.
 - **PII 마스킹 규칙은 가드레일(06번) 입력단과 정렬**되어 있어야 한다. 두 곳에서 서로 다른 규칙으로 개인정보를 가리면 구멍이 생기기 때문이다.
-- 배포는 `src/ocr_worker/Dockerfile`(CUDA 베이스 이미지)로 빌드해 **GPU 노드**에 올린다. PaddleOCR을 워커 프로세스 안에서 직접 돌리므로 반드시 GPU가 필요하다. (Ollama·vLLM 노드와 같은 장비에 함께 배치할 수 있다.)
+- 배포는 `src/ocr_worker/Dockerfile`로 빌드해 **GPU 노드**에 올린다. surya를 워커 프로세스 안에서 직접 돌리므로 GPU가 필요하다. VLM은 같은 프로세스가 아니라 클러스터 vLLM이라, 옮겨 갈 노드는 brbs-etl(g4dn.xlarge, T4 16GB — vLLM과 GPU를 타임슬라이스로 나눔)이다. 지금은 GPU EC2의 `deploy/docker-compose.ocr.yml`로 배포한다.
 
 Dockerfile의 핵심 부분은 이렇다.
 
 ```dockerfile
-FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04 AS base
+FROM python:3.12-slim AS builder
 ```
 
 ```dockerfile
-# 의존성만 설치(프로젝트는 PYTHONPATH로 실행). uv.lock 커밋 후 --frozen 권장.
+# 의존성만 먼저 설치(레이어 캐시). uv.lock 커밋 후 --frozen 권장.
 COPY pyproject.toml uv.lock* ./
 RUN uv sync --no-dev --extra ocr
 ```
 
-> 쉽게 말하면: **CUDA는 GPU에게 일을 시키는 통로**이고, 이 이미지는 그 통로가 깔린 리눅스 환경(`nvidia/cuda:12.4.1-cudnn-runtime`)에서 파이썬 3.12로 워커를 돌리도록 구성돼 있다. CUDA/cuDNN 버전은 실제 GPU 노드 및 `paddlepaddle-gpu` 휠과 맞아떨어져야 한다. 앞서 말했듯 실행 진입점(`__main__.py`)은 **아직 구현 전**이라, 지금 이 이미지를 빌드해 띄워도 실제 OCR 작업은 돌지 않는다.
+> 쉽게 말하면: **CUDA는 GPU에게 일을 시키는 통로**다. torch 휠이 CUDA 런타임을 스스로 싣고 오므로 무거운 `nvidia/cuda` 베이스 이미지 없이 `python:3.12-slim` 위에서 돌고, GPU 드라이버는 호스트가 넣어 준다. VLM 모델(PaddleOCR-VL)은 이 이미지에 없다 — 클러스터의 vLLM 서버에 있다.
 
 ---
 

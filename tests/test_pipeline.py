@@ -35,6 +35,8 @@ from core.contracts import DocType, OcrJob, ReportJob
 from core.exceptions import NonRetryableError, OcrError, UnreadableFileError
 from ocr_worker import pipeline as pipeline_module
 from ocr_worker.masking.image_masker import ImageMasker
+from ocr_worker.masking.image_verify import measure_coverage
+from ocr_worker.masking.masker import Masker
 from ocr_worker.masking.spans import PiiLabel, Span
 from ocr_worker.masking.verify import MaskingError
 from ocr_worker.ocr import OcrLine, OcrPage, OcrResult
@@ -391,16 +393,25 @@ class _RecordingVlm:
         return self._text
 
 
-class _SequencedVlm:
-    """페이지마다 다른 결과/예외를 순서대로 돌려주는 VLM 대역(다중 페이지 테스트용)."""
+def _page_index_of(image: Any) -> int:
+    """``FakeProcessor``가 만든 페이지 이미지(``_FakeImage("page-{index}")``)의 페이지 번호."""
+    return int(image.name.removeprefix("page-"))
+
+
+class _PerPageVlm:
+    """페이지마다 다른 결과/예외를 돌려주는 VLM 대역(다중 페이지 테스트용).
+
+    쪽 전사는 동시에 돌아 호출 순서가 페이지 순서라는 보장이 없다 — 호출 순서가 아니라
+    받은 이미지로 그 페이지의 결과를 고른다.
+    """
 
     def __init__(self, outcomes: list[str | Exception]) -> None:
         self._outcomes = list(outcomes)
         self.call_count = 0
 
-    async def __call__(self, image: object) -> str:
+    async def __call__(self, image: Any) -> str:
         self.call_count += 1
-        outcome = self._outcomes.pop(0)
+        outcome = self._outcomes[_page_index_of(image)]
         if isinstance(outcome, Exception):
             raise outcome
         return outcome
@@ -576,7 +587,7 @@ async def test_vlm_partial_page_failure_keeps_other_pages() -> None:
     page1 = "보험금 지급결과 안내문 지급결정 내역"
     page2 = "추가 산정 내역 진찰료 10000원"
     processor = FakeProcessor(_multi_page_result(page1, page2))
-    vlm = _SequencedVlm(
+    vlm = _PerPageVlm(
         [
             "보험금 지급결과 안내문 지급결정 내역(표)",  # 1페이지: grounded → 채택
             VlmClientError("연결 실패"),  # 2페이지: 실패 → surya 폴백
@@ -605,7 +616,7 @@ async def test_vlm_table_markdown_joins_only_adopted_pages() -> None:
         "산정내역 및 지급사유 설명",
     )
     processor = FakeProcessor(_multi_page_result(page1, page2, page3))
-    vlm = _SequencedVlm(
+    vlm = _PerPageVlm(
         [
             "보험금 지급결과 안내문(표1)",
             VlmClientError("연결 실패"),
@@ -632,7 +643,7 @@ async def test_vlm_all_pages_fail_falls_back_to_pure_surya() -> None:
     producer = FakeProducer()
     page1, page2 = "보험금 지급결과 안내문", "지급결정 내역"
     processor = FakeProcessor(_multi_page_result(page1, page2))
-    vlm = _SequencedVlm([VlmClientError("연결 실패"), VlmClientError("연결 실패")])
+    vlm = _PerPageVlm([VlmClientError("연결 실패"), VlmClientError("연결 실패")])
     pipeline = _pipeline(pool, producer, processor, vlm_transcribe=vlm)
 
     # Act
@@ -645,6 +656,250 @@ async def test_vlm_all_pages_fail_falls_back_to_pure_surya() -> None:
     assert page1 in masked_text
     assert page2 in masked_text
     assert "table_markdown" not in entities
+
+
+async def test_vlm_pages_run_concurrently_and_merge_in_page_order() -> None:
+    # Arrange: 1페이지 전사가 2페이지 전사가 **끝나야** 끝나도록 묶는다. 순차 구현이면 1페이지에서
+    # 영원히 멎고(상한으로 실패), 동시 구현이면 2페이지가 먼저 끝난다 — 그래도 결과는 페이지 순서로
+    # 합쳐져야 한다(SQS 가시성 600초 안에 들려고 쪽 전사를 동시에 돌려도 순서는 흔들리면 안 된다).
+    pool = FakePool(existing=None)
+    producer = FakeProducer()
+    page1 = "보험금 지급결과 안내문 지급결정 내역"
+    page2 = "추가 산정 내역 진찰료 10000원"
+    processor = FakeProcessor(_multi_page_result(page1, page2))
+    second_page_done = asyncio.Event()
+
+    async def vlm(image: Any) -> str:
+        if _page_index_of(image) == 0:
+            await second_page_done.wait()
+            return f"{page1}(표1)"
+        second_page_done.set()
+        return f"{page2}(표2)"
+
+    pipeline = _pipeline(pool, producer, processor, vlm_transcribe=vlm)
+
+    # Act
+    async with asyncio.timeout(_NON_BLOCKING_TIMEOUT_S):
+        await pipeline.handle(_job())
+
+    # Assert
+    insert_args = pool.insert_calls()[0][1]
+    masked_text = insert_args[4]
+    table_markdown = json.loads(insert_args[6])["table_markdown"]
+    assert masked_text == f"{page1}(표1)\n{page2}(표2)"
+    assert table_markdown.index("(표1)") < table_markdown.index("(표2)")
+
+
+async def test_vlm_page_budget_exceeded_falls_back_to_surya_for_unfinished_page() -> None:
+    # Arrange: 2페이지 전사가 응답하지 않는다. 단건 타임아웃(180초)만으론 쪽 수에 비례해 SQS
+    # 가시성을 넘길 수 있어 단계 예산에서 끊는다 — 끝난 1페이지는 VLM, 못 끝낸 2페이지는 surya.
+    pool = FakePool(existing=None)
+    producer = FakeProducer()
+    page1 = "보험금 지급결과 안내문 지급결정 내역"
+    page2 = "추가 산정 내역 진찰료 10000원"
+    processor = FakeProcessor(_multi_page_result(page1, page2))
+    never = asyncio.Event()
+
+    async def vlm(image: Any) -> str:
+        if _page_index_of(image) == 1:
+            await never.wait()  # 응답하지 않는 서버
+        return f"{page1}(표1)"
+
+    pipeline = _pipeline(
+        pool,
+        producer,
+        processor,
+        vlm_transcribe=vlm,
+        settings=Settings(vlm_page_budget_seconds=0.1),
+    )
+
+    # Act
+    with capture_logs() as logs:
+        async with asyncio.timeout(_NON_BLOCKING_TIMEOUT_S):
+            await pipeline.handle(_job())
+
+    # Assert
+    masked_text = pool.insert_calls()[0][1][4]
+    assert masked_text == f"{page1}(표1)\n{page2}"
+    budget_logs = [entry for entry in logs if entry["event"] == "vlm_page_budget_exceeded"]
+    assert [entry["page"] for entry in budget_logs] == [1]
+    assert len(producer.published) == 1  # 작업은 정상 완료
+
+
+# 부분 채택 문서에서 VLM이 실패·예산 초과한 쪽은 **그 쪽의 surya 원문을 마스킹해** 합성본에
+# 넣는다(QA W1). 이 쪽은 문서 단위 _analyze 마스킹이 아니라 쪽 단위 마스킹을 따로 받는다 —
+# 빠지면 이름처럼 잔류 게이트(주민·카드)에 안 걸리는 PII가 그대로 저장된다. 그래서 이름·전화로 본다.
+_ADOPTED_PAGE = "보험금 지급결과 안내문 지급결정 내역"
+_PII_PAGE = "수익자 성명 홍길동 연락처 010-1234-5678"
+
+
+async def test_vlm_failed_page_surya_text_stays_masked_in_partial_adoption() -> None:
+    # Arrange: 1쪽은 VLM 채택, 2쪽(PII 있음)은 VLM 실패 → 2쪽만 surya 폴백.
+    pool = FakePool(existing=None)
+    processor = FakeProcessor(_multi_page_result(_ADOPTED_PAGE, _PII_PAGE))
+    vlm = _PerPageVlm([f"{_ADOPTED_PAGE}(표1)", VlmClientError("연결 실패")])
+    pipeline = _pipeline(pool, FakeProducer(), processor, vlm_transcribe=vlm)
+
+    # Act
+    await pipeline.handle(_job())
+
+    # Assert: VLM 합성 경로를 탔고(1쪽 표시), 폴백 쪽 PII는 가려졌다.
+    masked_text = pool.insert_calls()[0][1][4]
+    assert "(표1)" in masked_text
+    assert "홍길동" not in masked_text
+    assert "010-1234-5678" not in masked_text
+    assert PiiLabel.NAME.token in masked_text
+
+
+async def test_vlm_budget_exceeded_page_surya_text_stays_masked() -> None:
+    # Arrange: 2쪽(PII 있음) 전사가 응답하지 않아 쪽 예산에서 끊긴다 → 2쪽만 surya 폴백.
+    pool = FakePool(existing=None)
+    processor = FakeProcessor(_multi_page_result(_ADOPTED_PAGE, _PII_PAGE))
+    never = asyncio.Event()
+
+    async def vlm(image: Any) -> str:
+        if _page_index_of(image) == 1:
+            await never.wait()  # 응답하지 않는 서버
+        return f"{_ADOPTED_PAGE}(표1)"
+
+    pipeline = _pipeline(
+        pool,
+        FakeProducer(),
+        processor,
+        vlm_transcribe=vlm,
+        settings=Settings(vlm_page_budget_seconds=0.1),
+    )
+
+    # Act
+    async with asyncio.timeout(_NON_BLOCKING_TIMEOUT_S):
+        await pipeline.handle(_job())
+
+    # Assert
+    masked_text = pool.insert_calls()[0][1][4]
+    assert "(표1)" in masked_text
+    assert "홍길동" not in masked_text
+    assert "010-1234-5678" not in masked_text
+
+
+class _PageBlindMasker(Masker):
+    """쪽 단위 마스킹만 주민번호를 놓치는 마스커 대역 — 합성본 잔류 게이트를 시험한다.
+
+    문서 전체(첫 쪽 표제 "보험금" 포함)나 채택된 VLM 쪽은 제대로 가리고, 그 단어가 없는 쪽만
+    가리지 않는다. 실제로는 쪽 경계에서 라벨 문맥을 잃는 경우에 해당한다.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(use_ner=False)
+
+    def mask(self, text: str) -> str:
+        return super().mask(text) if "보험금" in text else text
+
+
+async def test_vlm_composed_text_with_residual_pii_falls_back_to_surya_only() -> None:
+    # Arrange: 폴백 쪽의 쪽 단위 마스킹이 주민번호를 놓친다. 합성본은 문서 단위 잔류 검사를
+    # 받지 않았으므로 한 번 더 검사해, 걸리면 VLM 합성을 버리고 surya 단독 결과(검사 통과본)를 쓴다.
+    pool = FakePool(existing=None)
+    rrn_page = "수익자 주민번호 901010-1234567"
+    processor = FakeProcessor(_multi_page_result(_ADOPTED_PAGE, rrn_page))
+    vlm = _PerPageVlm([f"{_ADOPTED_PAGE}(표1)", VlmClientError("연결 실패")])
+    pipeline = _pipeline(
+        pool, FakeProducer(), processor, vlm_transcribe=vlm, masker=_PageBlindMasker()
+    )
+
+    # Act
+    with capture_logs() as logs:
+        await pipeline.handle(_job())
+
+    # Assert
+    insert_args = pool.insert_calls()[0][1]
+    masked_text = insert_args[4]
+    assert "901010-1234567" not in masked_text
+    assert "(표1)" not in masked_text  # VLM 합성은 버려졌다
+    assert "table_markdown" not in json.loads(insert_args[6])
+    assert "vlm_composed_masking_residual_pii" in [entry["event"] for entry in logs]
+
+
+async def test_unexpected_page_failure_cancels_sibling_pages_and_fails_job() -> None:
+    # Arrange: 1쪽이 VLM 실패가 아닌 예상 밖 예외로 죽는다(버그 흉내). 그 예외로 작업은 실패하되,
+    # 아직 도는 2쪽 전사는 취소돼야 한다 — 안 그러면 실패한 작업의 요청이 예산 끝까지 vLLM을 쓴다.
+    pool = FakePool(existing=None)
+    producer = FakeProducer()
+    processor = FakeProcessor(_multi_page_result(_ADOPTED_PAGE, _PII_PAGE))
+    sibling_started = asyncio.Event()
+    sibling_cancelled = asyncio.Event()
+    never = asyncio.Event()
+
+    async def vlm(image: Any) -> str:
+        if _page_index_of(image) == 0:
+            await sibling_started.wait()
+            raise RuntimeError("정리 단계 버그")
+        sibling_started.set()
+        try:
+            await never.wait()
+        except asyncio.CancelledError:
+            sibling_cancelled.set()
+            raise
+        return "도달 안 함"
+
+    pipeline = _pipeline(pool, producer, processor, vlm_transcribe=vlm)
+
+    # Act
+    with pytest.raises(RuntimeError):
+        async with asyncio.timeout(_NON_BLOCKING_TIMEOUT_S):
+            await pipeline.handle(_job())
+
+    # Assert: 형제 쪽은 작업이 끝나기 전에 취소됐고, 아무것도 저장·발행되지 않았다.
+    assert sibling_cancelled.is_set()
+    assert pool.insert_calls() == []
+    assert producer.published == []
+
+
+class _JournalTimelinePool(FakePool):
+    """실패 저널 쓰기에 **진입한 순간**을 공유 타임라인에 남기는 풀 대역(정리 순서 확인용)."""
+
+    def __init__(self, events: list[str]) -> None:
+        super().__init__(existing=None)
+        self._events = events
+
+    async def execute(self, sql: str, *args: Any) -> None:
+        if "ai.ocr_job_failures" in sql:
+            self._events.append("journal")  # 첫 await 전에 기록해 순서가 흔들리지 않게
+        await super().execute(sql, *args)
+
+
+async def test_page_failure_waits_for_sibling_cleanup_before_failing_job() -> None:
+    # Arrange: 1쪽이 예상 밖 예외로 죽고, 취소된 2쪽은 비동기 정리(응답 스트림 닫기 등)를 몇 차례
+    # 거친다. _extract_pages는 형제를 취소한 뒤 **정리가 끝날 때까지 기다리고서** 예외를 올려야
+    # 한다(QA N2b) — 안 기다리면 실패 기록·다음 작업이 아직 도는 형제와 겹친다.
+    events: list[str] = []
+    pool = _JournalTimelinePool(events)
+    processor = FakeProcessor(_multi_page_result(_ADOPTED_PAGE, _PII_PAGE))
+    sibling_started = asyncio.Event()
+    never = asyncio.Event()
+
+    async def vlm(image: Any) -> str:
+        if _page_index_of(image) == 0:
+            await sibling_started.wait()
+            raise RuntimeError("정리 단계 버그")
+        sibling_started.set()
+        try:
+            await never.wait()
+        except asyncio.CancelledError:
+            for _ in range(3):
+                await asyncio.sleep(0)  # 루프를 몇 번 도는 정리
+            events.append("sibling_cleanup_done")
+            raise
+        return "도달 안 함"
+
+    pipeline = _pipeline(pool, FakeProducer(), processor, vlm_transcribe=vlm)
+
+    # Act
+    with pytest.raises(RuntimeError):
+        async with asyncio.timeout(_NON_BLOCKING_TIMEOUT_S):
+            await pipeline.handle(_job())
+
+    # Assert: 형제 정리가 끝난 뒤에야 작업 실패가 기록됐다.
+    assert events == ["sibling_cleanup_done", "journal"]
 
 
 # ── 저신뢰도 VLM 트리거 ──────────────────────────────────────────
@@ -977,7 +1232,7 @@ def _detect_name(text: str) -> list[Span]:
     return [Span(start, start + 3, PiiLabel.NAME)] if start >= 0 else []
 
 
-def _fake_redactor(image: Any, page: OcrPage, indices: set[int], boxes: list[Any]) -> _FakeImage:
+def _fake_redactor(image: Any, page: OcrPage, indices: set[int]) -> _FakeImage:
     """검은블럭 렌더 대역 — 원본과 구분되는 이름의 사본을 돌려준다(PIL 불필요)."""
     return _FakeImage(f"redacted-{page.index}")
 
@@ -1297,6 +1552,133 @@ async def test_original_not_deleted_when_no_pages_rendered() -> None:
     # Assert
     assert s3.events == []
     assert json.loads(pool.insert_calls()[0][1][7]) == []
+
+
+# ── 기본 이미지 마스커의 VLM 라인 재판독 배선 ────────────────────
+class _PilProcessor(FakeProcessor):
+    """실제 PIL 이미지(흰 바탕)를 돌려주는 프로세서 대역 — 기본 이미지 마스커(PIL 렌더)를 태운다."""
+
+    async def process_with_images(
+        self, s3_key: str, content_type: str
+    ) -> tuple[OcrResult, list[object]]:
+        from PIL import Image
+
+        self.called = True
+        images = [
+            Image.new("RGB", (page.width, page.height), "white") for page in self._result.pages
+        ]
+        return self._result, images
+
+
+class _BlankReocrEngine:
+    """재OCR(5.2) 엔진 대역 — 마스킹 사본에서 아무것도 못 읽는다(잔류 PII 없음)."""
+
+    def recognize(self, images: list[Any]) -> list[list[OcrLine]]:
+        return [[]]
+
+
+def _misread_name_result(confidence: float) -> OcrResult:
+    """라벨(위)과 surya가 "828"로 오독한 이름(아래)이 다른 라인인 1페이지 결과."""
+
+    def line(text: str, bbox: tuple[float, float, float, float]) -> OcrLine:
+        x0, y0, x1, y1 = bbox
+        return OcrLine(
+            text=text,
+            bbox=bbox,
+            polygon=((x0, y0), (x1, y0), (x1, y1), (x0, y1)),
+            confidence=confidence,
+        )
+
+    page = OcrPage(
+        index=0,
+        width=100,
+        height=80,
+        lines=(line("환자 성명", (10.0, 10.0, 90.0, 30.0)), line("828", (10.0, 40.0, 90.0, 60.0))),
+    )
+    return OcrResult(pages=(page,))
+
+
+def _default_masker_pipeline(
+    processor: FakeProcessor, s3: _RecordingS3, coverage: Any
+) -> OcrPipeline:
+    """이미지 마스커를 주입하지 **않은** 파이프라인(기본 구성 배선 확인용)."""
+    return OcrPipeline(
+        pool=FakePool(existing=None),  # type: ignore[arg-type]
+        producer=FakeProducer(),  # type: ignore[arg-type]
+        processor=processor,  # type: ignore[arg-type]
+        masker=Masker(use_ner=False),
+        # 저신뢰도는 쪽 전사도 트리거한다 — 네트워크 없이 실패시켜 surya 폴백으로 둔다.
+        vlm_transcribe=_RecordingVlm(error=VlmClientError("연결 실패")),
+        coverage=coverage,
+        upload=s3.upload,
+        delete=s3.delete,
+    )
+
+
+async def test_default_image_masker_rereads_low_confidence_lines_and_verifies_them(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Arrange: surya가 이름을 "828"로 오독해 텍스트 검출로는 가릴 게 없는 저신뢰도 문서. 기본
+    # 구성이 vlm_client.reread_lines를 부르고, 재판독으로 찾은 라인을 **실제로** 검게 칠한 뒤 5.1
+    # 커버리지가 그 라인을 재야 한다(라인 인덱스로 합친 이유). 측정은 실제 numpy 측정을 감싼다.
+    reread_calls: list[int] = []
+
+    async def fake_reread(images: Any, pages: Any) -> list[list[str | None]]:
+        reread_calls.append(len(pages))
+        return [[None, "홍길동"]]
+
+    monkeypatch.setattr(pipeline_module, "reread_lines", fake_reread)
+    measured: list[set[int]] = []
+
+    def recording_coverage(image: Any, page: OcrPage, line_indices: set[int]) -> dict[int, float]:
+        measured.append(set(line_indices))
+        return measure_coverage(image, page, line_indices)
+
+    s3 = _RecordingS3()
+    processor = _PilProcessor(_misread_name_result(confidence=0.5), engine=_BlankReocrEngine())
+    pipeline = _default_masker_pipeline(processor, s3, recording_coverage)
+
+    # Act
+    with capture_logs() as logs:
+        await pipeline.handle(_job())
+        await pipeline.wait_for_pending_deletes()
+
+    # Assert
+    assert reread_calls == [1]
+    assert measured == [{1}]  # 재판독으로 찾은 "값" 라인을 5.1이 쟀다
+    assert s3.deleted == ["uploads/x.pdf"]  # 실제로 가려져 검증(5.1+5.2)을 통과했다
+    added = [entry for entry in logs if entry["event"] == "vlm_reread_pii_lines_added"]
+    assert [entry["lines"] for entry in added] == [1]
+
+
+async def test_default_image_masker_skips_reread_for_high_confidence_document(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Arrange: 고신뢰 문서는 재판독을 부르지 않는다(쪽 전사와 같은 0.90 게이트).
+    reread_calls: list[int] = []
+
+    async def fake_reread(images: Any, pages: Any) -> list[list[str | None]]:
+        reread_calls.append(len(pages))
+        return [[None, "홍길동"]]
+
+    monkeypatch.setattr(pipeline_module, "reread_lines", fake_reread)
+    measured: list[set[int]] = []
+
+    def recording_coverage(image: Any, page: OcrPage, line_indices: set[int]) -> dict[int, float]:
+        measured.append(set(line_indices))
+        return measure_coverage(image, page, line_indices)
+
+    s3 = _RecordingS3()
+    processor = _PilProcessor(_misread_name_result(confidence=0.95), engine=_BlankReocrEngine())
+    pipeline = _default_masker_pipeline(processor, s3, recording_coverage)
+
+    # Act
+    await pipeline.handle(_job())
+    await pipeline.wait_for_pending_deletes()
+
+    # Assert: 재판독 없음 → 가릴 라인 없음 → 검증할 페이지도 없다.
+    assert reread_calls == []
+    assert measured == []
 
 
 # ── 원본 삭제 outbox(재시도) ─────────────────────────────────────

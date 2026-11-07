@@ -2,9 +2,15 @@
 
 PIL 없이 검증한다 — "어느 라인이 PII인가"(``pii_line_indices``)와 "그 라인 어느
 구간이 PII인가"(``line_local_spans``)는 순수 함수이고, ``ImageMasker``는 detect·
-redactor를 주입해 렌더(PIL)를 배제한 채 오케스트레이션만 본다. 스팬은 실제 검출
+redactor·reread를 주입해 렌더(PIL)·VLM을 배제한 채 오케스트레이션만 본다. 스팬은 실제 검출
 대신 오프셋·라벨을 직접 만들어 라인 매핑 로직을 고립 검증한다.
+
+VLM 라인 재판독(예전 grounding의 대체)은 두 가지를 고정한다: 신뢰도 게이트(고신뢰 문서는
+호출조차 안 함)와, 재판독 텍스트로 찾은 PII 라인이 **라인 인덱스로** surya 판정에 더해지는지
+(5.1 커버리지가 그 라인을 재는 전제). 재판독 실패는 아무것도 보태지 않을 뿐 기존 판정을 깎지 않는다.
 """
+
+from collections.abc import Sequence
 
 import pytest
 
@@ -15,6 +21,7 @@ from ocr_worker.masking.image_masker import (
     reading_order,
     reading_order_text,
 )
+from ocr_worker.masking.masker import Masker
 from ocr_worker.masking.spans import PiiLabel, Span
 from ocr_worker.ocr import OcrLine, OcrPage, OcrResult
 
@@ -169,15 +176,13 @@ def test_redact_pages_only_redacts_pii_pages() -> None:
     result = OcrResult(pages=(page_pii, page_clean))
     images = ["img0", "img1"]
 
-    calls: list[tuple[str, set[int], tuple[object, ...]]] = []
+    calls: list[tuple[str, set[int]]] = []
 
     def fake_detect(text: str) -> list[Span]:
         return [Span(0, 3, PiiLabel.NAME)] if "pii" in text else []
 
-    def fake_redactor(
-        image: object, page: OcrPage, indices: set[int], extra_boxes: list[object]
-    ) -> str:
-        calls.append((str(image), indices, tuple(extra_boxes)))
+    def fake_redactor(image: object, page: OcrPage, indices: set[int]) -> str:
+        calls.append((str(image), indices))
         return f"redacted:{sorted(indices)}"
 
     masker = ImageMasker(detect=fake_detect, redactor=fake_redactor)
@@ -185,7 +190,7 @@ def test_redact_pages_only_redacts_pii_pages() -> None:
 
     # PII 페이지만 사본, clean은 원본 그대로
     assert [page.image for page in out] == ["redacted:[0]", "img1"]
-    assert calls == [("img0", {0}, ())]  # redactor는 PII 페이지에만 호출
+    assert calls == [("img0", {0})]  # redactor는 PII 페이지에만 호출
     # 검증(5.1)이 쓸 근거가 함께 나온다 — 가린 라인과 "실제로 가렸는가".
     assert [page.line_indices for page in out] == [{0}, set()]
     assert [page.redacted for page in out] == [True, False]
@@ -194,113 +199,232 @@ def test_redact_pages_only_redacts_pii_pages() -> None:
 def test_redact_pages_raises_on_count_mismatch() -> None:
     result = OcrResult(pages=(OcrPage(0, 100, 50, (_line("x"),)),))
 
-    masker = ImageMasker(detect=lambda _t: [], redactor=lambda i, _p, _idx, _boxes: i)
+    masker = ImageMasker(detect=lambda _t: [], redactor=lambda i, _p, _idx: i)
     with pytest.raises(ValueError, match="수 불일치"):
         masker.redact_pages(["a", "b"], result)
 
 
-def test_redact_pages_merges_grounded_boxes_even_without_line_pii() -> None:
-    # surya 라인 검출은 PII를 하나도 못 찾았지만(오독으로 못 잡힌 경우를 흉내), VLM
-    # grounding이 넘겨준 좌표는 여전히 반영돼야 한다 — 라인 판정과 무관하게 추가된다.
-    page = OcrPage(0, 100, 50, (_line("828"),))  # "828"은 PII로 안 잡힘(오독 흉내)
-    result = OcrResult(pages=(page,))
-    images = ["img0"]
-    grounded_boxes = [[(10, 20, 30, 40)]]
+# ── VLM 라인 재판독 병합(redact_pages, PIL 없이) ─────────────────
+def _detect_name(text: str) -> list[Span]:
+    """'홍길동'만 PII로 보는 검출기 대역 — 어느 라인이 가려지는지를 테스트가 통제한다."""
+    start = text.find("홍길동")
+    return [Span(start, start + 3, PiiLabel.NAME)] if start >= 0 else []
 
-    calls: list[tuple[set[int], tuple[object, ...]]] = []
 
-    def fake_redactor(
-        image: object, page: OcrPage, indices: set[int], extra_boxes: list[object]
-    ) -> str:
-        calls.append((indices, tuple(extra_boxes)))
+def _identity_redactor(image: object, page: OcrPage, indices: set[int]) -> object:
+    return image
+
+
+def _misread_name_page() -> OcrPage:
+    # 시각적 순서 = 검출 순서: 라벨(위) → 값(아래). surya가 이름을 "828"로 오독한 상황.
+    return OcrPage(
+        0,
+        100,
+        50,
+        (
+            _line("환자 성명", bbox=(0.0, 0.0, 40.0, 10.0)),
+            _line("828", bbox=(0.0, 20.0, 40.0, 30.0)),
+        ),
+    )
+
+
+def test_redact_pages_adds_reread_pii_line_that_surya_misread() -> None:
+    # Arrange: surya 텍스트로는 PII가 없지만 재판독 텍스트는 이름을 읽었다.
+    result = OcrResult(pages=(_misread_name_page(),))
+    calls: list[set[int]] = []
+
+    def redactor(image: object, page: OcrPage, indices: set[int]) -> str:
+        calls.append(set(indices))
         return "redacted"
 
-    masker = ImageMasker(detect=lambda _t: [], redactor=fake_redactor)
-    out = masker.redact_pages(images, result, grounded_boxes)
+    masker = ImageMasker(detect=_detect_name, redactor=redactor)
 
-    assert [page.image for page in out] == ["redacted"]
-    assert calls == [(set(), ((10, 20, 30, 40),))]
-    # 라인 PII는 없지만 grounding 박스로 가렸으므로 "가린 페이지"로 취급된다(검증 대상).
+    # Act
+    out = masker.redact_pages(["img0"], result, reread_texts=[[None, "홍길동"]])
+
+    # Assert: 그 라인이 검은블록 대상(line_indices)에 들어간다 — 5.1 커버리지가 이 값으로 잰다.
+    assert calls == [{1}]
+    assert out[0].image == "redacted"
+    assert out[0].line_indices == {1}
+    assert out[0].reread_indices == frozenset({1})
     assert out[0].redacted is True
-    assert out[0].extra_boxes == ((10, 20, 30, 40),)
 
 
-def test_redact_pages_raises_on_grounded_boxes_count_mismatch() -> None:
-    result = OcrResult(pages=(OcrPage(0, 100, 50, (_line("x"),)),))
+def test_redact_pages_reread_uses_page_context_for_split_label_and_value() -> None:
+    # Arrange: 실제 정규식 마스커. 라벨("환자 성명")과 값이 다른 라인이라, 재판독한 값 라인만
+    # 따로 검출하면 라벨이 없어 놓친다 — 텍스트만 바꾼 **페이지** 단위로 검출해야 잡힌다.
+    result = OcrResult(pages=(_misread_name_page(),))
+    masker = ImageMasker(detect=Masker(use_ner=False).detect, redactor=_identity_redactor)
 
-    masker = ImageMasker(detect=lambda _t: [], redactor=lambda i, _p, _idx, _boxes: i)
-    with pytest.raises(ValueError, match="grounded_boxes"):
-        masker.redact_pages(["a"], result, grounded_boxes=[[], []])
+    # Act
+    surya_only = masker.redact_pages(["img0"], result)
+    with_reread = masker.redact_pages(["img0"], result, reread_texts=[[None, "홍길동"]])
 
-
-# ── ground_pages (신뢰도 게이팅) ──────────────────────────────────
-async def test_ground_pages_skips_when_ground_not_provided() -> None:
-    result = OcrResult(pages=(OcrPage(0, 100, 50, (_line("x"),)),))
-    masker = ImageMasker(detect=lambda _t: [])  # ground 주입 안 함
-
-    out = await masker.ground_pages(["img0"], result)
-
-    assert out == [[]]
+    # Assert
+    assert surya_only[0].line_indices == set()
+    assert with_reread[0].line_indices == {1}
 
 
-async def test_ground_pages_skips_when_confidence_above_threshold() -> None:
-    line = _line("x")
-    page = OcrPage(0, 100, 50, (line,))
-    result = OcrResult(pages=(page,))  # 기본 confidence=1.0
+def test_redact_pages_reread_adds_to_surya_lines_instead_of_replacing() -> None:
+    # Arrange: surya가 이미 잡은 라인(0)은 재판독이 그 라인을 달리 읽어도 그대로 가린다(합집합).
+    page = OcrPage(
+        0,
+        100,
+        50,
+        (
+            _line("홍길동", bbox=(0.0, 0.0, 40.0, 10.0)),
+            _line("828", bbox=(0.0, 20.0, 40.0, 30.0)),
+        ),
+    )
+    result = OcrResult(pages=(page,))
+    masker = ImageMasker(detect=_detect_name, redactor=_identity_redactor)
 
-    called = False
+    # Act
+    out = masker.redact_pages(["img0"], result, reread_texts=[["흥길돔", "홍길동"]])
 
-    async def fake_ground(image: object) -> list[tuple[PiiLabel, tuple[int, int, int, int]]]:
-        nonlocal called
-        called = True
-        return [(PiiLabel.NAME, (0, 0, 1, 1))]
-
-    masker = ImageMasker(detect=lambda _t: [], ground=fake_ground, ground_confidence_threshold=0.90)
-    out = await masker.ground_pages(["img0"], result)
-
-    assert out == [[]]
-    assert called is False
+    # Assert
+    assert out[0].line_indices == {0, 1}
+    assert out[0].reread_indices == frozenset({1})  # 재판독으로만 찾은 라인
 
 
-async def test_ground_pages_calls_ground_when_confidence_low() -> None:
-    low_conf_line = OcrLine(
+def test_redact_pages_failed_reread_lines_keep_surya_text() -> None:
+    # Arrange: 재판독이 전부 실패(None) — 보탤 근거가 없을 뿐 surya 판정은 그대로다.
+    result = OcrResult(pages=(_misread_name_page(),))
+    calls: list[set[int]] = []
+
+    def redactor(image: object, page: OcrPage, indices: set[int]) -> str:
+        calls.append(set(indices))
+        return "redacted"
+
+    masker = ImageMasker(detect=_detect_name, redactor=redactor)
+
+    # Act
+    out = masker.redact_pages(["img0"], result, reread_texts=[[None, None]])
+
+    # Assert
+    assert out[0].line_indices == set()
+    assert out[0].redacted is False
+    assert out[0].image == "img0"  # 가릴 게 없으면 원본 그대로
+    assert calls == []
+
+
+def test_redact_pages_reread_respects_label_filter() -> None:
+    # Arrange: 소비자 프로파일(labels)은 재판독으로 찾은 라인에도 똑같이 걸린다(이름은 유지).
+    result = OcrResult(pages=(_misread_name_page(),))
+    masker = ImageMasker(detect=_detect_name, redactor=_identity_redactor, labels={PiiLabel.RRN})
+
+    # Act
+    out = masker.redact_pages(["img0"], result, reread_texts=[[None, "홍길동"]])
+
+    # Assert
+    assert out[0].line_indices == set()
+
+
+def test_redact_pages_raises_on_reread_page_count_mismatch() -> None:
+    result = OcrResult(pages=(_misread_name_page(),))
+    masker = ImageMasker(detect=_detect_name, redactor=_identity_redactor)
+
+    with pytest.raises(ValueError, match="reread_texts"):
+        masker.redact_pages(["img0"], result, reread_texts=[[None, None], [None]])
+
+
+def test_redact_pages_raises_on_reread_line_count_mismatch() -> None:
+    result = OcrResult(pages=(_misread_name_page(),))
+    masker = ImageMasker(detect=_detect_name, redactor=_identity_redactor)
+
+    with pytest.raises(ValueError, match="재판독 텍스트 수 불일치"):
+        masker.redact_pages(["img0"], result, reread_texts=[[None]])
+
+
+# ── reread_pages (신뢰도 게이팅) ──────────────────────────────────
+class _RecordingReread:
+    """``vlm_client.reread_lines`` 대역 — 받은 인자를 기록하고 고정 텍스트를 돌려준다."""
+
+    def __init__(self, texts: list[list[str | None]]) -> None:
+        self._texts = texts
+        self.calls: list[tuple[list[object], list[OcrPage]]] = []
+
+    async def __call__(
+        self, images: Sequence[object], pages: Sequence[OcrPage]
+    ) -> list[list[str | None]]:
+        self.calls.append((list(images), list(pages)))
+        return self._texts
+
+
+def _result_with_confidence(confidence: float) -> OcrResult:
+    line = OcrLine(
         text="828",
         bbox=(0.0, 0.0, 10.0, 5.0),
         polygon=((0.0, 0.0), (10.0, 0.0), (10.0, 5.0), (0.0, 5.0)),
-        confidence=0.5,
+        confidence=confidence,
     )
-    page = OcrPage(0, 100, 50, (low_conf_line,))
-    result = OcrResult(pages=(page,))
-    assert result.mean_confidence < 0.90
-
-    async def fake_ground(image: object) -> list[tuple[PiiLabel, tuple[int, int, int, int]]]:
-        return [(PiiLabel.NAME, (10, 20, 30, 40)), (PiiLabel.RRN, (50, 60, 70, 80))]
-
-    masker = ImageMasker(detect=lambda _t: [], ground=fake_ground, ground_confidence_threshold=0.90)
-    out = await masker.ground_pages(["img0"], result)
-
-    assert out == [[(10, 20, 30, 40), (50, 60, 70, 80)]]
+    return OcrResult(pages=(OcrPage(0, 100, 50, (line,)),))
 
 
-async def test_ground_pages_filters_by_labels() -> None:
-    low_conf_line = OcrLine(
-        text="828",
-        bbox=(0.0, 0.0, 10.0, 5.0),
-        polygon=((0.0, 0.0), (10.0, 0.0), (10.0, 5.0), (0.0, 5.0)),
-        confidence=0.5,
-    )
-    page = OcrPage(0, 100, 50, (low_conf_line,))
-    result = OcrResult(pages=(page,))
+async def test_reread_pages_skips_when_reread_not_provided() -> None:
+    masker = ImageMasker(detect=lambda _t: [])  # reread 주입 안 함
 
-    async def fake_ground(image: object) -> list[tuple[PiiLabel, tuple[int, int, int, int]]]:
-        return [(PiiLabel.NAME, (10, 20, 30, 40)), (PiiLabel.RRN, (50, 60, 70, 80))]
+    out = await masker.reread_pages(["img0"], _result_with_confidence(0.5))
 
-    masker = ImageMasker(
-        detect=lambda _t: [],
-        ground=fake_ground,
-        ground_confidence_threshold=0.90,
-        labels={PiiLabel.RRN},
-    )
-    out = await masker.ground_pages(["img0"], result)
+    assert out is None
 
-    assert out == [[(50, 60, 70, 80)]]  # NAME은 labels 필터에 안 걸려 제외
+
+async def test_reread_pages_skips_high_confidence_document() -> None:
+    # Arrange: 고신뢰 문서는 surya 검출로 충분하다고 본다 — VLM을 아예 부르지 않는다(비용).
+    reread = _RecordingReread([["x"]])
+    masker = ImageMasker(detect=lambda _t: [], reread=reread, reread_confidence_threshold=0.90)
+
+    # Act
+    out = await masker.reread_pages(["img0"], _result_with_confidence(0.95))
+
+    # Assert
+    assert out is None
+    assert reread.calls == []
+
+
+async def test_reread_pages_skips_document_exactly_at_threshold() -> None:
+    # Arrange: 쪽 전사 게이트(< 0.90)와 같은 경계 — 임계값과 같으면 시도하지 않는다.
+    reread = _RecordingReread([["x"]])
+    masker = ImageMasker(detect=lambda _t: [], reread=reread, reread_confidence_threshold=0.90)
+
+    # Act
+    out = await masker.reread_pages(["img0"], _result_with_confidence(0.90))
+
+    # Assert
+    assert out is None
+    assert reread.calls == []
+
+
+async def test_reread_pages_calls_reread_for_low_confidence_document() -> None:
+    # Arrange
+    reread = _RecordingReread([["홍길동"]])
+    result = _result_with_confidence(0.5)
+    masker = ImageMasker(detect=lambda _t: [], reread=reread, reread_confidence_threshold=0.90)
+
+    # Act
+    out = await masker.reread_pages(["img0"], result)
+
+    # Assert: 문서 전체(이미지·페이지)를 한 번에 넘긴다 — 우선순위·예산은 reread 쪽이 정한다.
+    assert out == [["홍길동"]]
+    assert reread.calls == [(["img0"], list(result.pages))]
+
+
+async def test_reread_pages_default_threshold_never_rereads() -> None:
+    # Arrange: 기본 임계값 0.0은 "항상 시도 안 함" — 켜려면 호출측이 임계값을 넘겨야 한다.
+    reread = _RecordingReread([["x"]])
+    masker = ImageMasker(detect=lambda _t: [], reread=reread)
+
+    # Act
+    out = await masker.reread_pages(["img0"], _result_with_confidence(0.5))
+
+    # Assert
+    assert out is None
+    assert reread.calls == []
+
+
+async def test_reread_pages_rejects_image_page_count_mismatch() -> None:
+    reread = _RecordingReread([["x"]])
+    masker = ImageMasker(detect=lambda _t: [], reread=reread, reread_confidence_threshold=0.90)
+
+    with pytest.raises(ValueError, match="수 불일치"):
+        await masker.reread_pages(["img0", "img1"], _result_with_confidence(0.5))

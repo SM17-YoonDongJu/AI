@@ -18,13 +18,15 @@ poison 메시지를 삭제하기 직전의 **마지막 기록 기회**이자, �
 """
 
 import asyncio
+import contextlib
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Any
 
 import pytest
 from structlog.testing import capture_logs
 
-from core.config import Settings
+from core.config import OCR_NON_VLM_RESERVE_SECONDS, OCR_VISIBILITY_SAFETY_MARGIN_SECONDS, Settings
 from core.contracts import OcrJob
 from ocr_worker import __main__ as ocr_main
 
@@ -179,6 +181,180 @@ def test_sweep_loop_is_wired_into_worker_startup() -> None:
     assert "_run_delete_sweep" in source  # 소비 루프와 병행해 띄운다
     assert "sweep_task.cancel()" in source  # 종료 시 정리
     assert "wait_for_pending_deletes" in source  # 기존 즉시 삭제 흡수도 유지
+
+
+# ── 기동·종료 배선(_run을 실제로 돌려 본다) ───────────────────────
+# 소스 문자열 검사로는 호출을 주석 처리해도 통과한다(QA W6). 자원 경계(db_pool·마이그레이션·
+# SQS·파이프라인·VLM 클라이언트 정리)를 페이크로 바꿔 _run을 끝까지 돌리고, 호출 순서를 본다.
+class _RunRecorder:
+    """``_run``이 거치는 경계를 페이크로 바꾸고 일어난 일을 순서대로 기록한다."""
+
+    def __init__(self, *, consumer_error: Exception | None = None) -> None:
+        self.events: list[str] = []
+        self._consumer_error = consumer_error
+
+    def install(self, monkeypatch: pytest.MonkeyPatch, settings: Settings | None = None) -> None:
+        recorder = self
+
+        @contextlib.asynccontextmanager
+        async def fake_db_pool(_settings: Settings) -> AsyncIterator[object]:
+            recorder.events.append("db_pool_open")
+            yield object()
+            recorder.events.append("db_pool_close")
+
+        async def fake_run_migrations(_pool: object, _directory: str) -> list[str]:
+            return []
+
+        class FakePipeline:
+            def __init__(self, **_kwargs: object) -> None:
+                pass
+
+            async def handle(self, job: OcrJob) -> None:
+                return None
+
+            async def sweep_pending_deletes(self, *, batch_size: int = 50) -> int:
+                return 0
+
+            async def wait_for_pending_deletes(self) -> None:
+                recorder.events.append("wait_for_pending_deletes")
+
+            async def advance_claim_progress(self, job: OcrJob) -> None:
+                return None
+
+        class FakeConsumer:
+            def __init__(self, **_kwargs: object) -> None:
+                pass
+
+            async def run(self) -> None:
+                await asyncio.sleep(0)
+                recorder.events.append("consumer_run")
+                if recorder._consumer_error is not None:
+                    raise recorder._consumer_error
+
+        async def fake_close_vlm_client() -> None:
+            recorder.events.append("close_vlm_client")
+
+        monkeypatch.setattr(ocr_main, "db_pool", fake_db_pool)
+        monkeypatch.setattr(ocr_main, "run_migrations", fake_run_migrations)
+        monkeypatch.setattr(ocr_main, "SqsProducer", lambda _settings: object())
+        monkeypatch.setattr(ocr_main, "OcrPipeline", FakePipeline)
+        monkeypatch.setattr(ocr_main, "SqsConsumer", FakeConsumer)
+        monkeypatch.setattr(ocr_main, "close_vlm_client", fake_close_vlm_client)
+        if settings is not None:
+            monkeypatch.setattr(ocr_main, "get_settings", lambda: settings)
+
+
+async def test_run_closes_vlm_client_after_consumer_stops(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Arrange
+    recorder = _RunRecorder()
+    recorder.install(monkeypatch, Settings(_env_file=None))
+
+    # Act
+    async with asyncio.timeout(_TIMEOUT_S):
+        await ocr_main._run()
+
+    # Assert: 소비 루프·삭제 흡수가 끝난 뒤, 풀을 닫기 전에 VLM 클라이언트를 닫는다.
+    assert recorder.events == [
+        "db_pool_open",
+        "consumer_run",
+        "wait_for_pending_deletes",
+        "close_vlm_client",
+        "db_pool_close",
+    ]
+
+
+async def test_run_closes_vlm_client_even_when_consumer_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Arrange: 소비 루프가 예외로 끝나도 finally 정리는 돌아야 한다.
+    recorder = _RunRecorder(consumer_error=RuntimeError("소비 루프 장애"))
+    recorder.install(monkeypatch, Settings(_env_file=None))
+
+    # Act
+    with pytest.raises(RuntimeError):
+        async with asyncio.timeout(_TIMEOUT_S):
+            await ocr_main._run()
+
+    # Assert
+    assert "close_vlm_client" in recorder.events
+
+
+# ── 기동 검사: VLM 예산이 SQS 가시성 안에 드는가(QA W5) ─────────────
+_BUDGET_ENV_NAMES = (
+    "VLM_PAGE_BUDGET_SECONDS",
+    "VLM_REREAD_BUDGET_SECONDS",
+    "SQS_VISIBILITY_TIMEOUT",
+)
+
+
+def test_vlm_time_budget_check_accepts_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Arrange: 기본값은 여유까지 넣어 가시성 안에 맞춰 뒀다(210 + 90 + 240 + 60 = 600).
+    for name in _BUDGET_ENV_NAMES:
+        monkeypatch.delenv(name, raising=False)
+    settings = Settings(_env_file=None)
+
+    # Act / Assert: 예외가 없어야 한다.
+    ocr_main._check_vlm_time_budget(settings)
+
+
+def test_vlm_time_budget_check_rejects_budget_over_visibility() -> None:
+    # Arrange: 배포 env로 쪽 예산을 1초만 올려도(211) 여유를 포함한 합이 가시성을 넘는다.
+    settings = Settings(
+        _env_file=None,
+        vlm_page_budget_seconds=211.0,
+        vlm_reread_budget_seconds=90.0,
+        sqs_visibility_timeout=600,
+    )
+
+    # Act / Assert
+    with pytest.raises(ValueError, match="sqs_visibility_timeout=600"):
+        ocr_main._check_vlm_time_budget(settings)
+
+
+def test_vlm_time_budget_check_counts_reserve_and_safety_margin() -> None:
+    # Arrange: 가시성을 늘리면 같은 예산도 통과한다 — VLM 외 몫과 여유는 config 상수 하나씩이다.
+    exact = 211 + 90 + OCR_NON_VLM_RESERVE_SECONDS + OCR_VISIBILITY_SAFETY_MARGIN_SECONDS
+    settings = Settings(
+        _env_file=None,
+        vlm_page_budget_seconds=211.0,
+        vlm_reread_budget_seconds=90.0,
+        sqs_visibility_timeout=int(exact),
+    )
+
+    # Act / Assert: 예외가 없어야 한다(합 = 가시성은 허용).
+    ocr_main._check_vlm_time_budget(settings)
+
+
+def test_vlm_time_budget_check_rejects_when_only_safety_margin_overflows() -> None:
+    # Arrange: 예산 + VLM 외 몫까지는 가시성 안이지만 여유를 더하면 넘는다 — 여유도 검사에 든다.
+    settings = Settings(
+        _env_file=None,
+        vlm_page_budget_seconds=210.0,
+        vlm_reread_budget_seconds=90.0,
+        sqs_visibility_timeout=int(210 + 90 + OCR_NON_VLM_RESERVE_SECONDS),
+    )
+
+    # Act / Assert
+    with pytest.raises(ValueError, match="safety_margin"):
+        ocr_main._check_vlm_time_budget(settings)
+
+
+async def test_run_refuses_to_start_before_acquiring_resources_when_budget_too_big(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Arrange
+    recorder = _RunRecorder()
+    recorder.install(
+        monkeypatch,
+        Settings(_env_file=None, vlm_reread_budget_seconds=500.0, sqs_visibility_timeout=600),
+    )
+
+    # Act
+    with pytest.raises(ValueError, match="SQS 가시성"):
+        await ocr_main._run()
+
+    # Assert: DB 풀조차 열지 않았다(자원을 잡기 전에 실패).
+    assert recorder.events == []
 
 
 def _run_source() -> str:

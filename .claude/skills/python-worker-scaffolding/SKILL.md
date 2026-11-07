@@ -24,7 +24,7 @@ description: 보험·법률 AI 엔진 Python 프로젝트의 토대를 세울 �
 
 ## 2. config — `src/core/config.py`
 - `pydantic-settings`의 `BaseSettings`. 모든 환경값을 한 곳에. `os.getenv` 산재 금지.
-- 그룹: SQS(큐 URL·`sqs_endpoint_url`·`sqs_max_receive_count`·`sqs_visibility_timeout` 등), DB(dsn·pool size), Ollama(base_url·임베딩/LLM 모델명·`num_ctx` — VLM 등 프롬프트가 커질 수 있는 호출은 명시적으로 지정), S3.
+- 그룹: SQS(큐 URL·`sqs_endpoint_url`·`sqs_max_receive_count`·`sqs_visibility_timeout` 등), DB(dsn·pool size), AI(LLM·임베딩 provider·base_url·모델명), VLM(vLLM OpenAI 호환 — `vlm_base_url`·`vlm_model`·`vlm_max_tokens`·타임아웃·단계 예산. 출력 잘림은 `finish_reason=length`로 감지해 버린다), S3.
 
 ## 3. contracts — `src/core/contracts.py` (가장 중요)
 Spring과의 인터페이스 계약. 전부 pydantic v2 `BaseModel`. 확정 즉시 팀에 공유한다.

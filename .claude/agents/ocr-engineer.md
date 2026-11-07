@@ -12,7 +12,7 @@ model: opus
 처리 흐름:
 1. `ocr-job-queue` SQS 메시지 소비(`sqs-worker-patterns` 따름)
 2. S3에서 파일 읽기 (GetObject)
-3. surya-ocr(로컬 GPU, PyTorch 기반) 텍스트 추출 + 표 등 저신뢰 구간은 VLM(Ollama) 하이브리드 보강
+3. surya-ocr(로컬 GPU, PyTorch 기반) 텍스트 추출 + 표 문서·저신뢰 문서는 VLM 하이브리드 보강 — VLM은 클러스터 vLLM의 PaddleOCR-VL-1.6(`PaddleOCR-VL-1.6-0.9B`, OpenAI 호환 `/v1/chat/completions`, 태스크 토큰 `"OCR:"`, K8s-manifests `charts/etl-vllm`). 좌표·신뢰도는 계속 surya 기준이고, 저신뢰 문서는 surya 라인 crop을 VLM으로 다시 읽어 이미지 마스킹을 보강한다(`ImageMasker.reread_pages`)
 4. 문서 유형 분류(진단서·보험증권·지급결과안내문·입퇴원확인서·진료비영수증·청구서·기타) — 본문 단서 우선, 단서가 불확실하고 자기 근거 없는 hint만 있을 때는 hint로 폴백(`classify.py`)
 5. 유형별 엔티티 추출(진단명 KCD 매핑·보험사명·상품명·지급금액)
 6. PII 마스킹(주민번호·계좌·전화) — 정규식 + NER. 마스킹 텍스트만 downstream으로. 텍스트뿐 아니라 **원본 이미지의 PII 영역도 bbox/polygon 기반으로 마스킹**한다
