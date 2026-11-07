@@ -18,6 +18,18 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # qwen3-embedding은 1024d이고, voyage-4-large는 요청의 output_dimension으로 1024를 맞춘다.
 DEFAULT_EMBEDDING_DIM = 1024
 
+# OCR 문서 1건의 SQS 가시성 중 VLM이 아닌 단계(S3·렌더·OCR 엔진·NER·재OCR 검증 5.2·DB·업로드)에
+# 남길 몫(초). 시작값이다 — 실측 근거가 없어, OCR 엔진(PP-OCRv5, CPU) 쪽당 시간을 잰 뒤 다시
+# 정한다. OCR과 5.2는 쪽 수에 비례하는데 이 값은 고정이라 쪽이 많은 문서는 넘을 수 있다(A4 한 쪽
+# OCR ≈ 18~23초, 2스레드·에뮬레이션 측정 — _workspace/20).
+OCR_NON_VLM_RESERVE_SECONDS = 240.0
+# 위 합에 더 얹는 안전 여유(초). VLM 예산이 끝난 뒤에도 정리 시간이 남고(형제 쪽 취소 대기·폴백 쪽
+# 마스킹·합성본 잔류 검사·crop 인코딩), VLM 외 몫도 아직 가정이라 여유 0으로 두지 않는다(QA W5).
+# VLM 두 단계 예산 + VLM 외 몫 + 이 여유가 sqs_visibility_timeout을 넘으면 ocr_worker가 기동을
+# 거부한다(ocr_worker.__main__의 기동 검사 — 배포 env로 예산을 올려도 조용히 넘어가지 않게).
+# 기본값: 210 + 90 + 240 + 60 = 600.
+OCR_VISIBILITY_SAFETY_MARGIN_SECONDS = 60.0
+
 # CD 스모크: shared(core) 변경으로 3개 서비스 배포 경로 검증(값·동작 무변경). 재트리거 6.
 # migrations/만 건드리는 변경은 ocr 필터(src/ocr_worker/**)엔 안 걸린다 — migrations/가
 # Dockerfile COPY로 이미지에 박히므로 재빌드 없인 옛 마이그레이션이 그대로 남는다.
@@ -116,6 +128,33 @@ class Settings(BaseSettings):
     corpus_demand_halflife_days: float = 7.0  # 수요 부스트 반감기(일)
     corpus_demand_boost_cap: float = 40.0  # 수요 부스트 상한
 
+    # --- OCR 엔진 — PaddleOCR(PP-OCRv5) CPU in-process, ocr_worker.ocr.PaddleOcrEngine ---
+    # 모델 이름은 PaddleX 공식 모델명이다. OCR 이미지는 기본 모델을 빌드 때 /opt/models에 넣어
+    # 두므로(Dockerfile) 이름을 바꾸면 그 모델이 이미지에 있어야 한다 — 없으면 첫 OCR에서 받으려다
+    # 외부 연결이 없으면 실패한다. 검출은 mobile(PP-OCRv5_mobile_det)도 넣어 두어 PoC로 바꿔 볼
+    # 수 있다.
+    # 검출 — 이미지 마스킹에서 검출 누락은 곧 노출이라 recall을 우선한다(공식 표: server Hmean
+    # 83.8 vs mobile 79.0, 모델 84MB vs 4.7MB, CPU 383ms vs 58ms).
+    ocr_det_model: str = "PP-OCRv5_server_det"
+    # 인식 — 한국어 전용 인식 모델은 mobile 하나뿐이다(한국어+영어+숫자, 공식 정확도 88.0%).
+    ocr_rec_model: str = "korean_PP-OCRv5_mobile_rec"
+    # 줄 방향 분류(뒤집힌 줄 crop을 바로 세워 인식). 줄 crop만 돌리므로 좌표엔 영향이 없다.
+    # 쪽 방향 분류·왜곡 보정은 좌표를 원본 쪽과 어긋나게 해 엔진이 항상 끈다(설정으로 두지 않는다).
+    ocr_textline_orientation: bool = True
+    # paddle 추론 스레드. 기본 10은 파드 CPU를 넘친다(OMP_NUM_THREADS와 맞춘다).
+    ocr_cpu_threads: int = Field(2, ge=1)
+    # x86 CPU 가속(oneDNN, 옛 이름 MKL-DNN). paddlepaddle 3.3.0·3.3.1은 oneDNN + PIR 실행기에서
+    # PP-OCRv5 검출이 NotImplementedError(ConvertPirAttribute2RuntimeAttribute)로 실패해(빌드
+    # 스모크 실측) pyproject에서 3.2.x로 묶었다. 끄는 건 마지막 수단이다 — 끄면 paddle 기본 CPU
+    # 커널로 돌아 A4 한 쪽(200DPI)에서 7.8GB VM이 OOM으로 죽었다(켜면 최대 RSS 3.7GB,
+    # _workspace/20).
+    ocr_enable_mkldnn: bool = True
+    # 저신뢰도 문서 판정 임계값. 문서 평균 라인 신뢰도가 이 값 미만이면 VLM 쪽 전사(표 문서가
+    # 아니어도), VLM 라인 재판독(이미지 마스킹 보강), "재확인 필요"(needs_reupload) 판정이 함께
+    # 켜진다. 0.90은 surya 시절 분포(클린 PDF 0.951+ vs 폰카 사진 0.861-, 표본 3건)로 정한 값이라
+    # PP-OCRv5 rec_score 분포에선 다시 맞춰야 한다 — PoC에서 env(OCR_LOW_CONFIDENCE_THRESHOLD)로.
+    ocr_low_confidence_threshold: float = Field(0.90, ge=0.0, le=1.0)
+
     # --- PII 마스킹 ---
     use_ner: bool = False  # NER 디텍터 활성 여부(false면 정규식만)
     # NER 모델(로컬 실행 — 외부 API로 PII 전송 금지). 이름(PS)만 사용.
@@ -154,24 +193,57 @@ class Settings(BaseSettings):
     embedding_dim: int = DEFAULT_EMBEDDING_DIM
     ai_timeout_seconds: float = 60.0  # httpx 요청 타임아웃(openai_compat 챗 + 모든 임베딩)
 
-    # --- VLM(Vision) 서빙 — Ollama 네이티브 /api/generate(OpenAI 호환 아님) ---
-    # 다중 항목 표 문서(지급결과서·청구서·입원확인서·진료비영수증)에서 surya 라인
-    # 순서가 표 구조를 못 살릴 때 보완하는 하이브리드 경로(ocr_worker.vlm_client) 전용.
-    vlm_base_url: str = "http://localhost:11434"  # ai_base_url과 별도(엔드포인트 형태 다름)
-    # 표 전사(텍스트만, 좌표 없음) — 팀 합의 모델. 실측: qwen3-vl:8b-instruct보다 텍스트
-    # 정확도·속도(~11초 vs ~15초) 모두 좋음.
-    vlm_model: str = "qwen3.6:35b-a3b"
-    # 이미지 마스킹 보강용 PII 위치 grounding(좌표 출력) 전용 — vlm_model과 별도 모델.
-    # 실측: qwen3.6:35b-a3b는 vision capability는 있지만 grounding 좌표가 실제 텍스트
-    # 위치에서 벗어남(이름 박스가 이름 글자를 완전히 빗나감) — qwen3-vl:8b-instruct는
-    # 같은 문서에서 정확했다. 좌표 정밀도가 안전(과소 마스킹 방지)에 직결돼 텍스트
-    # 전사보다 훨씬 보수적으로 골라야 하므로, 검증된 모델을 별도로 고정한다.
-    vlm_grounding_model: str = "qwen3-vl:8b-instruct"
-    vlm_timeout_seconds: float = 60.0  # 실측 평균 15초·최대 34초 — 여유 두고 60초
-    # ollama 기본 num_ctx는 페이지 이미지 토큰만으로 대부분 차 표 전사 응답이 문장
-    # 중간에서 조용히 잘렸다(실측: 지급결과서 응답이 "피" 한 글자에서 끊김 — 에러 없이
-    # 200 OK로 절단된 텍스트만 옴). 16384로 명시하니 4개 표 문서 전부 완전히 전사됐다.
-    vlm_num_ctx: int = 16384
+    # --- VLM(Vision) — 클러스터 vLLM(PaddleOCR-VL), OpenAI 호환 /v1/chat/completions ---
+    # ocr_worker.vlm_client 전용. 두 가지에 쓴다: 표 문서·저신뢰도 문서의 쪽 전사(OCR 엔진 라인
+    # 순서가 표 구조를 못 살릴 때)와, 저신뢰도 문서의 라인 재판독(이미지 마스킹 보강).
+    # 운영 서버는 K8s-manifests charts/etl-vllm(brbs-etl g4dn.xlarge T4, --max-model-len 8192)이고
+    # 같은 vLLM을 Policy-Chunker와 나눠 쓴다. 생성 속도 근거(둘 다 청커 운영 기록):
+    #   - PaddleOCR-VL-0.9B 실측: 토큰 간격 평균 0.028초(≈35.7 tok/s), prefill 평균 0.7초, 대기 0
+    #     (K8s-manifests charts/etl-chunker/values.yaml, 2026-11-03, 동시도 자동 조정 상한 16).
+    #   - 아래 시간 계산은 18.7 tok/s를 **보수적 하한**으로 쓴다. Paddle 전환 전(qwen3-vl 시절)
+    #     청커 실측이라(Policy-Chunker 87b6821, 2026-10-14) Paddle 실측의 약 절반 속도로 잡는다.
+    #   쪽 전체 입력은 모델이 ~1MP로 줄여 받아 ~1,273 토큰, 영역 crop 1회 1~3초.
+    #
+    # 최악 경로 — 문서 1건 처리가 SQS 가시성(sqs_visibility_timeout 600초, heartbeat 없음) 안에
+    # 끝나야 중복 처리가 없다. VLM 단계는 단건 타임아웃만으로는 상한이 안 선다(쪽·라인 수에 비례).
+    # 그래서 단계마다 예산을 두고, 예산을 넘긴 쪽은 OCR 엔진 결과로 폴백·남은 라인은 재판독을
+    # 건너뛴다:
+    #   쪽 전사      ≤ vlm_page_budget_seconds   210초 (단건은 connect 5 + read 180초에서 끊긴다)
+    #   라인 재판독  ≤ vlm_reread_budget_seconds  90초 (저신뢰도 문서만. 단건 connect 5 + read 30초)
+    #   VLM 합계     ≤ 300초 → 나머지는 OCR_NON_VLM_RESERVE_SECONDS(240초, S3·OCR 엔진·재OCR
+    #                검증(5.2)·DB·업로드 — 예산 밖이라 아직 실측 전)와 안전 여유 60초다.
+    # ocr_worker는 기동 시 이 합이 가시성을 넘으면 실패하고, tests/test_config.py가 기본값을
+    # 고정한다. 장기적으로는 처리 중 가시성 연장(heartbeat)이 필요하다 — 예산은 상한을 묶을 뿐
+    # 쪽 수에 비례하는 OCR 엔진·5.2 시간은 막지 못한다.
+    vlm_base_url: str = "http://localhost:8000"  # vLLM 기본 포트. k8s 같은 ns는 http://vllm:8000
+    # etl-vllm의 --served-model-name과 같아야 한다(다르면 404 → 매 호출 OCR 엔진 폴백). 이름에
+    # "paddleocr"가 있으면 태스크 토큰("OCR:")을, 아니면 한국어 지시문을 보낸다(vlm_client).
+    vlm_model: str = "PaddleOCR-VL-1.6-0.9B"
+    # 쪽 전사 출력 상한. 프롬프트(~1,300) + 출력이 max-model-len 8192를 넘지 않고, 3072 ÷ 18.7
+    # (보수적 하한) ≈ 164초가 쪽 1장의 최악이다(Paddle 실측 속도면 ≈ 87초). 상한에 닿은 응답
+    # (finish_reason=length)은 대개 반복 폭주라 버리고 OCR 엔진 결과로 폴백한다(청커 기록
+    # 2026-10-22: 운영 기준선 호출의 28%가 상한에서 잘렸고 그 모양이 PaddleOCR-VL 실험에서
+    # 재현됐다). 시작값.
+    vlm_max_tokens: int = 3072
+    vlm_timeout_seconds: float = 180.0  # 쪽 전사 읽기 타임아웃 ≥ 164초(위, 보수적) + 여유
+    # 접속 타임아웃은 짧게 따로 둔다 — brbs-etl은 stop/start 운영이라 서버가 없으면 읽기
+    # 타임아웃까지 기다리지 않고 곧바로 OCR 엔진 결과로 폴백해야 한다.
+    vlm_connect_timeout_seconds: float = 5.0
+    # 라인 재판독 출력 상한. 한 줄은 수십 토큰이면 충분하고, 반복 폭주를 128 ÷ 18.7(보수적 하한)
+    # ≈ 7초에서 끊는다(Paddle 실측 속도면 ≈ 4초). 모델 카드의 element-level 예시
+    # (max_new_tokens=512)보다 작은 건 영역이 아니라 한 줄이라서다.
+    vlm_reread_max_tokens: int = 128
+    vlm_reread_timeout_seconds: float = 30.0  # 라인 1건 읽기 타임아웃(vLLM 대기열 대기 포함)
+    # 문서 1건이 vLLM에 동시에 거는 요청 상한(쪽 전사·라인 재판독 공통). vLLM(T4 16GB 1장)을
+    # 청커와 나눠 쓰므로(청커는 /metrics의 대기열을 보고 물러난다) 작게 둔다. 워커는 메시지를
+    # 1건씩 처리하므로 프로세스 단위 상한이 곧 문서 단위 상한이다.
+    vlm_concurrency: int = Field(4, ge=1)
+    # 쪽 전사 단계 전체 상한(넘긴 쪽은 OCR 엔진 폴백). 단건 최악(connect 5 + read 180)이 들어가고,
+    # Paddle 실측 속도(35.7 tok/s)면 3,072토큰 ≈ 86초 + prefill이라 동시 4쪽이 한 바퀴에 끝난다.
+    vlm_page_budget_seconds: float = 210.0
+    # 라인 재판독 단계 전체 상한(남은 라인은 건너뜀 — 신뢰도 낮은 라인부터 읽는다). 한 줄 ≈ 1초
+    # (짧은 출력 + prefill 0.7초), 동시 4면 대략 300라인 — 저신뢰도 사진 1~3쪽은 들어간다.
+    vlm_reread_budget_seconds: float = 90.0
 
 
 @lru_cache

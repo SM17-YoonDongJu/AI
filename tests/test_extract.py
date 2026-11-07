@@ -179,7 +179,7 @@ def test_hospitalization_cert_extracts_days_from_direct_label() -> None:
 
 def test_hospitalization_cert_extracts_days_from_vlm_markdown_table_row() -> None:
     # Arrange — VLM 마크다운 표 형식("| 입원일수 | 6일 |"). 실측 확인된 실패 케이스 —
-    # surya가 저신뢰도 문서에서 라벨 자체를 오독해(예: "일본일수") VLM이 개입했는데,
+    # OCR 엔진이 저신뢰도 문서에서 라벨 자체를 오독해(예: "일본일수") VLM이 개입했는데,
     # VLM이 정확히 읽은 값도 이전 정규식은 "|"를 못 건너뛰어 놓치고 있었다.
     text = "| 입원일시 | 2026년 07월 29일 14시 20분 |\n| 입원일수 | 6일 |"
     # Act

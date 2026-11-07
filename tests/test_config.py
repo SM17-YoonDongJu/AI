@@ -3,7 +3,13 @@
 import pytest
 from pydantic import ValidationError
 
-from core.config import DEFAULT_EMBEDDING_DIM, Settings, get_settings
+from core.config import (
+    DEFAULT_EMBEDDING_DIM,
+    OCR_NON_VLM_RESERVE_SECONDS,
+    OCR_VISIBILITY_SAFETY_MARGIN_SECONDS,
+    Settings,
+    get_settings,
+)
 
 
 def test_embedding_dim_default_is_contract_value() -> None:
@@ -123,6 +129,67 @@ def test_ai_provider_rejects_unknown_value(
 ) -> None:
     # Arrange: 오타 provider로 조용히 기본 경로에 떨어지지 않고 기동 시점에 실패해야 한다
     monkeypatch.setenv(env_name, value)
+
+    # Act / Assert
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+
+# ── VLM(클러스터 vLLM) 최악 경로 ──────────────────────────────────
+# 시간 계산에 쓰는 생성 속도의 **보수적 하한**(토큰/초). Paddle 전환 전(qwen3-vl 시절) 청커
+# 실측(Policy-Chunker 87b6821)이다 — PaddleOCR-VL-0.9B 운영 실측은 토큰 간격 0.028초(≈35.7
+# tok/s, K8s-manifests charts/etl-chunker/values.yaml)라 이 하한으로 잡으면 안전 쪽이다.
+_CONSERVATIVE_DECODE_TOKENS_PER_S = 18.7
+_VLM_ENV_NAMES = (
+    "VLM_MAX_TOKENS",
+    "VLM_TIMEOUT_SECONDS",
+    "VLM_CONNECT_TIMEOUT_SECONDS",
+    "VLM_REREAD_MAX_TOKENS",
+    "VLM_REREAD_TIMEOUT_SECONDS",
+    "VLM_PAGE_BUDGET_SECONDS",
+    "VLM_REREAD_BUDGET_SECONDS",
+    "SQS_VISIBILITY_TIMEOUT",
+)
+
+
+def test_vlm_defaults_fit_worst_case_in_sqs_visibility(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Arrange: heartbeat가 없어 문서 1건이 가시성(600초) 안에 끝나야 중복 처리가 없다(config 주석).
+    # 기본값 계약이라 개발자 env를 격리한다.
+    for name in _VLM_ENV_NAMES:
+        monkeypatch.delenv(name, raising=False)
+
+    # Act
+    cfg = Settings(_env_file=None)
+
+    # Assert: 단건 상한은 각 단계 예산 안에, 두 단계 예산의 합은 가시성 안에(나머지 단계 몫을
+    # 빼고 — 기동 검사 ocr_worker.__main__._check_vlm_time_budget와 같은 상수).
+    assert cfg.vlm_max_tokens / _CONSERVATIVE_DECODE_TOKENS_PER_S <= cfg.vlm_timeout_seconds
+    assert (
+        cfg.vlm_reread_max_tokens / _CONSERVATIVE_DECODE_TOKENS_PER_S
+        <= cfg.vlm_reread_timeout_seconds
+    )
+    assert cfg.vlm_connect_timeout_seconds + cfg.vlm_timeout_seconds <= cfg.vlm_page_budget_seconds
+    assert (
+        cfg.vlm_connect_timeout_seconds + cfg.vlm_reread_timeout_seconds
+        <= cfg.vlm_reread_budget_seconds
+    )
+    assert (
+        cfg.vlm_page_budget_seconds
+        + cfg.vlm_reread_budget_seconds
+        + OCR_NON_VLM_RESERVE_SECONDS
+        + OCR_VISIBILITY_SAFETY_MARGIN_SECONDS
+        <= cfg.sqs_visibility_timeout
+    )
+
+
+def test_vlm_budget_keeps_a_nonzero_safety_margin() -> None:
+    # Assert: 예산이 끝난 뒤의 정리 시간·VLM 외 몫(실측 전 가정)을 위해 여유를 0으로 두지 않는다.
+    assert OCR_VISIBILITY_SAFETY_MARGIN_SECONDS > 0
+
+
+def test_vlm_concurrency_must_be_positive(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Arrange: 0이면 세마포어가 영원히 안 열려 VLM 단계가 예산 끝까지 멎는다 — 기동 시점에 거른다.
+    monkeypatch.setenv("VLM_CONCURRENCY", "0")
 
     # Act / Assert
     with pytest.raises(ValidationError):

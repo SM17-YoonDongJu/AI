@@ -25,7 +25,12 @@ from collections.abc import Awaitable, Callable
 
 import asyncpg
 
-from core.config import Settings, get_settings
+from core.config import (
+    OCR_NON_VLM_RESERVE_SECONDS,
+    OCR_VISIBILITY_SAFETY_MARGIN_SECONDS,
+    Settings,
+    get_settings,
+)
 from core.contracts import OcrJob
 from core.db import db_pool, run_migrations
 from core.logging import configure_logging, get_logger
@@ -33,6 +38,7 @@ from core.sqs.consumer import SqsConsumer
 from core.sqs.producer import SqsProducer
 from ocr_worker.pipeline import OcrPipeline
 from ocr_worker.repository import mark_failure_terminal
+from ocr_worker.vlm_client import close_client as close_vlm_client
 
 logger = get_logger(__name__)
 
@@ -51,9 +57,40 @@ _MIGRATIONS_DIR = "migrations/ai"
 _SHUTDOWN_DELETE_TIMEOUT_S = 5.0
 
 
+def _check_vlm_time_budget(settings: Settings) -> None:
+    """VLM 단계 예산 + VLM 외 단계 몫 + 안전 여유가 SQS 가시성 안에 드는지 확인한다(기동 검사).
+
+    heartbeat(가시성 연장)가 없어 문서 1건 처리가 ``sqs_visibility_timeout``을 넘기면 같은
+    메시지가 다시 보여 중복 처리된다. 기본값은 이 상한에 맞춰 뒀지만(config VLM 섹션), 배포
+    env로 예산을 올리면 런타임엔 아무 신호가 없다 — 그래서 자원을 잡기 전에 실패시킨다.
+
+    ``Settings`` 검증기가 아니라 여기 두는 이유: ``Settings``는 전 워커 공용이라 OCR 전용
+    제약을 검증기로 걸면 VLM을 쓰지 않는 워커(report 등)의 기동까지 그 값에 묶인다.
+
+    Raises:
+        ValueError: 합이 ``sqs_visibility_timeout``을 넘을 때(값은 숫자만 싣는다).
+    """
+    required = (
+        settings.vlm_page_budget_seconds
+        + settings.vlm_reread_budget_seconds
+        + OCR_NON_VLM_RESERVE_SECONDS
+        + OCR_VISIBILITY_SAFETY_MARGIN_SECONDS
+    )
+    if required > settings.sqs_visibility_timeout:
+        raise ValueError(
+            "VLM 단계 예산이 SQS 가시성을 넘는다: "
+            f"page_budget={settings.vlm_page_budget_seconds} "
+            f"reread_budget={settings.vlm_reread_budget_seconds} "
+            f"non_vlm_reserve={OCR_NON_VLM_RESERVE_SECONDS} "
+            f"safety_margin={OCR_VISIBILITY_SAFETY_MARGIN_SECONDS} "
+            f"> sqs_visibility_timeout={settings.sqs_visibility_timeout}"
+        )
+
+
 async def _run() -> None:
     """자원을 배선하고 소비 루프를 돈다(종료 신호까지)."""
     settings = get_settings()
+    _check_vlm_time_budget(settings)  # 자원을 잡기 전에 — 잘못된 예산이면 기동 자체를 거부한다
     async with db_pool(settings) as pool:
         applied = await run_migrations(pool, _MIGRATIONS_DIR)
         logger.info("migrations applied", files=applied)
@@ -68,7 +105,12 @@ async def _run() -> None:
             settings=settings,
             on_poison=_poison_journal(pool, pipeline),
         )
-        logger.info("ocr worker starting", queue_url=settings.sqs_ocr_job_queue_url)
+        # git_commit: 이미지 빌드 커밋(Dockerfile ARG → ENV). 새 이미지가 실제로 떴는지 확인한다.
+        logger.info(
+            "ocr worker starting",
+            queue_url=settings.sqs_ocr_job_queue_url,
+            git_commit=settings.git_commit,
+        )
         # 소비와 병행해 도는 outbox 스윕. 소비 루프와 독립적이라 gather로 묶지 않고
         # 별도 task로 띄운다 — 스윕이 죽어도 소비는 계속돼야 하고, 반대도 마찬가지다
         # (스윕 정리는 아래 finally가 맡는다).
@@ -96,6 +138,9 @@ async def _run() -> None:
             with contextlib.suppress(TimeoutError):
                 async with asyncio.timeout(_SHUTDOWN_DELETE_TIMEOUT_S):
                     await pipeline.wait_for_pending_deletes()
+            # VLM 공유 httpx 클라이언트(연결 풀)를 닫는다 — 소비 루프가 멈춘 뒤라 진행 중인
+            # VLM 호출이 없다.
+            await close_vlm_client()
 
 
 def _poison_journal(

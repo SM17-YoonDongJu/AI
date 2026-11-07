@@ -37,7 +37,7 @@ Closes #[이슈 번호 - 모르면 XXX로 표시]
 변경 내용 설명. 필요하면 before/after 코드 예시 포함.
 
 #### 세부 항목
-- `모듈/클래스/엔드포인트명` → 역할 설명 (예: `OcrWorker` → ocr-job-queue(SQS) 소비·surya-ocr 처리)
+- `모듈/클래스/엔드포인트명` → 역할 설명 (예: `OcrWorker` → ocr-job-queue(SQS) 소비·PaddleOCR 처리)
 
 <br/>
 

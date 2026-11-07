@@ -4,8 +4,9 @@
 - **이름(PS)만 NER로 잡는다.** 주소(LC)는 NER 출력이 noisy(precision 0.22)라
   정규식(``ADDRESS_RE``)이 담당 — 여기서는 LC를 쓰지 않는다.
 - **확정 모델**: ``Leo97/KoELECTRA-small-v3-modu-ner`` (small·CPU·~0.067s/샘플,
-  의료용어 오탐 0). 같은 OCR 워커에서 torch **CPU**로 in-process 실행 — OCR(surya)도
-  PyTorch라 프레임워크가 통일되며, NER은 가벼워 CPU로 두고 GPU는 OCR 전용(노션 §6 A안).
+  의료용어 오탐 0). 같은 OCR 워커에서 torch **CPU**로 in-process 실행한다. OCR 엔진
+  (PaddleOCR)도 CPU라 한 프로세스에 paddle과 torch가 함께 올라간다 — 둘의 OpenMP 런타임이
+  부딪치지 않는지는 OCR 이미지 빌드 스모크(``ocr_worker.build_check``)가 확인한다.
 - **로컬 실행 필수**: PII를 외부 API로 보내면 위반(CODE_CONVENTIONS §13).
 
 ``transformers``/``torch``는 ``ner`` extra라 무겁다 → 모듈 import가 아니라 첫
@@ -42,6 +43,10 @@ class NerDetector:
         # NER은 경량이라 직렬화 비용은 무시 가능(병목은 OCR).
         self._lock = threading.Lock()
 
+    def load(self) -> None:
+        """모델을 지금 로드한다(이미지 빌드 시 모델 프리페치용 — 평소엔 첫 ``detect``가 한다)."""
+        self._ensure_pipeline()
+
     def _ensure_pipeline(self) -> Any:
         """transformers 파이프라인을 1회 lazy 로드한다(CPU 강제, 스레드 안전).
 
@@ -58,7 +63,7 @@ class NerDetector:
                         model=self._model_name,
                         tokenizer=self._model_name,
                         aggregation_strategy="simple",
-                        device=-1,  # CPU 강제 — 모델 경량, GPU는 OCR(surya) 전용
+                        device=-1,  # CPU 강제 — 모델 경량(OCR 엔진도 CPU)
                     )
         return self._pipeline
 

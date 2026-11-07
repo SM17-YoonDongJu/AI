@@ -1,7 +1,7 @@
 # Corpus Worker — 약관 Notion→S3 스테이징(GPU 불필요·경량).
 # build context = 레포 루트:  docker build -f src/corpus_worker/Dockerfile -t corpus-worker .
 #
-# OCR 워커와 달리 CUDA/torch/surya가 없다 — 순수 파이썬(httpx·asyncpg·boto3).
+# OCR 워커와 달리 OCR 엔진(paddle)·torch가 없다 — 순수 파이썬(httpx·asyncpg·boto3).
 FROM python:3.12-slim AS base
 ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1
 
@@ -17,7 +17,7 @@ ENV UV_PROJECT_ENVIRONMENT=/app/.venv \
     PYTHONPATH=/app/src \
     PATH="/app/.venv/bin:$PATH"
 
-# 의존성만 설치(프로젝트는 PYTHONPATH로 실행). base + corpus(boto3), torch/surya 제외.
+# 의존성만 설치(프로젝트는 PYTHONPATH로 실행). base + corpus(boto3), paddle/torch 제외.
 COPY pyproject.toml uv.lock* ./
 RUN uv sync --no-dev --extra corpus
 

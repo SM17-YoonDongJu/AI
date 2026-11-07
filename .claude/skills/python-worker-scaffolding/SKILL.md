@@ -17,14 +17,14 @@ description: 보험·법률 AI 엔진 Python 프로젝트의 토대를 세울 �
 - `src/` 레이아웃(워커중심): `src/core`, `src/rag`, `src/guardrail`, `src/ocr_worker`, `src/report_worker`, `tests/`. 워커 진입점은 각 패키지의 `__main__.py`.
 - 의존성 **그룹 분리** — 워커별 슬림 배포를 위해:
   - 기본: pydantic, pydantic-settings, asyncpg, httpx(ai_client), structlog
-  - `ocr`(optional): surya-ocr, transformers, pillow, boto3(S3·SQS)
+  - `ocr`(optional): paddleocr·paddlepaddle(CPU), NER용 CPU torch·transformers, pymupdf, pillow, boto3(S3·SQS)
   - `report`(optional): langgraph, langchain-core, boto3(SQS)
   - `dev`: ruff, pytest, pytest-asyncio
 - `ruff.toml`: line-length 100, target py312, isort 활성.
 
 ## 2. config — `src/core/config.py`
 - `pydantic-settings`의 `BaseSettings`. 모든 환경값을 한 곳에. `os.getenv` 산재 금지.
-- 그룹: SQS(큐 URL·`sqs_endpoint_url`·`sqs_max_receive_count`·`sqs_visibility_timeout` 등), DB(dsn·pool size), Ollama(base_url·임베딩/LLM 모델명·`num_ctx` — VLM 등 프롬프트가 커질 수 있는 호출은 명시적으로 지정), S3.
+- 그룹: SQS(큐 URL·`sqs_endpoint_url`·`sqs_max_receive_count`·`sqs_visibility_timeout` 등), DB(dsn·pool size), AI(LLM·임베딩 provider·base_url·모델명), VLM(vLLM OpenAI 호환 — `vlm_base_url`·`vlm_model`·`vlm_max_tokens`·타임아웃·단계 예산. 출력 잘림은 `finish_reason=length`로 감지해 버린다), S3.
 
 ## 3. contracts — `src/core/contracts.py` (가장 중요)
 Spring과의 인터페이스 계약. 전부 pydantic v2 `BaseModel`. 확정 즉시 팀에 공유한다.

@@ -94,7 +94,7 @@ LLM Judge는 **리포트 전용**이다. 결과는 `judge_failures`로 돌려줄
 
 ### 배포 결합
 
-- `mask_pii`는 import 시점에 `ocr_worker.masking` 패키지 전체(`image_masker`→`ocr_worker.ocr`→`ocr_worker.storage`, `image_verify`, `verify` 등)를 불러온다. 지금 이 체인은 최상위에서 표준 라이브러리와 `core`만 import한다. surya·PIL·pymupdf·numpy·transformers·boto3는 함수 안에서 lazy import한다. 그래서 report 이미지에서 동작한다. report extra만 설치한 venv에서 import·호출·`report_worker.graph`/`worker` import를 확인했다. `test_mask_pii_imports_and_runs_without_report_absent_packages`는 하위 프로세스에서 PIL·torch·transformers·surya·fitz·cv2·sentence_transformers import를 막고 같은 호출을 돌린다. 체인에 이 중 하나가 최상위 import로 들어오면 이 테스트가 깨진다.
+- `mask_pii`는 import 시점에 `ocr_worker.masking` 패키지 전체(`image_masker`→`ocr_worker.ocr`→`ocr_worker.storage`, `image_verify`, `verify` 등)를 불러온다. 지금 이 체인은 최상위에서 표준 라이브러리와 `core`만 import한다. OCR 엔진(paddleocr)·PIL·pymupdf·numpy·transformers·boto3는 함수 안에서 lazy import한다. 그래서 report 이미지에서 동작한다. report extra만 설치한 venv에서 import·호출·`report_worker.graph`/`worker` import를 확인했다. `test_mask_pii_imports_and_runs_without_report_absent_packages`는 하위 프로세스에서 PIL·torch·transformers·paddle·paddleocr·paddlex·fitz·cv2·sentence_transformers(옛 엔진 surya 포함) import를 막고 같은 호출을 돌린다. 체인에 이 중 하나가 최상위 import로 들어오면 이 테스트가 깨진다.
 - report Dockerfile은 `COPY src ./src`로 `src/ocr_worker/`까지 이미지에 넣는다. 복사 범위를 report 관련 패키지로 좁히면 `import guardrail`부터 실패한다.
 - CI 배포 필터(`.github/workflows/deploy.yml`)의 `report`는 `src/report_worker/**`·`src/rag/**`·`src/guardrail/**`만 본다. `src/ocr_worker/masking/**`만 바뀌면 OCR만 재배포된다. 그러면 운영의 두 워커가 다른 규칙으로 돈다. report 필터에 `src/ocr_worker/masking/**`(그리고 import 체인의 `src/ocr_worker/{__init__,ocr,storage}.py`)를 넣는 후속 작업이 필요하다.
 

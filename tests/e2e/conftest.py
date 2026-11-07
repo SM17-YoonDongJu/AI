@@ -1,7 +1,7 @@
 """e2e 통합 테스트 공용 픽스처 (이슈 #20).
 
 실 SQS(LocalStack)·PostgreSQL(pgvector)에 붙어 OCR 워커의 소비→저장→발행 경로를 **끝에서
-끝까지** 검증한다. GPU(surya)와 S3만 페이크로 주입하고, SQS 컨슈머·프로듀서·ack(DeleteMessage)·
+끝까지** 검증한다. OCR 엔진과 S3만 페이크로 주입하고, SQS 컨슈머·프로듀서·ack(DeleteMessage)·
 poison 스킵·마이그레이션·``ocr_results`` 업서트는 전부 진짜를 쓴다.
 
 기동: ``docker compose up -d`` (LocalStack SQS localhost:4566 · postgres localhost:5432).
