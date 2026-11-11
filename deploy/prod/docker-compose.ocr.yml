@@ -28,7 +28,9 @@ services:
     environment:
       ENV: ${ENV:?set ENV=prod in .env.ocr}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      # brbs_prod DB의 ai_owner_prod 롤(deploy/schema_split.sql을 prod 롤 이름으로 실행한 뒤).
+      # 로그의 service 필드. 비우면 코드 기본값(ai-engine)이 찍혀 dev(ocr-worker)와 이름이 달라진다.
+      SERVICE_NAME: ocr-worker
+      # brbs_prod DB의 ai_owner_prod 롤(롤·서비스 간 권한은 deploy/schema_split.prod.sql).
       # 롤은 RDS 인스턴스 단위라 dev 롤(ai_owner)을 쓰면 dev 자격증명으로 prod를 건드리게 된다.
       DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env.ocr}
       # RDS는 SSL 연결만 허용(pg_hba). 비우면 core.db가 SSL을 꺼(평문) "no encryption"으로 거부된다.
