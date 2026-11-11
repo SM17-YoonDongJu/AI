@@ -1,0 +1,50 @@
+#
+# 배포(prod)는 docker-compose로 앱 서비스를 띄우되, 다음은 AWS 관리형을 사용한다:
+#   - SQS       → AWS SQS (로컬은 LocalStack)
+
+services:
+
+  # LocalStack — 로컬 SQS(ocr-job-queue·report-job 큐). prod은 AWS SQS.
+  # 워커는 boto3 endpoint_url로 접속한다: 호스트 실행 시 http://localhost:4566,
+  # compose 내부 실행 시 http://localstack:4566. 자격증명은 더미(test/test — .env.example 참고).
+  # 큐는 ready.d 훅(./localstack/ready.d)이 기동 시 생성한다. e2e 테스트는 자체 유니크
+  # 큐를 만들므로 이 훅과 무관하다.
+  localstack:
+    image: localstack/localstack:3
+    ports:
+      - "4566:4566"
+    environment:
+      SERVICES: sqs
+      DEBUG: "0"
+    volumes:
+      - localstack:/var/lib/localstack
+      - ./localstack/ready.d:/etc/localstack/init/ready.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:4566/_localstack/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # PostgreSQL — ocr_results·RAG 등 공용 DB (prod은 AWS RDS).
+  # pgvector 이미지 사용 — core.db 풀이 커넥션마다 vector 타입을 등록하므로 확장이 필요하다
+  # (migrations/000_extensions.sql이 CREATE EXTENSION 수행). 기본 접속정보는 config의
+  # database_url 기본값(postgres/postgres@localhost:5432/ai_engine)과 일치시킨다.
+  postgres:
+    image: pgvector/pgvector:pg16
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ai_engine
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ai_engine"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  localstack:
+  pgdata:

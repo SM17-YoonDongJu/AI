@@ -1,0 +1,40 @@
+# 후유장해분류표 적재 매니페스트 (예시)
+#
+# load_schedule.py 가 이 파일을 읽어 버전별 원문 마크다운을 청킹·임베딩해 schedule_chunks 에
+# 적재한다. 각 version 은 개정판 하나에 대응하며, applies_from~applies_to 로 적용기간을 정의한다.
+#   - applies_to: null  → 현행판 (검색 시 contract_date=None 이면 이 판만 조회)
+#   - files: "## 신체부위" 헤더로 절을 나눈 마크다운. 헤더 아래 표(마크다운 테이블)를 담는다.
+#
+# 실행:
+#   python tempVectorDB/load_schedule.py --manifest tempVectorDB/schedule_manifest.yaml
+#   (경로 생략 시 이 example 파일을 읽는다 — 스모크용)
+#
+# 파일 경로는 매니페스트 파일 위치 기준 상대경로 또는 절대경로.
+
+versions:
+  - version_label: "2018.4 개정"          # 2018.4 대개정판 (현행)
+    applies_from: "2018-04-01"
+    applies_to: null                       # 현행판
+    source_url: "https://www.fss.or.kr/fss/bbs/B0000188/list.do"
+    files:
+      - "schedule/2018_04/disability_schedule.md"
+
+  - version_label: "2005 표준약관"         # 2005~2018.3 적용판
+    applies_from: "2005-04-01"
+    applies_to: "2018-04-01"               # exclusive — 2018-04-01 부터는 위 개정판
+    source_url: "https://www.fss.or.kr/fss/bbs/B0000188/list.do"
+    files:
+      - "schedule/2005/disability_schedule.md"
+
+# 원문 마크다운 예시 (files 가 가리키는 파일 형식):
+#
+#   ## 눈
+#   | 장해등급 | 지급률 | 내용 |
+#   |---------|-------|------|
+#   | 1 | 100% | 두 눈이 멀었을 때 |
+#   | 2 | 50%  | 한 눈이 멀었을 때 |
+#
+#   ## 귀
+#   | 장해등급 | 지급률 | 내용 |
+#   |---------|-------|------|
+#   | 1 | 80% | 두 귀의 청력을 완전히 잃었을 때 |

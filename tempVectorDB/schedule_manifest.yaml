@@ -1,0 +1,36 @@
+# 후유장해분류표(부표3) 적재 매니페스트 — 금감원 보험업감독업무시행세칙 별표15
+#
+# load_schedule.py 가 읽어 버전별 원문 마크다운을 청킹·임베딩해 schedule_chunks 에 적재한다.
+# 각 version 은 부표3 '실질 개정판'(항목·지급률 표 기준)에 대응하며 applies_from~applies_to 로
+# 적용기간을 정의한다. applies_to 는 exclusive(그 날짜부터는 다음 판).
+#
+# 버전 확정(3벌) — dedup 근거는 schedule_data/VERIFICATION.md 참조:
+#   - 2005 계열(pre2018): 2018.3.2 개정 직전판.
+#   - 2018.4 개정: 2018.3.2 대개정판. 2019.12.20 개정은 표(항목·지급률) 무변경(판정기준 문구만
+#     「장애등급판정기준」→「장애정도판정기준」)이라 합본 — 표 기준 동일하므로 구간만 확장.
+#   - 2025.6 개정(현행): 2025.6.30 개정. 표·판정기준의 '간질'→'뇌전증' 명칭 개정만 반영,
+#     지급률 값 변경 없음(신경계·정신행동 11~13 항목 70/40/10 그대로).
+#
+# source_url: law.go.kr 세칙 본문(별표15). 실제 다운로드 원본은 schedule_data/raw/ 참조.
+
+versions:
+  - version_label: "2005 계열 (2018.3.2 개정 직전)"
+    applies_from: "2005-04-01"
+    applies_to: "2018-04-01"          # exclusive
+    source_url: "https://www.law.go.kr/LSW/admRulLsInfoP.do?admRulSeq=&chrClsCd=010202#AJAX"
+    files:
+      - "schedule/2005/disability_schedule.md"
+
+  - version_label: "2018.4 개정 (2018.3.2 개정, 2019.12.20 판정기준 개정 합본)"
+    applies_from: "2018-04-01"
+    applies_to: "2025-06-30"          # 다음 실질(명칭) 개정 시행일 — 확인 필요(TODO)
+    source_url: "https://www.law.go.kr/LSW/admRulLsInfoP.do?admRulSeq=&chrClsCd=010202#AJAX"
+    files:
+      - "schedule/2018_04/disability_schedule.md"
+
+  - version_label: "2025.6 개정 (현행, 간질→뇌전증 명칭 개정)"
+    applies_from: "2025-06-30"        # 개정일 기준 — 정확한 시행일 확인 필요(TODO)
+    applies_to: null                  # 현행판
+    source_url: "https://www.law.go.kr/LSW/admRulLsInfoP.do?admRulSeq=&chrClsCd=010202#AJAX"
+    files:
+      - "schedule/2025_06/disability_schedule.md"

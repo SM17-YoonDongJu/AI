@@ -1,0 +1,276 @@
+"""OCR 워커 진입점 (이슈 #15) — ``python -m ocr_worker``.
+
+얇은 부트스트랩만 담당한다: 로깅 구성 → DB 풀 생성 → 마이그레이션 적용 → SQS
+프로듀서 준비 → 파이프라인 배선 → ``ocr-job-queue`` 큐 소비 루프. 처리 로직은
+``pipeline.py``, 소비·ack(DeleteMessage)·poison 스킵·우아한 종료는 ``core.sqs.consumer``가 맡는다.
+
+수명 순서(진입 시 자원 확보, 종료 시 역순 정리):
+  db_pool → run_migrations → SqsProducer(ReportJob 발행) → 삭제 스윕 task +
+  SqsConsumer.run()
+``SqsConsumer``는 롱폴링으로 소비하고 SIGTERM/SIGINT에 우아하게 멈춘다(DLQ 미도입 —
+실패=삭제 안 함으로 재전달, poison은 수신 횟수 상한으로 스킵). 스킵 직전에는
+``_poison_journal`` 훅이 ``ai.ocr_job_failures``에 확정 실패를 남기고, 그 문서를 청구
+종결 카운트에도 반영한다 — 걷어내기가 "조용한 유실"이 되지 않게 하는 마지막 기록
+지점이자, 걷힌 문서 때문에 청구 fan-in이 영영 멈추지 않게 하는 지점이다.
+소비 루프와 **병행해** 원본 삭제 outbox 스윕(``_run_delete_sweep``)을 주기적으로 돈다 —
+즉시 삭제가 실패했거나 그 전에 crash가 나 ``pending``으로 남은 원본을 재시도한다.
+소비 루프가 멈춘 뒤에는 스윕 task를 정리하고, 파이프라인이 백그라운드로 돌리는 S3 원본
+삭제 task를 짧게 흡수한다 — 자세한 근거는 ``_SHUTDOWN_DELETE_TIMEOUT_S`` 참고.
+로컬 PG·RDS에 같은 ``migrations/*.sql``을 적용해 스키마 드리프트를 차단한다(#19).
+"""
+
+import asyncio
+import contextlib
+import ctypes
+import gc
+from collections.abc import Awaitable, Callable
+
+import asyncpg
+
+from core.config import (
+    OCR_NON_VLM_RESERVE_SECONDS,
+    OCR_VISIBILITY_SAFETY_MARGIN_SECONDS,
+    Settings,
+    get_settings,
+)
+from core.contracts import OcrJob
+from core.db import db_pool, run_migrations
+from core.logging import configure_logging, get_logger
+from core.sqs.consumer import SqsConsumer
+from core.sqs.producer import SqsProducer
+from ocr_worker.pipeline import OcrPipeline
+from ocr_worker.repository import mark_failure_terminal
+from ocr_worker.vlm_client import close_client as close_vlm_client
+
+logger = get_logger(__name__)
+
+# 마이그레이션 SQL 디렉터리(리포지토리 루트 기준 상대). 진입 시 멱등 DDL을 적용한다.
+# ai_owner 전용 서브디렉터리만 가리킨다 — migrations/ 전체를 돌리면 corpus_owner 소유
+# 오브젝트(policy_chunks 등)를 건드리다 권한 에러로 기동이 막힌다(실측, #48~#50).
+_MIGRATIONS_DIR = "migrations/ai"
+
+# 종료 시 미완료 S3 원본 삭제 task를 기다리는 상한(초). ``OcrPipeline``은 원본 삭제를
+# ReportJob 발행과 떼어 백그라운드 task로 돌리므로, 종료 신호가 오면 몇 건이 떠 있을 수
+# 있다. 그냥 두면 루프가 닫히며 task가 취소돼 "pending task destroyed" 잡음만 남으니 잠깐
+# 흡수한다. 짧게 잡는 이유: 이 대기는 **최선 노력**일 뿐 정합성 장치가 아니다 — 못 끝낸
+# 삭제는 원본이 S3에 남을 뿐이고, 그건 검증 실패·crash 시에도 이미 일어나는 일이라
+# S3 라이프사이클 정책이 백스톱으로 정리한다(pipeline 모듈 docstring §원본 삭제 게이트).
+# SIGTERM→SIGKILL 유예(k8s 기본 30초) 안에 넉넉히 들어가는 값이어야 한다.
+_SHUTDOWN_DELETE_TIMEOUT_S = 5.0
+
+
+def _check_vlm_time_budget(settings: Settings) -> None:
+    """VLM 단계 예산 + VLM 외 단계 몫 + 안전 여유가 SQS 가시성 안에 드는지 확인한다(기동 검사).
+
+    heartbeat(가시성 연장)가 없어 문서 1건 처리가 ``sqs_visibility_timeout``을 넘기면 같은
+    메시지가 다시 보여 중복 처리된다. 기본값은 이 상한에 맞춰 뒀지만(config VLM 섹션), 배포
+    env로 예산을 올리면 런타임엔 아무 신호가 없다 — 그래서 자원을 잡기 전에 실패시킨다.
+
+    ``Settings`` 검증기가 아니라 여기 두는 이유: ``Settings``는 전 워커 공용이라 OCR 전용
+    제약을 검증기로 걸면 VLM을 쓰지 않는 워커(report 등)의 기동까지 그 값에 묶인다.
+
+    Raises:
+        ValueError: 합이 ``sqs_visibility_timeout``을 넘을 때(값은 숫자만 싣는다).
+    """
+    required = (
+        settings.vlm_page_budget_seconds
+        + settings.vlm_reread_budget_seconds
+        + OCR_NON_VLM_RESERVE_SECONDS
+        + OCR_VISIBILITY_SAFETY_MARGIN_SECONDS
+    )
+    if required > settings.sqs_visibility_timeout:
+        raise ValueError(
+            "VLM 단계 예산이 SQS 가시성을 넘는다: "
+            f"page_budget={settings.vlm_page_budget_seconds} "
+            f"reread_budget={settings.vlm_reread_budget_seconds} "
+            f"non_vlm_reserve={OCR_NON_VLM_RESERVE_SECONDS} "
+            f"safety_margin={OCR_VISIBILITY_SAFETY_MARGIN_SECONDS} "
+            f"> sqs_visibility_timeout={settings.sqs_visibility_timeout}"
+        )
+
+
+async def _run() -> None:
+    """자원을 배선하고 소비 루프를 돈다(종료 신호까지)."""
+    settings = get_settings()
+    _check_vlm_time_budget(settings)  # 자원을 잡기 전에 — 잘못된 예산이면 기동 자체를 거부한다
+    async with db_pool(settings) as pool:
+        applied = await run_migrations(pool, _MIGRATIONS_DIR)
+        logger.info("migrations applied", files=applied)
+        # SQS 프로듀서는 유지할 연결 수명이 없어(요청마다 서명되는 boto3 호출) 컨텍스트
+        # 매니저가 아니다 — 그냥 만들어 파이프라인에 넘긴다.
+        producer = SqsProducer(settings)
+        pipeline = OcrPipeline(pool=pool, producer=producer, settings=settings)
+        consumer: SqsConsumer[OcrJob] = SqsConsumer(
+            queue_url=settings.sqs_ocr_job_queue_url,
+            schema=OcrJob,
+            handler=_with_memory_release(pipeline.handle),
+            settings=settings,
+            on_poison=_poison_journal(pool, pipeline),
+        )
+        # git_commit: 이미지 빌드 커밋(Dockerfile ARG → ENV). 새 이미지가 실제로 떴는지 확인한다.
+        logger.info(
+            "ocr worker starting",
+            queue_url=settings.sqs_ocr_job_queue_url,
+            git_commit=settings.git_commit,
+        )
+        # 소비와 병행해 도는 outbox 스윕. 소비 루프와 독립적이라 gather로 묶지 않고
+        # 별도 task로 띄운다 — 스윕이 죽어도 소비는 계속돼야 하고, 반대도 마찬가지다
+        # (스윕 정리는 아래 finally가 맡는다).
+        stopping = asyncio.Event()
+        sweep_task = asyncio.create_task(_run_delete_sweep(pipeline, settings, stopping))
+        try:
+            await consumer.run()
+        finally:
+            # 스윕을 먼저 멈춘다: 신규 사이클 진입을 막고(stopping), 대기 중이면 즉시
+            # 깨우며, S3 왕복 중이면 취소한다. 스윕은 멱등이라 중간에 잘려도 남은
+            # pending 행을 다음 기동이 그대로 이어받는다.
+            stopping.set()
+            sweep_task.cancel()
+            try:
+                await sweep_task
+            except asyncio.CancelledError:
+                pass  # 정상 취소 경로 — 사이클 중간이어도 다음 기동이 이어받는다
+            except Exception:  # 루프가 이미 죽어 있던 경우: 종료 흐름을 막지 않는다
+                logger.exception("original_delete_sweep_task_error")
+            # 소비 루프 종료 후 백그라운드 원본 삭제를 짧게 흡수한다(최선 노력).
+            # 타임아웃이 나도 **이 함수 범위 안에서는** 진행 중인 삭제가 취소되지
+            # 않는다(내부가 gather가 아니라 asyncio.wait). 다만 그 뒤 ``asyncio.run``의
+            # teardown(``Runner.close`` → ``_cancel_all_tasks``)이 결국 남은 task를
+            # 취소하므로, 이 대기는 "끝날 수 있는 삭제를 끝내주는" 장치일 뿐이다.
+            with contextlib.suppress(TimeoutError):
+                async with asyncio.timeout(_SHUTDOWN_DELETE_TIMEOUT_S):
+                    await pipeline.wait_for_pending_deletes()
+            # VLM 공유 httpx 클라이언트(연결 풀)를 닫는다 — 소비 루프가 멈춘 뒤라 진행 중인
+            # VLM 호출이 없다.
+            await close_vlm_client()
+
+
+def _release_memory() -> None:
+    """문서 하나를 끝낸 뒤 해제된 힙을 OS로 돌려준다(glibc ``malloc_trim``).
+
+    검출 최고점(A4 한 쪽 약 3.9GB)이 지나도 glibc가 해제된 메모리를 붙들고 있으면 작업 사이
+    RSS가 높게 남아, 같은 노드의 다른 파드 몫을 깎는다. 최고점 자체는 줄이지 못한다 — 그건
+    ``ocr_det_limit_side_len``이 맡는다. glibc가 아니면(macOS·musl) 할 일이 없다.
+    """
+    gc.collect()
+    try:
+        malloc_trim = ctypes.CDLL("libc.so.6").malloc_trim
+    except (OSError, AttributeError):
+        return
+    malloc_trim(0)
+
+
+def _with_memory_release(
+    handler: Callable[[OcrJob], Awaitable[None]],
+) -> Callable[[OcrJob], Awaitable[None]]:
+    """핸들러가 끝날 때마다(성공·실패 모두) ``_release_memory``를 스레드에서 부른다.
+
+    반납은 최선 노력이다 — 반납이 실패해도 작업 결과(ack·재전달)는 바꾸지 않는다.
+    """
+
+    async def handle(job: OcrJob) -> None:
+        try:
+            await handler(job)
+        finally:
+            try:
+                await asyncio.to_thread(_release_memory)
+            except Exception as exc:  # 최선 노력 — 원래 예외·결과를 덮지 않는다
+                logger.warning("memory_release_failed", error_type=type(exc).__name__)
+
+    return handle
+
+
+def _poison_journal(
+    pool: asyncpg.Pool, pipeline: OcrPipeline
+) -> Callable[[OcrJob | None, str, int], Awaitable[None]]:
+    """poison 메시지를 걷어내기 직전 실패 저널에 확정 기록하는 훅을 만든다.
+
+    컨슈머의 poison 가드는 수신 횟수 상한을 넘긴 메시지를 **삭제**한다. 그게 마지막
+    기회라, 여기서 기록하지 않으면 사용자는 원인 조회조차 불가능한 무음 실패를 겪는다.
+
+    **저널 기록의 예외는 삼키지 않는다** — 컨슈머가 훅의 성공 여부로 삭제/보류를
+    정하기 때문이다(``_run_poison_hook``). 여기서 잡아 로그만 남기면 컨슈머는 성공으로
+    오인해 메시지를 지우고, 정확히 이 함수가 막으려던 무음 실패가 다시 생긴다.
+
+    기록에 성공하면 이 문서는 **확정 종결**이므로 청구 진행에도 반영한다
+    (``advance_claim_progress``) — 재시도를 소진해 걷힌 문서를 안 세면 그 청구의
+    ``docs_terminal``이 영영 ``doc_total``에 못 미쳐 리포트가 나오지 않는다.
+    이미 세어진 문서를 다시 알려도 안전하다: 종결 카운트는 ``job_id`` 집합이라
+    **문서별 멱등**이고(마이그레이션 010), 중복 보고로 수가 늘지 않는다 — 여기에 별도
+    "이미 카운트됐나" 가드를 두지 않는 이유다(가드는 조회~증가 사이 경합에 다시
+    노출되지만, 집합 방식은 단일 원자적 업서트 안에서 끝난다).
+
+    다만 이 반영의 실패는 **삼킨다**(경고만): 저널이라는 본래 목적은 이미 달성됐고,
+    여기서 예외를 올리면 컨슈머가 메시지를 못 지워 poison 가드가 끊으려던 재전달
+    루프(큐 보존기간 내내)가 되살아난다. 그쪽 실패 모드가 더 나쁘다. 반영이 끝내
+    안 되면 그 청구는 ``pending``에 남는다(아래 알려진 한계와 같은 결과).
+
+    **알려진 한계**: ``job``이 ``None``이면(본문 역직렬화 자체가 실패) ``claim_id``를
+    알 수 없어 진행 반영이 불가능하다. 그 청구는 ``docs_terminal``이 ``doc_total``에
+    못 미친 채 ``pending``에 머물러 리포트가 나오지 않는다 — 운영 조회(``message_id``로
+    남은 ``ai.ocr_job_failures`` 행)와 수동 개입이 유일한 복구 수단이다. MVP 범위 밖으로 둔다.
+
+    Args:
+        pool: asyncpg 연결 풀(워커 수명과 같다 — 클로저로 잡아 둔다).
+        pipeline: 청구 진행 반영을 위임할 파이프라인(같은 풀을 공유한다).
+
+    Returns:
+        ``SqsConsumer(on_poison=...)``에 넘길 훅.
+    """
+
+    async def on_poison(job: OcrJob | None, message_id: str, receive_count: int) -> None:
+        await mark_failure_terminal(
+            pool, job=job, message_id=message_id, receive_count=receive_count
+        )
+        if job is None:
+            return  # claim_id를 모른다 — 위 docstring의 알려진 한계
+        try:
+            await pipeline.advance_claim_progress(job)
+        except Exception as exc:  # 저널은 이미 남았다 — 재전달 루프를 되살리지 않는다(§8)
+            logger.warning(
+                "claim_progress_advance_failed",
+                message_id=message_id,
+                claim_id=job.claim_id,
+                error_type=type(exc).__name__,
+            )
+
+    return on_poison
+
+
+async def _run_delete_sweep(
+    pipeline: OcrPipeline, settings: Settings, stopping: asyncio.Event
+) -> None:
+    """원본 삭제 outbox를 주기적으로 스윕한다(``corpus_worker``의 폴링 루프 패턴).
+
+    즉시 삭제(fire-and-forget) 실패나 crash로 ``pending``에 남은 원본을 재시도해,
+    "저장은 됐는데 원본이 조용히 남는" 경로를 닫는다. 한 사이클의 예외는 잡아 로그만
+    남기고 다음 사이클로 넘어간다 — 일시적 DB·S3 오류로 상시 데몬이 죽으면 재시도
+    경로 자체가 사라진다(§8 top-loop 격리).
+    """
+    while not stopping.is_set():
+        try:
+            await pipeline.sweep_pending_deletes()
+        except Exception:  # 최상위 격리: 한 사이클 실패가 스윕을 멈추지 않게(§8)
+            logger.exception("original_delete_sweep_error")
+        await _sleep_or_stop(stopping, settings.ocr_delete_retry_interval_seconds)
+
+
+async def _sleep_or_stop(stopping: asyncio.Event, seconds: float) -> None:
+    """종료 신호가 오면 즉시 깨어나는 취소 가능 대기(스윕 사이클 간격용)."""
+    try:
+        await asyncio.wait_for(stopping.wait(), timeout=seconds)
+    except TimeoutError:
+        return  # 정상 간격 경과 — 다음 사이클로
+
+
+def main() -> None:
+    """프로세스 진입점. 로깅을 구성하고 이벤트 루프를 돌린다."""
+    configure_logging()
+    try:
+        asyncio.run(_run())
+    except KeyboardInterrupt:  # 시그널 핸들러 미지원 플랫폼(Windows 등)의 종료 경로
+        logger.info("ocr worker interrupted")
+
+
+if __name__ == "__main__":
+    main()

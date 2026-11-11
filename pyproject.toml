@@ -1,0 +1,131 @@
+[project]
+name = "ai-engine"
+version = "0.1.0"
+description = "보험·법률 AI 처리 엔진 (OCR Worker·Hybrid RAG·LangGraph 리포트·가드레일)"
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "asyncpg>=0.29",
+    "pgvector>=0.3",
+    "ollama>=0.3",
+    "structlog>=24.1",
+    "httpx>=0.27",
+    "kiwipiepy>=0.23.2",
+    "cryptography>=42",  # core.crypto의 AES-256-GCM PII 컬럼 복호화 — 전 워커 공용이라 base
+]
+
+[project.optional-dependencies]
+# OCR Worker. OCR 엔진은 PaddleOCR(PP-OCRv5 검출 + 한국어 인식)이고 CPU로 in-process 추론한다
+# (GPU 불필요). paddlepaddle CPU 휠이 PyPI에 있다 — cp312 linux x86_64·macOS arm64·win_amd64
+# (linux aarch64 휠은 없다). 어댑터(ocr_worker.ocr.PaddleOcrEngine)가 3.7 predict 결과 형식
+# (rec_texts·rec_scores·rec_polys)에 맞춰져 있어 마이너 버전을 묶는다.
+# 배포 이미지는 ner extra도 같이 깐다(USE_NER=true). 로컬·CI엔 미설치 — 엔진/렌더/S3는 lazy import.
+ocr = [
+    "paddleocr>=3.7,<3.8",
+    # CPU 휠(paddlepaddle-gpu 아님). 3.3.0·3.3.1은 x86 oneDNN + PIR 실행기에서 PP-OCRv5 검출이
+    # NotImplementedError(ConvertPirAttribute2RuntimeAttribute)로 죽는다 — oneDNN을 끄면 돌지만 A4 한
+    # 쪽에 7.8GB VM이 OOM으로 죽었다(빌드 스모크·실측, _workspace/20). 3.2.2는 oneDNN으로 정상(최대 RSS
+    # 3.7GB)이라 3.2.x로 묶는다. 올릴 때는 이미지 빌드 스모크가 다시 판정한다.
+    "paddlepaddle>=3.2.2,<3.3",
+    "numpy>=1.26",     # PIL → BGR 배열(ocr_worker.ocr._to_bgr_array)
+    "pymupdf>=1.24",   # PDF → 페이지 이미지 렌더
+    "pillow>=10.0",    # 페이지 이미지(PIL.Image)
+    "boto3>=1.34",     # S3 GetObject(원본 다운로드) · SQS 소비(ocr-job-queue)·발행(report-job)
+]
+# 약관 코퍼스 S3 스테이징 워커(GPU 불필요·경량). Notion 첨부 → S3.
+# base(httpx·asyncpg·pydantic·structlog) + boto3만. torch/paddle 없음.
+corpus = [
+    "boto3>=1.34",   # S3 PutObject/HeadObject
+]
+# LangGraph 멀티에이전트 리포트 생성 (report-job SQS 큐 소비)
+report = [
+    "langgraph>=0.2",
+    "langchain-core>=0.3",
+    "boto3>=1.34",  # SQS ReceiveMessage/DeleteMessage(report-job 큐 소비)
+    "anthropic>=2.3",  # Claude API(LLM_PROVIDER=anthropic) — core.ai_client가 지연 import
+    # anthropic SDK의 HTTP 계층. 스트림 도중 끊김 예외를 core.ai_client가 직접 잡아 명시한다.
+    "httpx2>=2.0",
+]
+# PII 탐지 보조 NER(KoELECTRA, CPU). USE_NER=true가 이름 마스킹의 유일한 방어선이라 OCR 이미지는
+# ocr + ner를 함께 깐다 — surya 시절엔 surya가 torch·transformers를 끌어와 우연히 채워졌다.
+ner = [
+    # NER 파이프라인(task="ner", aggregation_strategy="simple")은 4.x에서만 검증했다(5.x 미검증).
+    "transformers>=4.42,<5",
+    # CPU 휠. linux는 아래 pytorch-cpu 인덱스에서만 받는다 — PyPI의 linux torch는 CUDA 휠이라
+    # nvidia-* 수 GB를 끌어온다(이미지에 CUDA torch가 들어가면 안 된다). macOS·Windows는 PyPI(CPU).
+    "torch>=2.4",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.5",
+    "mypy>=1.10",
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=5.0",
+    # test_vlm_client.py·test_ocr.py가 PIL.Image·numpy로 테스트 이미지를 만든다. paddle 등
+    # 무거운 나머지 ocr extra와 달리 둘은 가벼워 CI dev 동기화에 넣어도 무리 없다.
+    "pillow>=10.0",
+    "numpy>=1.26",
+]
+
+[tool.uv]
+# src 코드 작성 단계에서 package = true + build-system으로 전환한다.
+package = false
+
+# torch는 linux에서 CPU 인덱스로만 받는다(ner extra 주석). explicit이라 다른 패키지엔 영향이 없다.
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "S", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+# 테스트: assert(S101)·가짜 시크릿(S105·S106)·임시파일 접근(ASYNC230/240) 허용
+"tests/**" = ["S101", "S105", "S106", "ASYNC230", "ASYNC240"]
+# 이관된 실험 리포트 그래프(P2). 프롬프트·주석 위주 장문(E501/RUF003), 자립 RAG의
+# 즉시-await 클로저(B023)·내부상수 SQL(S608)은 안전 — 정밀 정리는 후속 리라이트에서.
+"src/report_worker/nodes/agents.py" = ["E501", "RUF001", "RUF002", "RUF003", "SIM117"]
+"src/report_worker/state.py" = ["E501"]
+# 동적 검색 SQL: 테이블·컬럼은 내부 상수(_NS_TABLE/_NS_COLS), 사용자 값은 $N 파라미터 바인딩만.
+"src/rag/search.py" = ["S608"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+plugins = ["pydantic.mypy"]
+mypy_path = "src"
+
+# 선택 의존성(extra)은 dev 환경에 미설치 → stub 없음. lazy import라 런타임엔 무관.
+[[tool.mypy.overrides]]
+module = [
+    "transformers",
+    "transformers.*",
+    "paddleocr",
+    "paddleocr.*",
+    "fitz",
+    "boto3",
+    "botocore.*",
+    "PIL.*",
+    "asyncpg",
+    "anthropic",
+    "anthropic.*",
+    "httpx2",
+]
+ignore_missing_imports = true

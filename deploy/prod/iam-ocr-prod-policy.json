@@ -1,0 +1,63 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ConsumeOcrJobs",
+      "Effect": "Allow",
+      "Action": [
+        "sqs:ReceiveMessage",
+        "sqs:DeleteMessage",
+        "sqs:ChangeMessageVisibility",
+        "sqs:GetQueueAttributes"
+      ],
+      "Resource": "arn:aws:sqs:ap-northeast-2:REPLACE_ME_ACCOUNT_ID:brbs-ocr-job-queue-prod"
+    },
+    {
+      "Sid": "PublishReportJobs",
+      "Effect": "Allow",
+      "Action": [
+        "sqs:SendMessage"
+      ],
+      "Resource": "arn:aws:sqs:ap-northeast-2:REPLACE_ME_ACCOUNT_ID:brbs-report-job-queue-prod"
+    },
+    {
+      "Sid": "ReadAndDeleteOriginals",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:DeleteObject"
+      ],
+      "Resource": "arn:aws:s3:::REPLACE_ME_BUCKET/report-documents/*"
+    },
+    {
+      "Sid": "WriteMaskedCopies",
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject",
+        "s3:GetObject"
+      ],
+      "Resource": "arn:aws:s3:::REPLACE_ME_BUCKET/masked/*"
+    },
+    {
+      "Sid": "ReadOcrConfig",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:GetParametersByPath",
+        "ssm:GetParameters",
+        "ssm:GetParameter"
+      ],
+      "Resource": [
+        "arn:aws:ssm:ap-northeast-2:REPLACE_ME_ACCOUNT_ID:parameter/brbs/prod/ocr",
+        "arn:aws:ssm:ap-northeast-2:REPLACE_ME_ACCOUNT_ID:parameter/brbs/prod/ocr/*"
+      ]
+    },
+    {
+      "Sid": "ReadOcrSecret",
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:GetSecretValue"
+      ],
+      "Resource": "arn:aws:secretsmanager:ap-northeast-2:REPLACE_ME_ACCOUNT_ID:secret:prod/ocr-*"
+    }
+  ]
+}
