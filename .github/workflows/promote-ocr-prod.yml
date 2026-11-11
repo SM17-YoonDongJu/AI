@@ -1,0 +1,154 @@
+# Promote OCR to prod — dev에서 검증한 OCR 이미지(:<sha7>)를 prod OCR 전용 EC2(brbs-ocr-prod)에 올린다.
+#
+# 다시 빌드하지 않는다. dev 배포(deploy.yml)가 ECR에 올린 불변 태그를 그대로 쓰므로, dev에서 검증한
+# 이미지와 prod에 뜨는 이미지가 같다. 승인은 GitHub Environment `prod`의 필수 리뷰어가 건다
+# (레포 Settings → Environments → prod).
+# 대상은 Name 태그로 찾는다(백엔드 deploy-prod.yml과 같은 방식). 스팟 회수 뒤 stop→start돼도
+# 인스턴스 ID 변수를 관리할 필요가 없다. 절차·인프라 준비는 deploy/prod/README.md.
+name: Promote OCR to prod
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "배포할 이미지 태그 — dev에서 검증한 커밋 sha7 (예: ab3e605)"
+        required: true
+        type: string
+
+concurrency:
+  group: promote-ocr-prod
+  cancel-in-progress: false
+
+permissions:
+  id-token: write # OIDC
+  contents: read
+
+env:
+  ECR_REPOSITORY: brbs/ocr
+  EC2_INSTANCE_NAME: brbs-ocr-prod
+  HOST_DIR: /opt/ocr
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - uses: actions/checkout@v4
+
+      # 가변 태그(dev·latest)로 prod를 띄우지 않는다. 이 값은 호스트 스크립트에 그대로 들어가므로
+      # 형식도 여기서 묶는다.
+      - name: Validate tag
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          if ! [[ "$TAG" =~ ^[0-9a-f]{7}$ ]]; then
+            echo "::error::tag는 7자리 커밋 sha여야 합니다: $TAG"
+            exit 1
+          fi
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      # 배포 역할에는 ecr:DescribeImages가 없어 pull 권한(BatchGetImage)으로 존재만 확인한다.
+      # 없는 태그로 SSM까지 가면 호스트에서 pull이 실패한 뒤에야 드러난다.
+      - name: Check image exists in ECR
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          FOUND=$(aws ecr batch-get-image --repository-name "$ECR_REPOSITORY" \
+            --image-ids imageTag="$TAG" --query 'length(images)' --output text)
+          if [ "$FOUND" = "0" ]; then
+            echo "::error::$ECR_REPOSITORY:$TAG 이미지가 ECR에 없습니다(dev 배포가 올린 sha7인지 확인)."
+            exit 1
+          fi
+
+      - name: Find prod OCR instance
+        id: inst
+        run: |
+          ID=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=$EC2_INSTANCE_NAME" "Name=instance-state-name,Values=running" \
+            --query 'Reservations[0].Instances[0].InstanceId' --output text)
+          if [ -z "$ID" ] || [ "$ID" = "None" ]; then
+            echo "::error::running 상태의 $EC2_INSTANCE_NAME 인스턴스가 없습니다(스팟 회수로 stopped일 수 있음)."
+            exit 1
+          fi
+          echo "id=$ID" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy via SSM
+        env:
+          INSTANCE: ${{ steps.inst.outputs.id }}
+          TAG: ${{ inputs.tag }}
+          REGISTRY: ${{ secrets.AWS_ECR_REGISTRY }}
+          REGION: ${{ secrets.AWS_REGION }}
+        run: |
+          COMPOSE_B64=$(base64 -w0 deploy/prod/docker-compose.ocr.yml)
+          # 이 heredoc은 러너에서 변수($HOST_DIR·$TAG 등)를 채운 뒤 호스트로 보낸다. \$로 적은 부분만
+          # 호스트에서 평가된다.
+          CMD=$(cat <<EOF
+          set -euo pipefail
+          cd $HOST_DIR
+          # compose는 레포가 진실원 — 서버에서 고친 내용이 있어도 덮는다.
+          echo "$COMPOSE_B64" | base64 -d > docker-compose.ocr.yml
+          # 배포 태그를 .env.ocr에 남겨 둔다. 스팟 stop→start나 수동 up에도 같은 이미지로 뜬다.
+          if grep -q '^OCR_TAG=' .env.ocr; then
+            sed -i 's/^OCR_TAG=.*/OCR_TAG=$TAG/' .env.ocr
+          else
+            echo 'OCR_TAG=$TAG' >> .env.ocr
+          fi
+          aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $REGISTRY
+          docker compose -f docker-compose.ocr.yml --env-file .env.ocr pull ocr-worker
+          docker compose -f docker-compose.ocr.yml --env-file .env.ocr up -d ocr-worker
+          # 기동 직후 죽는 경우(env 누락·DB 권한·마이그레이션 오류)를 배포 실패로 드러낸다.
+          # 마이그레이션·DB 풀 생성까지 끝날 시간을 준 뒤 재시작 없이 떠 있는지 본다.
+          sleep 45
+          STATE=\$(docker inspect -f '{{.State.Status}} {{.RestartCount}}' brbs-ocr-worker)
+          echo "container: \$STATE"
+          docker logs --tail 30 brbs-ocr-worker
+          [ "\$STATE" = "running 0" ]
+          docker image prune -f
+          EOF
+          )
+          # 스크립트 전체를 base64로 감싸 보낸다 — 따옴표·특수문자가 --parameters JSON을 깨지 않게.
+          B64=$(printf '%s' "$CMD" | base64 -w0)
+          printf '{"commands":["echo %s | base64 -d | bash"],"executionTimeout":["900"]}' "$B64" > /tmp/ssm-params.json
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE" \
+            --document-name "AWS-RunShellScript" \
+            --comment "promote ocr $TAG to prod" \
+            --parameters file:///tmp/ssm-params.json \
+            --query "Command.CommandId" --output text)
+          echo "SSM CommandId=$CMD_ID"
+          # 큰 이미지(paddle 모델 포함) pull이 기본 waiter(~100초)를 넘기므로 직접 폴링한다(최대 12분).
+          STATUS=Pending
+          for i in $(seq 1 72); do
+            STATUS=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE" \
+              --query Status --output text 2>/dev/null || echo Pending)
+            case "$STATUS" in
+              Success | Failed | Cancelled | TimedOut) break ;;
+            esac
+            echo "SSM $STATUS ... ($i/72)"
+            sleep 10
+          done
+          echo "SSM Status=$STATUS"
+          echo "----- SSM StandardOutput (host, tail) -----"
+          aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE" \
+            --query StandardOutputContent --output text 2>/dev/null | tail -40
+          if [ "$STATUS" != "Success" ]; then
+            echo "----- SSM StandardError (host) -----"
+            aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE" \
+              --query StandardErrorContent --output text 2>/dev/null | tail -50
+            exit 1
+          fi
+
+      - name: Notify deploy result
+        if: always()
+        uses: ./.github/actions/discord-notify
+        with:
+          webhook_url: ${{ job.status == 'success' && secrets.DISCORD_WEBHOOK_DEPLOYMENT || secrets.DISCORD_WEBHOOK_CI_FAILURES }}
+          status: ${{ job.status }}
+          service: ocr
+          environment: prod
+          image_tag: ${{ format('{0}:{1}', env.ECR_REPOSITORY, inputs.tag) }}
