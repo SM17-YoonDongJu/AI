@@ -20,6 +20,7 @@ import datetime
 import json
 import uuid
 from typing import Any
+from unittest.mock import ANY
 
 import pytest
 
@@ -441,7 +442,11 @@ async def test_load_context_does_not_swallow_missing_ner_dependency(monkeypatch)
     out = await agents.load_context(_state())
 
     # Assert: 필드를 조용히 비우지 않는다 — worker가 재전달로 올리는 하드 실패로 드러난다
-    assert out == {"errors": ["load_context_failed:ModuleNotFoundError"]}
+    # (node_trace는 safe_node가 붙이는 리포트 수치용 소요 시간이다)
+    assert out == {
+        "errors": ["load_context_failed:ModuleNotFoundError"],
+        "node_trace": [{"node": "load_context", "ms": ANY, "status": "failed"}],
+    }
     assert out["errors"][0].startswith(worker._HARD_FAILURE_PREFIXES)
 
 

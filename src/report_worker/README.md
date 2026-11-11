@@ -29,8 +29,8 @@ uv run python -m report_worker       # uv 없이: PYTHONPATH=src python -m repor
 | **LLM 시스템 실패** | 노드 안의 `AiClientError`(429·5xx·타임아웃·연결 오류, 키·모델 누락, `max_tokens` 잘림) → `{노드}_failed:AiClientError` | 첫 실패에서 그래프 종료(이후 LLM 호출 없음). 초안 없음. `ReportWorkerError`로 재전달 | 비종결 업서트 `llm_unavailable` |
 | 분류 밖 예외 | 그래프 밖에서 난 예외 | 그대로 올라가 재전달 | 비종결 업서트 `unknown`(error_type=클래스명) |
 | **LLM 거절** | `LlmRefusalError`(서버 측 폴백 모델까지 거절) → `{노드}_failed:LlmRefusalError` | 초안 없이 `reports.status = 'BLOCKED'`만 기록. `ReportRefusedError`(`NonRetryableError`)로 즉시 ack | 남기지 않는다(BLOCKED로 보인다). 이전 행은 지운다 |
-| 소프트 실패 | `rag_empty`, `case_data_missing`, `input_blocked`, `*_llm_failed`(JSON 파싱 실패), `pii_mask_failed:<필드>`, 그 밖의 노드 예외 | 부분 결과로 저장하고 ack | 행 삭제(회복) |
-| Judge 실패 | 출력 가드레일 Judge의 `AiClientError`(거절 포함) | `judge_failures=[JUDGE_UNAVAILABLE]`을 남기고 저장. 본문은 완성됐다 | 행 삭제(회복) |
+| 소프트 실패 | `rag_empty`, `case_data_missing`, `input_blocked`, `*_llm_failed`(JSON 파싱 실패), `pii_mask_failed:<필드>`, `collect_metrics_failed:*`(리포트 수치 계산 실패 — `metrics` 없이 저장, `confidence_level`은 안 쓴다), 그 밖의 노드 예외 | 부분 결과로 저장하고 ack | 행 삭제(회복) |
+| Judge 실패 | 출력 가드레일 Judge의 `AiClientError`(거절 포함) 또는 판정 불가 응답(`chat_json` 파싱 실패 `{}`, `failures`가 없거나 list가 아님 등) | `judge_failures=[JUDGE_UNAVAILABLE]`을 남기고 저장. 본문은 완성됐다. 리포트 수치엔 `judge.unavailable=true`, 신뢰도는 MEDIUM 이하 | 행 삭제(회복) |
 | 차단 기록 실패 | `persist_blocked_failed` | 하드 실패로 올리지 않는다. 재처리해도 같은 차단이 반복될 뿐이다 | 행 삭제(정상 반환이라서 — 아래 한계) |
 
 - 재전달 한도는 `SQS_MAX_RECEIVE_COUNT`(report 운영값 3)다. 같은 실패가 3번 처리된 뒤 4번째 수신에서 poison 스킵된다. Claude SDK도 호출마다 자체 재시도(최대 2회)를 한 뒤에 `AiClientError`를 낸다.
@@ -64,12 +64,13 @@ load_context → input_guardrail ─┬─▶ persist_blocked → END           
  → coverage_analysis → case_search ─┬─▶ disability_rag → disability_verify → disability_calc ─┐
                                     └───────────────────────────────────────────────────────┤  (3)
  payment_calc ◀─────────────────────────────────────────────────────────────────────────────┘
- → report_compose → output_guardrail → persist → END
+ → report_compose → output_guardrail → collect_metrics → persist → END                       (4)
 ```
 
 1. 입력 가드레일이 차단하면(보험·법률 외 질문, 또는 `load_context`의 PII 복호화 실패) 초안 없이 `reports.status = 'BLOCKED'`만 기록한다.
 2. 가입 약관이 `policy_chunks`에 없을 때만 런타임 파싱(`terms_parse`)을 거친다.
 3. 후유장해 검토가 필요하면 장해 서브그래프를 거친다. 지급률 합산은 LLM이 아니라 `disability_rules.py`의 **순수 함수**가 한다.
+4. `collect_metrics`는 LLM·DB 없이 리포트 수치와 신뢰도 등급을 계산한다(아래 "리포트 수치"). 실패해도 소프트 실패로 저장까지 간다.
 
 ### 실패 단락
 
@@ -90,8 +91,9 @@ load_context → input_guardrail ─┬─▶ persist_blocked → END           
 | 파일 | 역할 |
 |---|---|
 | `nodes/agents.py` | 노드 구현과 분기 함수 |
-| `state.py` | `ReportState` 정의 |
+| `state.py` | `ReportState` 정의. 선언하지 않은 키는 LangGraph가 조용히 버린다 |
 | `disability_rules.py` | 장해 지급률 결정론 합산(순수 함수) |
+| `metrics.py` | 리포트 수치·신뢰도 등급·Judge 근거 조립(순수 함수) |
 | `rag/hybrid.py` | `src/rag.search()` 어댑터. `RagResult`를 노드용 dict와 인용 문자열로 변환 |
 
 ## 외부 전송 전 PII 마스킹 (CODE_CONVENTIONS §13)
@@ -122,15 +124,15 @@ LLM(Claude)과 임베딩(Voyage 전환 예정)은 외부 API다. 그래서 Sprin
 | 앞 노드의 LLM 결과(적용·누락 특약, 분석, 장해 항목, 본문) | 뒤 노드 프롬프트, Judge | 마스킹된 입력과 공개 코퍼스로만 만든 값 |
 | `insurer`·`product_name`·`enrolled_at` | RAG의 로컬 SQL 필터뿐 | 외부로 안 나감 |
 | `entities` | `payment_calc` 로컬 계산뿐 | 외부로 안 나감 |
-| 약관·판례·장해표 청크 | 각 프롬프트, Judge | 공개 코퍼스 |
-| `errors` → `7_추가확인필요` | Judge(리포트 앞 2000자 안에 들면) | 분류 표식만(PII 없음) |
+| 약관·판례·장해표 청크 | 각 프롬프트, Judge(2026-11-11부터 판례도 근거로 넘긴다) | 공개 코퍼스 |
+| `errors` → `7_추가확인필요` | Judge(리포트 앞 12,000자 — `guardrail.JUDGE_MAX_REPORT_CHARS` — 안에 들면) | 분류 표식만(PII 없음) |
 
 ## 저장 (`persist`, 한 트랜잭션)
 
 | 테이블 | 내용 |
 |---|---|
-| `report_drafts` | 초안 전체(JSONB, 영구 보존). `report_id`로 `ON CONFLICT` 업서트 → **멱등** |
-| `reports` | 적용 담보, 누락 특약, 근거 약관·판례, 예상 금액 범위. `status = 'AWAITING_ADOPTION'` |
+| `report_drafts` | 초안 전체(JSONB, 영구 보존). `metrics`(리포트 수치, 계산에 실패하면 키 없음) 포함. `report_id`로 `ON CONFLICT` 업서트 → **멱등** |
+| `reports` | 적용 담보, 누락 특약, 근거 약관·판례, 예상 금액 범위. `status = 'AWAITING_ADOPTION'`. 신뢰도 등급 `confidence_level`(`HIGH`·`MEDIUM`·`LOW`)은 세이브포인트로 따로 쓴다(아래) |
 | `report_issues` | 쟁점 목록. 해당 리포트의 기존 행을 지운 뒤 다시 넣는다 |
 
 `reports.status`는 이 워커에서 `AWAITING_ADOPTION`·`BLOCKED`·`NEEDS_REUPLOAD` 셋 중 하나로 바뀐다.
@@ -142,6 +144,108 @@ LLM(Claude)과 임베딩(Voyage 전환 예정)은 외부 API다. 그래서 Sprin
 | OCR 품질 미달 | `NEEDS_REUPLOAD` | 없음 | 행 삭제 | NEEDS_REUPLOAD |
 | 하드 실패·LLM 시스템 실패(재전달 중) | 바뀌지 않음(Spring 생성값 `AWAITING_INSPECTION`) | 없음 | 비종결 행(`terminal=false`) | PROCESSING |
 | 위 실패가 한도를 넘겨 poison 스킵 | 바뀌지 않음 | 없음 | **terminal 확정** | **FAILED** |
+
+**`reports.confidence_level`** — backend가 고객 상세·검수 화면에 내려주고 프론트가 추정 보상 범위 옆 신뢰도 게이지로 보여주는 컬럼이다(값은 대문자, `draft.metrics.confidence.level`과 같다).
+
+- backend 소유 컬럼이라 `ai_owner`(prod `ai_owner_prod`)에 이 컬럼의 UPDATE 권한이 따로 필요하다(`deploy/schema_split*.sql`).
+- persist는 이 UPDATE만 같은 트랜잭션 안의 **세이브포인트**(중첩 `conn.transaction()`)로 뗀다. 권한이 없으면(`InsufficientPrivilegeError`) 세이브포인트만 되돌리고 경고 `report confidence level not saved`(`error_type`)를 남긴다. 초안·`reports`·쟁점은 그대로 커밋된다. 그 밖의 DB 오류는 지금처럼 `persist_failed`(하드 실패, 재전달)다.
+- **배포 순서와 무관하다.** GRANT 전에 워커를 배포해도 리포트는 저장되고 경고만 남는다. GRANT를 적용하면 재배포 없이 다음 리포트부터 채워진다. 그 전에 저장된 리포트는 재처리해야 채워진다.
+- 수치 계산이 실패했거나(`collect_metrics_failed:*`) 등급이 세 값이 아니면 쓰지 않는다. 같은 리포트를 다시 처리했는데 그때만 계산이 실패하면 이전 값이 남는다.
+
+## 리포트 수치 (`draft.metrics`, `metrics.py`)
+
+리포트를 만드는 동안 나온 기술 수치를 구조화해 `report_drafts.draft["metrics"]`에 남긴다(심사·설명가능성). 등급(`confidence.level`)은 `reports.confidence_level`로도 나간다(위 "저장"). 이 절이 스키마의 단일 출처다(`.claude/docs/contracts.md` §4가 여기를 가리킨다). 키를 바꾸거나 빼면 `metrics.METRICS_VERSION`을 올린다.
+
+- 계산: `collect_metrics` 노드(`output_guardrail` 뒤, `persist` 앞)가 `metrics.build_report_metrics(state)`를 부른다. LLM·DB 호출이 없는 순수 계산이다.
+- 재료는 앞 노드가 state에 남긴다: `node_trace`(safe_node — 노드마다 ms·ok/failed), `input_documents`(load_context — `ai.ocr_results`의 `ocr_confidence`·`doc_type_confidence`), `case_funnel`(case_search), `judge_stats`(output_guardrail — `OutputGuardResult.judge_*`).
+- 이 재료가 없거나 모양이 어긋나도 그 항목만 0·빈 값·null이 되고 계산은 계속한다. 수치에는 유한한 숫자만 들어간다(NaN·무한대가 하나라도 있으면 PG jsonb가 초안 전체를 거부해 persist가 하드 실패한다). 계산 자체가 예외로 끝나면 `collect_metrics_failed:*` 소프트 실패다(초안은 `metrics` 없이 저장). 읽는 쪽은 `metrics` 키가 없을 수 있음을 허용해야 한다.
+- PII 없음: 분류값(doc_type·마스킹 라벨·노드명)·건수·글자 수·정규화한 조항 번호뿐이다. 예외는 `verification.disability.reclassified[].injury`(LLM이 마스킹된 문서에서 뽑은 손상명 — 건강정보, `draft.disability`에 이미 있는 값)다.
+
+### 스키마 (version 1)
+
+예시는 `tests/test_report_metrics.py`의 골든 픽스처 출력이다(`pipeline.nodes`는 줄였다).
+
+```json
+{
+  "version": 1,
+  "input": {
+    "document_count": 3,
+    "doc_types": ["policy", "diagnosis", "medical_receipt"],
+    "ocr_confidence": {"min": 0.93, "avg": 0.94},
+    "doc_type_confidence": {"min": 0.8, "avg": 0.9},
+    "pii_masked": {"total": 6, "by_label": {"주민등록번호": 1, "전화번호": 2, "이름": 3}, "documents": 4, "free_text": 2}
+  },
+  "retrieval": {
+    "policy_matched": true,
+    "evidence": {"terms": 2, "schedule": 1, "case": 2},
+    "case_funnel": {"candidates": 12, "deduped": 9, "relevant": 2, "kept": 2},
+    "disability_schedule_source": "terms"
+  },
+  "verification": {
+    "disability": {"extracted": 2, "verified": 2, "combined_rate": 20.0, "confidence": "low",
+                   "pending_reeval": false, "reclassified": [{"injury": "추간판 탈출", "from": 30.0, "to": 20.0}]},
+    "clause_citations": {"cited": 3, "grounded": 2, "ungrounded": ["제99조"], "statute_mentions": 1},
+    "judge": {"ran": true, "unavailable": false, "flagged": 1, "checked_chars": 12000, "total_chars": 12480,
+              "coverage": 0.96, "evidence_chunks": 5}
+  },
+  "pipeline": {"nodes": [{"node": "load_context", "ms": 140, "status": "ok"}, "..."],
+               "node_count": 12, "failed_nodes": [], "total_ms": 73043},
+  "confidence": {"level": "MEDIUM", "reasons": ["가입금액 미보유 — 제시액 기준 어림 범위", "근거 미확인 주장 1건",
+                 "인용 검증 범위 일부(96%)", "근거에 없는 조항 인용 1건", "후유장해 지급률 추정 불확실"]}
+}
+```
+
+| 키 | 값 | 출처 |
+|---|---|---|
+| `input.document_count`·`doc_types` | 문서 수, 문서 순 doc_type(중복 포함) | `input_documents`. 대표 문서 단건 경로의 유형은 ReportJob `doc_type` |
+| `input.ocr_confidence`·`doc_type_confidence` | `{min, avg}`(소수 3자리) 또는 null | 같은 이름의 `ai.ocr_results` 컬럼. null·숫자 아닌 값·NaN·무한대는 빼고 나머지는 [0, 1]로 자른다. 남는 값이 없으면 null |
+| `input.pii_masked` | `total`·`by_label`(한국어 라벨별)·`documents`·`free_text` | `guardrail.count_masked_pii`. documents = OCR `masked_text`, free_text = `case_info`의 `question`·`description`·`additional_information`(mask_pii 마스킹본) |
+| `retrieval.policy_matched` | bool | errors에 `policy_not_in_db*`가 없으면 true |
+| `retrieval.evidence` | `{terms, schedule, case}` 건수 | Judge 근거(`metrics.judge_evidence` — 중복 제거 후). schedule = namespace `level` 또는 chunk_type `schedule`, case = `legal_references` |
+| `retrieval.case_funnel` | `{candidates, deduped, relevant, kept}` 또는 null | case_search(검색 후보 → 사건 단위 중복 제거 → 관련성 필터 → 상위 4). 결과 0건이면 전부 0, case_search가 예외로 끝났으면 null. 필터는 판정 실패·전부 탈락이면 그대로 통과시키므로 relevant = deduped가 "걸러낼 게 없었다"는 뜻은 아니다 |
+| `retrieval.disability_schedule_source` | `terms`·`standard`·null | 가입 약관 장해분류표 / 표준표 폴백(`disability_fallback_standard_schedule`) / 장해 경로 아님·표 미검색 |
+| `verification.disability` | 객체 또는 null | `disability_analysis`. `reclassified` = disability_verify가 과대분류로 낮춘 항목(`rate_original` → `rate`). 장해 경로가 아니면 null |
+| `verification.clause_citations` | `cited`·`grounded`·`ungrounded`(본문 첫 등장 순)·`statute_mentions` | `sections["6_본문"]` 정규식(아래) |
+| `verification.judge` | `ran`(= checked > 0)·`unavailable`(JUDGE_UNAVAILABLE 있음)·`flagged`(그 표식 뺀 판정 수)·`checked_chars`·`total_chars`·`coverage`(checked/total, 소수 2자리, total 0이면 0.0)·`evidence_chunks` | `judge_stats`·`judge_failures` |
+| `pipeline` | `nodes`(`{node, ms, status}`)·`node_count`·`failed_nodes`·`total_ms` | `node_trace`. output_guardrail까지다(collect_metrics·persist는 계산 시점에 안 끝났다). ms·깔때기 값은 음수 아닌 정수로 정규화한다 |
+| `confidence` | `{level, reasons}` | `metrics.grade_confidence`(아래 표) |
+
+**조항 인용 실재율**(LLM 없이 정규식): 본문에서 `제\s*(\d+)\s*조(?:\s*의\s*(\d+))?`를 찾아 `제12조`·`제12조의2`로 정규화하고 중복을 뺀다. 그중 법령 조문은 `statute_mentions`로만 센다. 법령 조문은 둘 중 하나다.
+
+1. **법령 이름이 인용 바로 앞에 붙어 있다.** 인용 앞 20글자 안에서 `법`·`법률`·`시행령`·`대통령령`·`총리령`·`부령`·`시행규칙`·`규칙`으로 끝나고, 그 뒤엔 `상`·닫는 괄호(`」』)`)·공백만 오는 경우다(정규식 `(?:(?<!방)법|[예소]방법|법률|시행령|대통령령|총리령|부령|시행규칙|규칙)상?[」』)]?\s*$`). 예: 상법 제651조, 민법상 제750조, 보험업법 시행령 제5조, 동법 제7조, 「약관의 규제에 관한 법률」 제6조. 맨 `령`은 넣지 않는다("보험금 수령 제5조"·"가입 연령 제3조"는 약관 인용). `방법`도 법령 이름이 아니다("청구 방법 제9조"). 단 `방법`으로 끝나는 실제 법령인 `예방법`·`소방법`(감염병예방법 제49조, 소방법 제3조)은 법령으로 본다. "대법원은 제12조"·"보험업법상 약관 제3조"처럼 사이에 다른 말이 끼면 약관 인용이다.
+2. **법령 조문에 열거로 이어진다.** 바로 앞 인용이 법령 조문이고 그 사이가 `및`·`와`·`과`·`또는`·`내지`·`,`·`·`·`ㆍ`·`~`·`제N항`·`제N호`뿐이면 같은 법령이다. 예: "상법 제651조 및 제652조", "제651조 제1항, 제652조".
+
+나머지가 `cited`이고, 그중 근거 청크의 `article_number`나 `text`에 같은 조항이 있으면 `grounded`, 없으면 `ungrounded`다.
+
+### 신뢰도 등급 (`grade_confidence`)
+
+프론트 게이지는 **추정 보상 범위**의 신뢰도다(HIGH "보수적 범위" / MEDIUM "추가 자료 시 조정" / LOW "자료 부족·변동 폭 큼"). HIGH에서 시작해 걸리는 조건마다 상한을 낮추고 사유를 모은다. LOW 조건이 하나라도 있으면 LOW, 아니면 MEDIUM 조건이 있으면 MEDIUM이다. 사유는 화면에 그대로 보여도 되는 문구이고 LOW 사유가 먼저 온다.
+
+| 상한 | 조건 | 사유(문구 그대로) |
+|---|---|---|
+| LOW | errors에 `rag_empty` | 약관 근거를 찾지 못함 |
+| LOW | errors에 `policy_not_in_db` 접두 | 가입 상품 약관이 DB에 없어 일반 약관으로 분석 |
+| LOW | `estimated_range.max` ≤ 0 또는 없음(payment_calc 실패 포함) | 보상 범위 산출 불가(제시액·가입금액 없음) |
+| MEDIUM | `payment_breakdown` 비어 있음 | 가입금액 미보유 — 제시액 기준 어림 범위 |
+| MEDIUM | `judge.ran`이 false(판정 불가, 또는 근거가 없어 Judge를 안 돌림) | 인용 검증 미수행 |
+| MEDIUM | `judge.flagged` > 0 | 근거 미확인 주장 n건 |
+| MEDIUM | `judge.ran`이고 `checked_chars` < `total_chars` | 인용 검증 범위 일부(xx%) — %는 내림 |
+| MEDIUM | `clause_citations.ungrounded` 있음 | 근거에 없는 조항 인용 n건 |
+| MEDIUM | 장해 경로(`requires_disability_review` 또는 분석 있음)인데 분석 없음·표 미검색·재평가 대상·confidence≠high·하향 교정 | 후유장해 지급률 추정 불확실 |
+| MEDIUM | `input.ocr_confidence.min` < `OCR_LOW_CONFIDENCE_THRESHOLD` | 문서 인식 신뢰도 낮음 |
+| MEDIUM | errors에 `pii_mask_failed:` 접두 | 개인정보 보호로 일부 입력 제외 |
+| MEDIUM | errors에 `diagnosis_llm_failed` | 진단 정보 자동 추출 실패 |
+| MEDIUM | `pipeline.failed_nodes` 있음 | 일부 분석 단계 실패 |
+
+### 한계
+
+- **운영에선 지금 항상 MEDIUM 이하다.** `load_context`가 `coverage_details`(특약별 가입금액)를 채우지 않아 `payment_breakdown`이 늘 비기 때문이다. 제시액 배수 어림 범위라는 사실을 그대로 드러낸 의도된 결과다.
+- **LOW 문구와 원인이 어긋나는 경우가 있다(2026-11-12 결정: 그대로 둔다).** LOW 사유 중 "약관 근거를 찾지 못함"(`rag_empty`)·"가입 상품 약관이 DB에 없어 일반 약관으로 분석"(`policy_not_in_db`)은 우리 약관 코퍼스가 비어서 생긴다. 그런데 프론트 LOW 문구는 "자료가 부족해 변동 폭이 커요. 자료 보강을 권해요."로 고객에게 행동을 요구한다(`terms_parse`는 스텁이라 고객이 자료를 더 내도 등급이 바뀌지 않는다). 그래도 신뢰도를 실제보다 높게 보이지 않도록 LOW를 유지한다. 사유별 문구는 2단계(backend가 `draft.metrics.confidence.reasons`를 내려주고 프론트가 사유를 보여줌)에서 해결한다.
+- `pipeline.total_ms`는 노드 소요 시간의 합이다. 라우터(`policy_in_db`의 DB 조회)·LangGraph 오버헤드·collect_metrics·persist는 빠진다(벽시계 시간이 아니다).
+- 조항 인용은 휴리스틱이다. `제`가 없는 인용("12조")은 세지 않는다. 법령 이름과 인용 사이에 괄호 개정일 같은 말이 끼면("상법(2014. 3. 11. 개정) 제651조") 약관 인용으로 센다(근거에 없으면 `ungrounded`). 거꾸로 `법`·`규칙`으로 끝나는 일반 명사가 인용에 바로 붙으면("해석 규칙 제5조") 법령으로 빠진다(`방법`만 뺐다. "도수치료 요법 제3조"·"비급여 치료법 제4조"도 법령으로 빠진다). `grounded`는 그 조항 번호가 근거에 있다는 뜻일 뿐이고, 인용한 내용이 맞는지는 Judge 몫이다.
+- Judge 근거 상한은 20건(약관 8 + 장해분류표 ≤8 + 판례 4)이다. 어느 검색의 top_k라도 늘리면 맨 뒤 판례부터 조용히 빠진다. `judge.evidence_chunks` < `retrieval.evidence` 합계로만 드러난다.
+- `pii_masked`는 `[분류]` 토큰 수다. 원문에 처음부터 있던 `[이름]` 글자도 세고, `guard_input`의 `***` 가림과 마스킹 실패로 비운 필드는 세지 않는다.
+- OCR 신뢰도 임계값은 이 워커의 `OCR_LOW_CONFIDENCE_THRESHOLD`(기본 0.90)다. OCR 워커에서 이 값을 다시 맞추면 report 배포 env에도 같은 값을 줘야 판정이 같아진다. 비교는 표시값(소수 3자리)으로 한다(`real` 왕복 오차 0.9 → 0.8999999를 흡수). `0.0`은 인식 라인이 하나도 없던 문서다.
 
 ## 입력 / 출력 (계약)
 

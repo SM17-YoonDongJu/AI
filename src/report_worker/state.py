@@ -52,6 +52,19 @@ class ReportState(TypedDict, total=False):
     report: str  # 통합 Markdown
     judge_failures: list[str]  # 출력 가드레일 인용검증 실패 섹션
 
+    # ── 리포트 수치 (draft.metrics — metrics.py, README "리포트 수치") ──────
+    # 여기 선언하지 않은 키는 LangGraph가 머지하지 않고 조용히 버린다 — 새 수치 키도 반드시 선언한다.
+    # 전부 PII 없는 값이다(분류값·건수·글자 수·노드명).
+    # [{"node", "ms", "status": "ok"|"failed"}] — safe_node가 노드가 끝날 때마다 덧붙인다
+    node_trace: list[dict[str, Any]]
+    # [{"doc_type", "ocr_confidence": float|None, "doc_type_confidence": float|None}] 문서 순
+    input_documents: list[dict[str, Any]]
+    case_funnel: dict[str, int]  # 판례 깔때기 {"candidates","deduped","relevant","kept"}
+    # Judge가 실제로 본 범위 {"checked_chars","total_chars","evidence_chunks"}(OutputGuardResult)
+    judge_stats: dict[str, int]
+    report_metrics: dict[str, Any]  # collect_metrics 산출 → report_drafts.draft["metrics"]
+    confidence_level: str  # "HIGH"|"MEDIUM"|"LOW" → reports.confidence_level
+
     # ── 운영 ──────────────────────────────────────────────
     errors: list[str]  # 노드별 fallback/실패 기록 (부분결과 표기)
     # 노드 안에서 난 ai_client 예외의 종류(safe_node가 예외 타입으로 판정). 값이 있으면 그래프가

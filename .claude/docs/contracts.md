@@ -191,6 +191,8 @@
 }
 ```
 - 금액은 **단정 금지** → 항상 `estimated_range`(범위)로만 표현(가드레일 강제).
+- `draft.metrics`(2026-11-11 추가, 선택 키): 리포트 생성 과정의 기술 수치(입력 품질·검색 근거·검증·처리 경로·신뢰도 등급과 사유). 구조는 `src/report_worker/README.md`의 "리포트 수치" 절이 단일 출처다. 계산에 실패하면 키가 없을 수 있다 — 읽는 쪽은 없음을 허용해야 한다. PII 없음: 건수·분류값·조항 번호·노드명과 소요 ms만 담는다. 예외 하나는 `verification.disability.reclassified[].injury`(LLM이 붙인 손상명 — 같은 값이 이미 `draft.disability`에 있다, 건강정보이며 식별자 아님).
+- `core.reports.confidence_level`(backend 소유 컬럼, varchar(10))에 `HIGH`·`MEDIUM`·`LOW` 중 하나를 쓴다(`draft.metrics.confidence.level`과 같은 값). backend가 고객 상세·검수 화면에 내려주고 프론트가 추정 보상 범위의 신뢰도 게이지로 보여준다. 쓰려면 `ai_owner`(prod는 `ai_owner_prod`)에 이 컬럼 UPDATE 권한이 있어야 한다(`deploy/schema_split*.sql`). 권한이 없으면 이 값만 건너뛰고 리포트는 저장된다.
 
 ---
 
