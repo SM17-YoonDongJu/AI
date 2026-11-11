@@ -110,10 +110,13 @@ diagnosis ───────────── LLM: 진단명·ICD·사고유
                        report_compose ── LLM: 8섹션 본문 + issues + 생성 가드레일
                              │
                              ▼
-                       output_guardrail ── 법적 고지문 + LLM Judge 인용 검증
+                       output_guardrail ── 법적 고지문 + LLM Judge 인용 검증(근거 = 약관·장해분류표·판례)
                              │
                              ▼
-                          persist ──────── report_drafts/reports/report_issues 저장
+                       collect_metrics ─── 리포트 수치(draft.metrics)·신뢰도 등급 (LLM·DB 없음)
+                             │
+                             ▼
+                          persist ──────── report_drafts/reports(+confidence_level)/report_issues 저장
                              │
                              ▼
                             END
@@ -140,6 +143,9 @@ diagnosis ───────────── LLM: 진단명·ICD·사고유
 - 분석: `diagnosis`, `retrieved_clauses`, `applicable_coverages`, `missing_coverages`,
   `coverage_analysis`, `disability_analysis`, `legal_references`, `estimated_range`
 - 산출: `sections`, `issues`, `report`, `judge_failures`
+- 리포트 수치(2026-11-11): `node_trace`, `input_documents`, `case_funnel`, `judge_stats` →
+  `collect_metrics`가 `report_metrics`·`confidence_level`로 묶는다(스키마·등급 규칙은
+  [`src/report_worker/README.md`](../../src/report_worker/README.md) "리포트 수치")
 - 운영: `errors` (노드별 폴백/실패 기록 — 부분결과 표기용)
 
 ### 오류 처리 패턴 — `@safe_node` (`agents.py:30`)
@@ -190,8 +196,9 @@ src/report_worker/
 ├── graph.py               StateGraph 조립 (build_graph)
 ├── state.py               ReportState TypedDict
 ├── disability_rules.py    ★ 결정론 지급률 합산 (순수 함수, 단위테스트 가능)
+├── metrics.py             리포트 수치·신뢰도 등급·Judge 근거 조립 (순수 함수)
 ├── nodes/
-│   └── agents.py          14개 노드 전부 (async)
+│   └── agents.py          그래프 노드 전부 (async, 2026-11-11 기준 17개 — collect_metrics 포함)
 └── rag/
     └── hybrid.py          src/rag 어댑터 (RagResult → 노드용 dict 변환)
 

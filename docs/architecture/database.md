@@ -419,6 +419,7 @@ AND applies_from <= $idx AND (applies_to IS NULL OR $idx < applies_to)
        uuid.UUID(state["ocr_result_id"]),
    )  # agents.py:69-72
    ```
+   2026-11-11부터 청구 문서·대표 문서 두 SELECT 모두 `ocr_confidence`·`doc_type_confidence`도 읽는다(리포트 수치 `input_documents`용 — 프롬프트엔 안 들어간다). 컬럼이 없거나 NULL이어도 load_context는 실패하지 않는다(`row.get`).
 2. **reports** — 사고 기본정보 + `claim_id` 로드:
    ```python
    rep = await c.fetchrow(
@@ -471,7 +472,7 @@ AND applies_from <= $idx AND (applies_to IS NULL OR $idx < applies_to)
 
 ## 5. persist 매핑 (state → 테이블/컬럼) — 결과를 DB에 저장하기
 
-`persist` 노드(`agents.py:570-630`)는 한 트랜잭션(`async with c.transaction()`, `agents.py:597`) 안에서 `report_drafts` UPSERT → `reports` UPDATE → `report_issues` DELETE+INSERT를 차례로 한다.
+`persist` 노드(`agents.py:570-630`)는 한 트랜잭션(`async with c.transaction()`, `agents.py:597`) 안에서 `report_drafts` UPSERT → `reports` UPDATE → (2026-11-11) `reports.confidence_level` 세이브포인트 UPDATE → `report_issues` DELETE+INSERT를 차례로 한다.
 
 > 트랜잭션 = 여러 쓰기를 "전부 성공 아니면 전부 취소"로 묶는 것. 은행 이체처럼 중간에 실패하면 앞선 것도 없던 일로 되돌린다.
 >
@@ -516,6 +517,7 @@ INSERT INTO report_drafts (report_id, draft, status)
 | `legal_references` | `case_refs` (판례·분쟁조정 근거 별도 보존) (`:589`) |
 | `disability` | `state.disability_analysis` (장해지급률·근거, P1) (`:590`) |
 | `errors` | `state.errors` (`:591`) |
+| `metrics` | `state.report_metrics` — 리포트 수치(입력 품질·검색 근거·검증·노드 소요 시간·신뢰도 등급과 사유). 2026-11-11 추가, `collect_metrics`가 계산하고 실패하면 키가 없다. 스키마는 [`src/report_worker/README.md`](../../src/report_worker/README.md) "리포트 수치" |
 
 > 표 읽는 법: 이 JSON 한 칸(`draft`) 안에 리포트 산출물 전체가 통째로 보존된다. 본문 8섹션, 추정 금액 범위, 고지문, 인용검증 실패 기록, 쟁점, 근거 등이 모두 들어간다.
 
@@ -542,6 +544,22 @@ UPDATE reports SET
 | (고정) | `updated_at` | `now()` |
 
 > 표 읽는 법: `$1`~`$6`은 위 SQL의 자리표시자 순서다. 즉 이 표는 "SQL의 몇 번째 자리에 어떤 state 값이 들어가는지"를 풀어 놓은 것이다. `status`는 항상 `'AWAITING_ADOPTION'`(채택 대기)로 고정 설정된다.
+
+### 5-D′. `reports.confidence_level` 세이브포인트 UPDATE (2026-11-11 추가)
+
+```sql
+-- agents._UPDATE_CONFIDENCE_LEVEL_SQL — 위 UPDATE 다음, 같은 트랜잭션 안의 중첩 트랜잭션(SAVEPOINT)
+UPDATE reports SET confidence_level = $2 WHERE id = $1
+```
+
+| 파라미터 | reports 컬럼 | state 소스 |
+|----------|--------------|-----------|
+| `$1` | `id` (WHERE) | `uuid.UUID(state.report_id)` |
+| `$2` | `confidence_level` (varchar(10)) | `state.confidence_level` — `HIGH`·`MEDIUM`·`LOW`(대문자) 중 하나일 때만 쓴다 |
+
+- backend 소유 컬럼이라 워커 계정(`ai_owner`, prod `ai_owner_prod`)에 컬럼 UPDATE 권한이 따로 필요하다(`deploy/schema_split*.sql`). WHERE의 `id`는 이미 있는 테이블 SELECT 권한으로 읽는다.
+- 권한이 없으면(`InsufficientPrivilegeError`) 세이브포인트만 되돌리고 경고 로그를 남긴 뒤 나머지(초안·reports·쟁점)를 커밋한다. 그 밖의 DB 오류는 바깥 트랜잭션까지 롤백되는 `persist_failed`(하드 실패)다.
+- 수치 계산이 실패해 값이 없으면(`collect_metrics_failed:*`) 이 UPDATE를 하지 않는다.
 
 ### 5-E. `report_issues` DELETE + INSERT (`agents.py:618-629`)
 
@@ -595,6 +613,7 @@ UPDATE reports SET status = 'BLOCKED', updated_at = now() WHERE id = $1
                                                     │  omitted_special_contract│  ◄─ persist UPDATE
                                                     │  basis_terms_precedents  │  ◄─ persist UPDATE
                                                     │  claimed_min/max_amount  │  ◄─ persist UPDATE
+                                                    │  confidence_level        │  ◄─ persist UPDATE(세이브포인트)
                                                     └──────┬────────────┼───┼──┘
                                                            │ id(PK)     │   │
                         ┌──────────────┐                   │            │   │
@@ -674,7 +693,7 @@ UPDATE reports SET status = 'BLOCKED', updated_at = now() WHERE id = $1
 
 ### JSONB 용도
 - `ocr_results.entities`(추출 엔티티, `02:10`), `user_claims.hospitalization`(입원 이력 배열, `02:21`), `report_drafts.draft`(리포트 초안 전체 구조, `02:70`)가 JSONB다.
-- 읽을 때 dict가 아니면 `json.loads`로 방어적으로 변환한다(`agents.py:96-98`). 쓸 때는 `json.dumps(..., ensure_ascii=False)`로 문자열화한 뒤 `$2::jsonb`로 캐스트한다(`agents.py:603`·`600`). `draft` JSONB는 sections·estimated_range·disclaimer·judge_failures·issues·disability·errors 등 리포트 산출물 전체를 **영구 보존**하는 그릇이다(§5-C).
+- 읽을 때 dict가 아니면 `json.loads`로 방어적으로 변환한다(`agents.py:96-98`). 쓸 때는 `json.dumps(..., ensure_ascii=False)`로 문자열화한 뒤 `$2::jsonb`로 캐스트한다(`agents.py:603`·`600`). `draft` JSONB는 sections·estimated_range·disclaimer·judge_failures·issues·disability·errors·metrics(2026-11-11) 등 리포트 산출물 전체를 **영구 보존**하는 그릇이다(§5-C).
 
 > 쉽게 말하면: JSONB는 "형태가 자유로운 데이터"를 한 칸에 통째로 담는 타입이다. 입원 이력처럼 항목 수가 들쭉날쭉한 정보나, 리포트 초안 전체 구조를 한꺼번에 넣기에 편하다.
 

@@ -80,10 +80,10 @@ load_context → input_guardrail →⟨차단?⟩→ persist_blocked → END
                                      → coverage_analysis → case_search →⟨후유장해?⟩
                                         → disability_rag → disability_calc ─┐
                                         └──────────────(불필요)────────────→ payment_calc
-                                     → report_compose → output_guardrail → persist → END
+                                     → report_compose → output_guardrail → collect_metrics → persist → END
    │
    ▼  DB 쓰기 (한 트랜잭션)
-report_drafts (UPSERT) · reports (UPDATE status=AWAITING_ADOPTION) · report_issues (DELETE+INSERT)
+report_drafts (UPSERT, draft.metrics 포함) · reports (UPDATE status=AWAITING_ADOPTION, confidence_level은 세이브포인트) · report_issues (DELETE+INSERT)
 ```
 
 > 순서도 읽는 법: 화살표를 따라 왼쪽에서 오른쪽으로 흐르고, `⟨…?⟩`가 갈림길이다. 예를 들어 입력 가드레일에서 "차단?"이 참이면 곧장 차단 기록 후 종료(`persist_blocked → END`)하고, 후유장해가 없으면 지급률 계산을 건너뛰어 `payment_calc`로 바로 간다.
@@ -161,7 +161,7 @@ report_drafts (UPSERT) · reports (UPDATE status=AWAITING_ADOPTION) · report_is
 1. **초기 주입**: `worker.handle_job`이 `report_id`·`ocr_result_id`·`claim_id`·`user_ref`·`doc_type`만 넣는다. 나머지는 그래프가 채운다.
 2. **컨텍스트 생성**: `load_context`가 `case_info`·`masked_text`·`entities`·`subscribed_coverages`를 만든다(유일한 생산자, 이후 노드는 읽기만).
 3. **분석 누적**: `diagnosis`→`coverage_analysis`→`case_search`→`disability_rag`→`disability_calc`→`payment_calc`가 각각 `diagnosis`·`retrieved_clauses`·`coverage_analysis`·`legal_references`·`disability_analysis`·`estimated_range`를 추가/증강한다.
-4. **산출**: `report_compose`가 `sections`·`issues`·`report`를, `output_guardrail`이 `report`(고지문 반영)·`judge_failures`를 남긴다.
+4. **산출**: `report_compose`가 `sections`·`issues`·`report`를, `output_guardrail`이 `report`(고지문 반영)·`judge_failures`·`judge_stats`를 남긴다. 그다음 `collect_metrics`(2026-11-11 추가, LLM·DB 없음)가 리포트 수치 `report_metrics`(→ `report_drafts.draft.metrics`)와 신뢰도 등급 `confidence_level`(→ `reports.confidence_level`)을 만든다 — 스키마·등급 규칙은 [`src/report_worker/README.md`](../../src/report_worker/README.md) "리포트 수치".
 5. **운영 채널 `errors[]`**: 모든 노드가 실패·폴백을 `_err`로 **누적 append**한다. `@safe_node`가 예외를 이 채널로 흡수해 "한 노드 실패 = 전체 실패"가 아니라 **부분결과 리포트**가 나오게 한다. worker는 `errors` 중 하드실패 prefix(`load_context_failed`·`persist_failed`·`ocr_result_missing`)가 있을 때만 예외를 올려 Kafka 재시도/DLQ로 보낸다.
 
 > 쉽게 말하면: 하나의 서류 묶음(state)을 작업대들이 한 명씩 이어받아 자기 칸만 채워 나간다고 보면 된다. `load_context`가 밑그림(사고 정보·가린 텍스트·추출 항목·가입 특약)을 그리면, 뒤 작업대들은 그걸 읽어 분석 결과를 한 칸씩 덧붙인다.

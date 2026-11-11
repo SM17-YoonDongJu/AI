@@ -83,10 +83,10 @@ load_context → input_guardrail →⟨차단?⟩→ persist_blocked → END
                                      → coverage_analysis → case_search →⟨후유장해?⟩
                                         → disability_rag → disability_calc ─┐
                                         └──────────────(불필요)────────────→ payment_calc
-                                     → report_compose → output_guardrail → persist → END
+                                     → report_compose → output_guardrail → collect_metrics → persist → END
    │
    ▼  DB 쓰기 (한 트랜잭션)
-report_drafts (UPSERT) · reports (UPDATE status=AWAITING_ADOPTION) · report_issues (DELETE+INSERT)
+report_drafts (UPSERT, draft.metrics 포함) · reports (UPDATE status=AWAITING_ADOPTION, confidence_level은 세이브포인트) · report_issues (DELETE+INSERT)
 ```
 
 > 순서도 읽는 법: 화살표를 따라 왼쪽에서 오른쪽으로 흐르고, `⟨…?⟩`가 갈림길이다. 예를 들어 입력 가드레일에서 "차단?"이 참이면 곧장 차단 기록 후 종료(`persist_blocked → END`)하고, 후유장해가 없으면 지급률 계산을 건너뛰어 `payment_calc`로 바로 간다.
@@ -164,7 +164,7 @@ report_drafts (UPSERT) · reports (UPDATE status=AWAITING_ADOPTION) · report_is
 1. **초기 주입**: `worker.handle_job`이 `report_id`·`ocr_result_id`·`claim_id`·`user_ref`·`doc_type`만 넣는다. 나머지는 그래프가 채운다.
 2. **컨텍스트 생성**: `load_context`가 `case_info`·`masked_text`·`entities`·`subscribed_coverages`를 만든다(유일한 생산자, 이후 노드는 읽기만).
 3. **분석 누적**: `diagnosis`→`coverage_analysis`→`case_search`→`disability_rag`→`disability_calc`→`payment_calc`가 각각 `diagnosis`·`retrieved_clauses`·`coverage_analysis`·`legal_references`·`disability_analysis`·`estimated_range`를 추가/증강한다.
-4. **산출**: `report_compose`가 `sections`·`issues`·`report`를, `output_guardrail`이 `report`(고지문 반영)·`judge_failures`를 남긴다.
+4. **산출**: `report_compose`가 `sections`·`issues`·`report`를, `output_guardrail`이 `report`(고지문 반영)·`judge_failures`·`judge_stats`를 남긴다. 그다음 `collect_metrics`(2026-11-11 추가, LLM·DB 없음)가 리포트 수치 `report_metrics`(→ `report_drafts.draft.metrics`)와 신뢰도 등급 `confidence_level`(→ `reports.confidence_level`)을 만든다 — 스키마·등급 규칙은 [`src/report_worker/README.md`](../../src/report_worker/README.md) "리포트 수치".
 5. **운영 채널 `errors[]`**: 모든 노드가 실패·폴백을 `_err`로 **누적 append**한다. `@safe_node`가 예외를 이 채널로 흡수해 "한 노드 실패 = 전체 실패"가 아니라 **부분결과 리포트**가 나오게 한다. worker는 `errors` 중 하드실패 prefix(`load_context_failed`·`persist_failed`·`ocr_result_missing`)가 있을 때만 예외를 올려 Kafka 재시도/DLQ로 보낸다.
 
 > 쉽게 말하면: 하나의 서류 묶음(state)을 작업대들이 한 명씩 이어받아 자기 칸만 채워 나간다고 보면 된다. `load_context`가 밑그림(사고 정보·가린 텍스트·추출 항목·가입 특약)을 그리면, 뒤 작업대들은 그걸 읽어 분석 결과를 한 칸씩 덧붙인다.
@@ -324,7 +324,7 @@ load_context → input_guardrail →⟨차단?⟩→ persist_blocked → END
                                      → coverage_analysis → case_search →⟨후유장해?⟩
                                         → disability_rag → disability_calc ─┐
                                         └──────────────(불필요)────────────→ payment_calc
-                                     → report_compose → output_guardrail → persist → END
+                                     → report_compose → output_guardrail → collect_metrics → persist → END
 ```
 
 김씨 사례(교통사고·후유장해)를 이 흐름에 태워 노드별로 따라가 보자.
@@ -373,10 +373,12 @@ load_context → input_guardrail →⟨차단?⟩→ persist_blocked → END
 
 **⑪ `report_compose` — 리포트 본문 조립(LLM 2회 + 생성 가드레일).** 9개 섹션(사건요약·적용특약·누락가능특약·약관근거·판례근거·추정보상범위·장해지급률·본문·추가확인필요)과 쟁점(issues)을 Markdown으로 엮는다(`agents.py:486-557`). 이때 **생성 가드레일**이 "정확히 3,000만 원"처럼 단정하는 금액 표현을 "참고 추정 범위"로 바꾼다.
 
-**⑫ `output_guardrail` — 출구 검문(고지문 + LLM Judge).** 법적 고지문을 삽입하고, LLM Judge가 인용이 실제 근거와 맞는지 검증한다(`run_judge=True`, `agents.py:561-566`). 실패는 `judge_failures`로 따로 기록한다.
+**⑫ `output_guardrail` — 출구 검문(고지문 + LLM Judge).** 법적 고지문을 삽입하고, LLM Judge가 인용이 실제 근거와 맞는지 검증한다(`run_judge=True`, `agents.py:561-566`). 실패는 `judge_failures`로 따로 기록한다. 2026-11-11부터 근거는 약관 → 장해분류표 → 판례 순(중복 제거)이고, Judge가 실제로 본 범위(글자 수·근거 청크 수)를 `judge_stats`로 남긴다.
 > ⚠️ 정직 표기: LLM Judge는 현재 "탐지는 하되 조치는 안 하는" **관찰 전용**이다. 문서가 약속한 인용 강제·환각 섹션 자동삭제는 미구현이다.
 
-**⑬ `persist` — 저장(정상 종료).** 한 트랜잭션 안에서 세 테이블에 쓴다(`agents.py:570-630`).
+**⑫′ `collect_metrics` — 리포트 수치 정리(2026-11-11 추가, LLM·DB 없음).** 입력 문서 품질(OCR·분류 신뢰도, 가린 PII 건수)·검색 근거·검증 결과(조항 인용 실재율, Judge 범위)·노드별 소요 시간을 `report_metrics`로 묶고, 추정 보상 범위의 신뢰도 등급(`HIGH`·`MEDIUM`·`LOW`)과 사유를 정한다. 계산이 실패해도 저장은 계속한다(`collect_metrics_failed:*`, 소프트 실패). 스키마·등급 규칙은 [`src/report_worker/README.md`](../../src/report_worker/README.md) "리포트 수치".
+
+**⑬ `persist` — 저장(정상 종료).** 한 트랜잭션 안에서 세 테이블에 쓴다(`agents.py:570-630`). 초안에는 `metrics`(⑫′의 수치, 계산에 실패했으면 키 없음)도 들어간다.
 
 ```sql
 INSERT INTO report_drafts (report_id, draft, status)
@@ -391,6 +393,14 @@ UPDATE reports SET
    status = 'AWAITING_ADOPTION', updated_at = now()
  WHERE id = $1
 ```
+
+이어서 신뢰도 등급을 **세이브포인트**(같은 트랜잭션 안의 중첩 트랜잭션) 안에서 따로 쓴다(2026-11-11 추가).
+
+```sql
+UPDATE reports SET confidence_level = $2 WHERE id = $1   -- 'HIGH' | 'MEDIUM' | 'LOW'
+```
+
+`confidence_level`은 backend 소유 컬럼이라 워커 계정에 컬럼 UPDATE 권한(`deploy/schema_split*.sql`)이 따로 필요하다. 권한이 없으면 이 문장만 되돌리고 경고 로그를 남긴 채 나머지를 커밋한다 — 권한 적용 전에 배포해도 리포트는 저장된다. 그 밖의 DB 오류는 지금처럼 저장 실패(`persist_failed`)다.
 
 그리고 `report_issues`는 **먼저 지우고 다시 넣는다**(`DELETE ... WHERE report_id=$1` 후 INSERT).
 
@@ -419,8 +429,9 @@ UPDATE reports SET status = 'BLOCKED', updated_at = now() WHERE id = $1
 | `disability_calc` | `disability_analysis` | `disability_analysis`(+combined_rate 등) | 결정론 `combine_disability_rate` |
 | `payment_calc` | `case_info`, `disability_analysis` | `estimated_range` | — |
 | `report_compose` | 다수 | `sections`, `issues`, `report` | LLM 2회 + 생성 가드레일 |
-| `output_guardrail` | `report`, `retrieved_clauses` | `report`, `judge_failures` | 출력 가드레일(LLM Judge) |
-| `persist` | 다수 | `errors`(패스스루) | DB 트랜잭션(drafts UPSERT, reports UPDATE=`AWAITING_ADOPTION`, issues DELETE+INSERT) |
+| `output_guardrail` | `report`, `retrieved_clauses`, `legal_references` | `report`, `judge_failures`, `judge_stats` | 출력 가드레일(LLM Judge, 근거 = 약관·장해분류표·판례) |
+| `collect_metrics` | 수치 재료(`node_trace`·`input_documents`·`case_funnel`·`judge_stats` 등) | `report_metrics`, `confidence_level` | 없음(순수 계산 `metrics.py`). errors: (예외 시)`collect_metrics_failed:*` |
+| `persist` | 다수 | `errors`(패스스루) | DB 트랜잭션(drafts UPSERT — `draft.metrics` 포함, reports UPDATE=`AWAITING_ADOPTION`, `confidence_level` 세이브포인트 UPDATE, issues DELETE+INSERT) |
 | `persist_blocked` | `errors`, `report_id` | `errors`(패스스루) | DB `UPDATE reports SET status='BLOCKED'` |
 
 > 표 읽는 법: `case_info`는 `load_context`만 만들고 이후 노드는 읽기만 한다. 노드가 전부 순차 실행이라 동시 쓰기가 없어, 각 노드는 부분 dict만 반환하고 LangGraph가 합쳐 준다. `errors`만 모든 노드가 누적해서 덧붙인다.
@@ -677,6 +688,8 @@ _HARD_FAILURE_PREFIXES = ("load_context_failed", "persist_failed", "ocr_result_m
 > 출처: AI 엔진 아키텍처 문서 세트 · 최종 점검일 2026-07-15 · 브랜치 `11-feature-langgraph-멀티에이전트-구현`
 > 상위: [README](./README.md) · 원본 코드 정독 + 적대적 교차검증(코드 재대조) 완료
 
+> **주의 — 2026-11-11 부분 갱신**: `output_guardrail`과 `persist` 사이에 `collect_metrics` 노드(리포트 수치 `draft.metrics`·신뢰도 등급 `reports.confidence_level`, LLM·DB 없음)를 추가했고, `output_guardrail`의 Judge 근거에 판례가 들어갔고, `persist`가 `draft.metrics`와 `reports.confidence_level`(세이브포인트)을 쓴다. 이 문서에는 그 부분만 반영했다. 노드 수("14개")·`파일:라인`·그 밖의 서술(`disability_verify`·`persist_refused`·실패 단락 등)은 07-15 스냅숏 그대로다. 현행 그래프와 실패 규칙은 [`src/report_worker/README.md`](../../src/report_worker/README.md)가 기준이다.
+
 > 🎯 **한 문장 요약**
 > 리포트 워커는 보험 청구 한 건이 들어오면, 정해진 순서대로 14개의 작업 단계를 자동으로 거치게 해서 손해사정 리포트 초안을 만들어 주는 프로그램이다.
 
@@ -708,11 +721,12 @@ g.add_node("disability_calc", agents.disability_calc)
 g.add_node("payment_calc", agents.payment_calc)
 g.add_node("report_compose", agents.report_compose)
 g.add_node("output_guardrail", agents.output_guardrail)
+g.add_node("collect_metrics", agents.collect_metrics)  # 2026-11-11 추가
 g.add_node("persist", agents.persist)
 g.add_node("persist_blocked", agents.persist_blocked)
 ```
 
-작업대(노드)는 모두 14개다. 갈림길을 판단하는 라우터 함수 3개(`route_after_input`, `policy_in_db`, `route_after_case`)는 **노드로 등록하지 않는다.** 이들은 `add_conditional_edges`에서 "어느 길로 갈지" 정하는 판단 함수로만 쓰인다 (`graph.py:39,48,60`).
+작업대(노드)는 모두 14개다(07-15 기준 — 위 `collect_metrics`는 그 뒤 추가). 갈림길을 판단하는 라우터 함수 3개(`route_after_input`, `policy_in_db`, `route_after_case`)는 **노드로 등록하지 않는다.** 이들은 `add_conditional_edges`에서 "어느 길로 갈지" 정하는 판단 함수로만 쓰인다 (`graph.py:39,48,60`).
 
 > 쉽게 말하면: 라우터는 작업대가 아니라, 갈림길에 서서 "이쪽으로 가세요"라고 방향만 알려주는 안내판이다.
 
@@ -729,7 +743,8 @@ g.add_node("persist_blocked", agents.persist_blocked)
 - `disability_calc → payment_calc` (`graph.py:64`)
 - `payment_calc → report_compose` (`graph.py:66`)
 - `report_compose → output_guardrail` (`graph.py:67`)
-- `output_guardrail → persist` (`graph.py:68`)
+- `output_guardrail → collect_metrics` (2026-11-11 — 예전엔 `output_guardrail → persist` 직결)
+- `collect_metrics → persist` (2026-11-11)
 - `persist → END` (`graph.py:69`)
 - `persist_blocked → END` (`graph.py:70`)
 
@@ -823,6 +838,9 @@ g.add_conditional_edges(
                        │                  output_guardrail
                        │                        │
                        │                        ▼
+                       │                  collect_metrics   (2026-11-11 추가)
+                       │                        │
+                       │                        ▼
                        │                     persist
                        │                        │
                        └────────────┐           ▼
@@ -876,10 +894,11 @@ def safe_node(fn: Callable[[ReportState], Awaitable[dict[str, Any]]]):
 - `payment_calc` (`agents.py:472`)
 - `report_compose` (`agents.py:486`)
 - `output_guardrail` (`agents.py:561`)
+- `collect_metrics` (2026-11-11 추가)
 - `persist` (`agents.py:570`)
 - `persist_blocked` (`agents.py:634`)
 
-실제로 14개 작업대 **전부**에 `@safe_node`가 붙어 있다.
+실제로 14개 작업대 **전부**에 `@safe_node`가 붙어 있다(뒤에 추가된 `collect_metrics`도). 2026-11-11부터 `safe_node`는 모든 반환(정상·예외)에 그 노드의 소요 시간을 `node_trace`(`{"node", "ms", "status": "ok"|"failed"}`)로 덧붙인다 — 리포트 수치의 `pipeline` 절이다.
 
 **어디엔 안 붙나 (라우터 3개):**
 - `policy_in_db` (`agents.py:171`) — 데코레이터가 없다. 대신 함수 안에 자체 `try/except`가 있어서, DB 조회가 실패하면 안전하게 `"terms_parse"`를 돌려준다 (`agents.py:176-190`).
@@ -1074,25 +1093,35 @@ return {
 
 - **(a) 파일:라인** — `agents.py:561-566`
 - **(b) 하는 일** — 출력 가드레일이다. 법적 고지문을 끼워 넣고, LLM Judge(AI가 쓴 내용이 근거와 맞는지 다른 AI가 채점하는 검사)로 인용을 검증한다.
-- **(c) 서류철에서 읽는 항목** — `report`(`agents.py:564`), `retrieved_clauses`(`agents.py:564`).
-- **(d) 서류철에 쓰는 항목** — `report`(고지문 등이 반영된 최종본), `judge_failures` (`agents.py:566`).
-- **(e) LLM 호출** — 가드레일 내부의 LLM Judge(`run_judge=True`) (`agents.py:564`).
+- **(c) 서류철에서 읽는 항목** — `report`, `retrieved_clauses`, `legal_references`(2026-11-11부터).
+- **(d) 서류철에 쓰는 항목** — `report`(고지문 등이 반영된 최종본), `judge_failures`, `judge_stats`(Judge가 실제로 본 범위 `{checked_chars, total_chars, evidence_chunks}`, 2026-11-11부터).
+- **(e) LLM 호출** — 가드레일 내부의 LLM Judge(`run_judge=True`).
 - **(f) DB 쿼리** — 없음.
-- **(g) RAG/가드레일** — `guardrail.guard_output(state.get("report",""), run_judge=True, chunks=state.get("retrieved_clauses", []))` (`agents.py:563-565`). 돌아온 `g.final_text`, `g.judge_failures`를 쓴다.
+- **(g) RAG/가드레일** — `guardrail.guard_output(state.get("report",""), run_judge=True, chunks=metrics.judge_evidence(state))`. 근거는 약관 → 장해분류표 → 판례 순으로 중복 없이 넘긴다(07-15에는 `retrieved_clauses`만 넘겨 판례가 검증 밖이었다). 돌아온 `g.final_text`, `g.judge_failures`, `g.judge_*`를 쓴다.
 - **(h) 남기는 errors 표식** — 없음(문제가 있으면 `judge_failures`에 따로 적는다).
 
 > 쉽게 말하면: 리포트를 내보내기 전에, 다른 AI가 검사관이 되어 "이 문장이 진짜 근거 조항과 맞나?"를 채점한다. 어긋난 부분은 `judge_failures`에 적어 둔다.
+
+### 3-12b. `collect_metrics` — 리포트 수치 정리 (2026-11-11 추가)
+
+- **(b) 하는 일** — 리포트를 만드는 동안 나온 기술 수치(입력 문서 품질·검색 근거·검증 결과·노드 소요 시간)를 묶고, 추정 보상 범위의 신뢰도 등급(`HIGH`·`MEDIUM`·`LOW`)과 사유를 정한다. 계산은 `report_worker/metrics.py`의 순수 함수(`build_report_metrics`·`grade_confidence`)가 한다.
+- **(c) 서류철에서 읽는 항목** — `node_trace`, `input_documents`, `masked_text`, `case_info`, `retrieved_clauses`, `legal_references`, `case_funnel`, `diagnosis`, `disability_analysis`, `estimated_range`, `payment_breakdown`, `sections`, `judge_failures`, `judge_stats`, `errors`.
+- **(d) 서류철에 쓰는 항목** — `report_metrics`(→ `report_drafts.draft["metrics"]`), `confidence_level`(→ `reports.confidence_level`).
+- **(e) LLM 호출** — 없음. **(f) DB** — 없음. **(g) RAG/가드레일** — 없음(`guardrail.count_masked_pii`로 마스킹 토큰만 센다).
+- **(h) 남기는 errors 표식** — 예외가 나면 `safe_node`가 `collect_metrics_failed:*`(소프트 실패)로 남기고 `persist`로 간다. 초안은 `metrics` 없이 저장된다.
+- 스키마·등급 규칙·한계는 [`src/report_worker/README.md`](../../src/report_worker/README.md) "리포트 수치" 절이 단일 출처다.
 
 ### 3-13. `persist` — 저장 (정상 종료)
 
 - **(a) 파일:라인** — `agents.py:570-630`
 - **(b) 하는 일** — `report_drafts`(업서트), `reports`(갱신), `report_issues`(지운 뒤 다시 삽입)에 결과를 영구 저장한다. 정상적으로 끝나는 종료 작업대다.
-- **(c) 서류철에서 읽는 항목** — `coverage_analysis`(citations) (`agents.py:573`), `legal_references`(`agents.py:574-576`), `disability_analysis`(citations) (`agents.py:577`), `sections`·`estimated_range`·`judge_failures`·`issues`·`applicable_coverages`·`missing_coverages` (`agents.py:580-591`), `report_id`(`agents.py:593`), `errors`(`agents.py:591,630`).
+- **(c) 서류철에서 읽는 항목** — `coverage_analysis`(citations) (`agents.py:573`), `legal_references`(`agents.py:574-576`), `disability_analysis`(citations) (`agents.py:577`), `sections`·`estimated_range`·`judge_failures`·`issues`·`applicable_coverages`·`missing_coverages` (`agents.py:580-591`), `report_id`(`agents.py:593`), `errors`(`agents.py:591,630`), 그리고 2026-11-11부터 `report_metrics`·`confidence_level`(바로 앞 `collect_metrics`가 만든 값).
 - **(d) 서류철에 쓰는 항목** — `errors`(받은 그대로 반환) (`agents.py:630`). 실제 결과물은 DB에 남는 부수효과다.
 - **(e) LLM 호출** — 없음.
 - **(f) DB 쿼리** — 트랜잭션(`c.transaction()`, `agents.py:597`) 안에서 실행한다:
   1. `INSERT INTO report_drafts (report_id, draft, status) VALUES ($1,$2::jsonb,'draft') ON CONFLICT (report_id) DO UPDATE SET draft=EXCLUDED.draft, status='draft'` — **멱등 업서트**(같은 걸 여러 번 실행해도 한 번 한 것과 결과가 같음) (`agents.py:598-604`).
   2. `UPDATE reports SET applicable_guarantees=$2, omitted_special_contract=$3, basis_terms_precedents=$4, claimed_min_amount=$5, claimed_max_amount=$6, status='AWAITING_ADOPTION', updated_at=now() WHERE id=$1` (`agents.py:605-617`).
+  2′. (2026-11-11 추가) `confidence_level`이 `HIGH`·`MEDIUM`·`LOW` 중 하나면 `UPDATE reports SET confidence_level=$2 WHERE id=$1`를 **세이브포인트**(같은 트랜잭션 안의 중첩 `c.transaction()`) 안에서 실행한다. backend 소유 컬럼이라 컬럼 UPDATE 권한(`deploy/schema_split*.sql`)이 따로 필요한데, 권한이 없으면(`InsufficientPrivilegeError`) 이 문장만 되돌리고 경고 `report confidence level not saved`를 남긴 채 나머지를 커밋한다. 그 밖의 DB 오류는 지금처럼 `persist_failed`다.
   3. `DELETE FROM report_issues WHERE report_id=$1` (`agents.py:618`).
   4. issues의 각 항목을 `INSERT INTO report_issues (id, report_id, title, description, ai_status, tags) VALUES ($1..$6)`로 넣는다 — id는 `uuid.uuid4()`, title은 200자로 자르고, ai_status가 없으면 `"INFO"`로 둔다 (`agents.py:619-629`).
 - **(g) RAG/가드레일** — `guardrail.DISCLAIMER`(법적 고지문)를 draft에 끼워 넣는다 (`agents.py:583`).
@@ -1100,7 +1129,7 @@ return {
 
 > 쉽게 말하면: 트랜잭션은 "전부 되거나, 아니면 전부 없던 일로" 처리하는 묶음이다. 저장 중간에 하나라도 실패하면 앞서 한 것까지 다 되돌려, 반쪽짜리로 저장되는 사고를 막는다. 그리고 멱등 업서트 덕분에 같은 리포트를 두 번 처리해도 중복 저장 없이 최신 한 벌만 남는다.
 
-`basis`는 `terms_cites + case_refs + da_cites`를 합친 것이다 (`agents.py:578`). draft dict에는 sections·estimated_range·disclaimer·judge_failures·issues·applicable_guarantees·omitted_special_contract·basis_terms_precedents·legal_references·disability·errors를 담고, `json.dumps(..., ensure_ascii=False)`로 문자열로 만든다 (`agents.py:580-603`).
+`basis`는 `terms_cites + case_refs + da_cites`를 합친 것이다 (`agents.py:578`). draft dict에는 sections·estimated_range·disclaimer·judge_failures·issues·applicable_guarantees·omitted_special_contract·basis_terms_precedents·legal_references·disability·errors를 담고(2026-11-11부터 `report_metrics`가 있으면 `metrics` 키도 — 리포트 수치), `json.dumps(..., ensure_ascii=False)`로 문자열로 만든다 (`agents.py:580-603`).
 
 ### 3-14. `persist_blocked` — 차단 기록 (차단 경로 종료)
 
@@ -1203,8 +1232,9 @@ def route_after_case(state: ReportState) -> str:
 | `disability_calc` (`agents.py:456`) | `disability_analysis` | `disability_analysis`(+combined_rate, +normalized_items, rule_notes 병합) | 없음(결정론 `combine_disability_rate`) |
 | `payment_calc` (`agents.py:472`) | `case_info`(offered_amount), `disability_analysis`(combined_rate) | `estimated_range` | 없음 |
 | `report_compose` (`agents.py:486`) | `case_info`, `coverage_analysis`, `diagnosis`, `disability_analysis`, `applicable_coverages`, `missing_coverages`, `estimated_range`, `legal_references`, `errors` | `sections`, `issues`, `report` | LLM `chat`(본문)+`chat_json`(issues), 생성가드레일 `guard_generation` |
-| `output_guardrail` (`agents.py:561`) | `report`, `retrieved_clauses` | `report`, `judge_failures` | 출력가드레일 `guard_output(run_judge=True)` (LLM Judge) |
-| `persist` (`agents.py:570`) | `coverage_analysis`, `legal_references`, `disability_analysis`, `sections`, `estimated_range`, `judge_failures`, `issues`, `applicable_coverages`, `missing_coverages`, `report_id`, `errors` | `errors`(패스스루) | DB 트랜잭션: report_drafts 업서트, reports UPDATE(status='AWAITING_ADOPTION'), report_issues DELETE+INSERT. DISCLAIMER 삽입 |
+| `output_guardrail` (`agents.py:561`) | `report`, `retrieved_clauses`, `legal_references` | `report`, `judge_failures`, `judge_stats` | 출력가드레일 `guard_output(run_judge=True)` (LLM Judge, 근거 = 약관·장해분류표·판례) |
+| `collect_metrics` (2026-11-11) | 수치 재료(`node_trace`·`input_documents`·`case_funnel`·`judge_stats` 등, §3-12b) | `report_metrics`, `confidence_level` | 없음(순수 계산 `metrics.py`) |
+| `persist` (`agents.py:570`) | `coverage_analysis`, `legal_references`, `disability_analysis`, `sections`, `estimated_range`, `judge_failures`, `issues`, `applicable_coverages`, `missing_coverages`, `report_metrics`, `confidence_level`, `report_id`, `errors` | `errors`(패스스루) | DB 트랜잭션: report_drafts 업서트(`draft.metrics` 포함), reports UPDATE(status='AWAITING_ADOPTION'), reports.confidence_level 세이브포인트 UPDATE(권한 없으면 건너뜀), report_issues DELETE+INSERT. DISCLAIMER 삽입 |
 | `persist_blocked` (`agents.py:634`) | `errors`, `report_id` | `errors`(패스스루) | DB `UPDATE reports SET status='BLOCKED'`. 로그만 |
 
 참고로, `case_info`는 `load_context`만 만들어 넣고, 그 뒤 작업대들은 읽기만 한다. `disability_analysis`는 `disability_rag`가 만들고 → `disability_calc`가 살을 붙이고 → `payment_calc`·`report_compose`·`persist`가 가져다 쓴다. 작업대가 순서대로 하나씩 돌기 때문에 두 곳에서 동시에 쓰는 일이 없고, 그래서 값을 합치는 reducer(`Annotated[..., add]`)를 쓰지 않는다 (`state.py:3-4`). 오직 `errors`만 각 작업대가 `_err`로 계속 이어 붙인다.
@@ -1722,6 +1752,7 @@ AND applies_from <= $idx AND (applies_to IS NULL OR $idx < applies_to)
        uuid.UUID(state["ocr_result_id"]),
    )  # agents.py:69-72
    ```
+   2026-11-11부터 청구 문서·대표 문서 두 SELECT 모두 `ocr_confidence`·`doc_type_confidence`도 읽는다(리포트 수치 `input_documents`용 — 프롬프트엔 안 들어간다). 컬럼이 없거나 NULL이어도 load_context는 실패하지 않는다(`row.get`).
 2. **reports** — 사고 기본정보 + `claim_id` 로드:
    ```python
    rep = await c.fetchrow(
@@ -1774,7 +1805,7 @@ AND applies_from <= $idx AND (applies_to IS NULL OR $idx < applies_to)
 
 ## 5. persist 매핑 (state → 테이블/컬럼) — 결과를 DB에 저장하기
 
-`persist` 노드(`agents.py:570-630`)는 한 트랜잭션(`async with c.transaction()`, `agents.py:597`) 안에서 `report_drafts` UPSERT → `reports` UPDATE → `report_issues` DELETE+INSERT를 차례로 한다.
+`persist` 노드(`agents.py:570-630`)는 한 트랜잭션(`async with c.transaction()`, `agents.py:597`) 안에서 `report_drafts` UPSERT → `reports` UPDATE → (2026-11-11) `reports.confidence_level` 세이브포인트 UPDATE → `report_issues` DELETE+INSERT를 차례로 한다.
 
 > 트랜잭션 = 여러 쓰기를 "전부 성공 아니면 전부 취소"로 묶는 것. 은행 이체처럼 중간에 실패하면 앞선 것도 없던 일로 되돌린다.
 >
@@ -1819,6 +1850,7 @@ INSERT INTO report_drafts (report_id, draft, status)
 | `legal_references` | `case_refs` (판례·분쟁조정 근거 별도 보존) (`:589`) |
 | `disability` | `state.disability_analysis` (장해지급률·근거, P1) (`:590`) |
 | `errors` | `state.errors` (`:591`) |
+| `metrics` | `state.report_metrics` — 리포트 수치(입력 품질·검색 근거·검증·노드 소요 시간·신뢰도 등급과 사유). 2026-11-11 추가, `collect_metrics`가 계산하고 실패하면 키가 없다. 스키마는 [`src/report_worker/README.md`](../../src/report_worker/README.md) "리포트 수치" |
 
 > 표 읽는 법: 이 JSON 한 칸(`draft`) 안에 리포트 산출물 전체가 통째로 보존된다. 본문 8섹션, 추정 금액 범위, 고지문, 인용검증 실패 기록, 쟁점, 근거 등이 모두 들어간다.
 
@@ -1845,6 +1877,22 @@ UPDATE reports SET
 | (고정) | `updated_at` | `now()` |
 
 > 표 읽는 법: `$1`~`$6`은 위 SQL의 자리표시자 순서다. 즉 이 표는 "SQL의 몇 번째 자리에 어떤 state 값이 들어가는지"를 풀어 놓은 것이다. `status`는 항상 `'AWAITING_ADOPTION'`(채택 대기)로 고정 설정된다.
+
+### 5-D′. `reports.confidence_level` 세이브포인트 UPDATE (2026-11-11 추가)
+
+```sql
+-- agents._UPDATE_CONFIDENCE_LEVEL_SQL — 위 UPDATE 다음, 같은 트랜잭션 안의 중첩 트랜잭션(SAVEPOINT)
+UPDATE reports SET confidence_level = $2 WHERE id = $1
+```
+
+| 파라미터 | reports 컬럼 | state 소스 |
+|----------|--------------|-----------|
+| `$1` | `id` (WHERE) | `uuid.UUID(state.report_id)` |
+| `$2` | `confidence_level` (varchar(10)) | `state.confidence_level` — `HIGH`·`MEDIUM`·`LOW`(대문자) 중 하나일 때만 쓴다 |
+
+- backend 소유 컬럼이라 워커 계정(`ai_owner`, prod `ai_owner_prod`)에 컬럼 UPDATE 권한이 따로 필요하다(`deploy/schema_split*.sql`). WHERE의 `id`는 이미 있는 테이블 SELECT 권한으로 읽는다.
+- 권한이 없으면(`InsufficientPrivilegeError`) 세이브포인트만 되돌리고 경고 로그를 남긴 뒤 나머지(초안·reports·쟁점)를 커밋한다. 그 밖의 DB 오류는 바깥 트랜잭션까지 롤백되는 `persist_failed`(하드 실패)다.
+- 수치 계산이 실패해 값이 없으면(`collect_metrics_failed:*`) 이 UPDATE를 하지 않는다.
 
 ### 5-E. `report_issues` DELETE + INSERT (`agents.py:618-629`)
 
@@ -1898,6 +1946,7 @@ UPDATE reports SET status = 'BLOCKED', updated_at = now() WHERE id = $1
                                                     │  omitted_special_contract│  ◄─ persist UPDATE
                                                     │  basis_terms_precedents  │  ◄─ persist UPDATE
                                                     │  claimed_min/max_amount  │  ◄─ persist UPDATE
+                                                    │  confidence_level        │  ◄─ persist UPDATE(세이브포인트)
                                                     └──────┬────────────┼───┼──┘
                                                            │ id(PK)     │   │
                         ┌──────────────┐                   │            │   │
@@ -1977,7 +2026,7 @@ UPDATE reports SET status = 'BLOCKED', updated_at = now() WHERE id = $1
 
 ### JSONB 용도
 - `ocr_results.entities`(추출 엔티티, `02:10`), `user_claims.hospitalization`(입원 이력 배열, `02:21`), `report_drafts.draft`(리포트 초안 전체 구조, `02:70`)가 JSONB다.
-- 읽을 때 dict가 아니면 `json.loads`로 방어적으로 변환한다(`agents.py:96-98`). 쓸 때는 `json.dumps(..., ensure_ascii=False)`로 문자열화한 뒤 `$2::jsonb`로 캐스트한다(`agents.py:603`·`600`). `draft` JSONB는 sections·estimated_range·disclaimer·judge_failures·issues·disability·errors 등 리포트 산출물 전체를 **영구 보존**하는 그릇이다(§5-C).
+- 읽을 때 dict가 아니면 `json.loads`로 방어적으로 변환한다(`agents.py:96-98`). 쓸 때는 `json.dumps(..., ensure_ascii=False)`로 문자열화한 뒤 `$2::jsonb`로 캐스트한다(`agents.py:603`·`600`). `draft` JSONB는 sections·estimated_range·disclaimer·judge_failures·issues·disability·errors·metrics(2026-11-11) 등 리포트 산출물 전체를 **영구 보존**하는 그릇이다(§5-C).
 
 > 쉽게 말하면: JSONB는 "형태가 자유로운 데이터"를 한 칸에 통째로 담는 타입이다. 입원 이력처럼 항목 수가 들쭉날쭉한 정보나, 리포트 초안 전체 구조를 한꺼번에 넣기에 편하다.
 
@@ -3083,6 +3132,8 @@ class Citation(BaseModel):
 > 출처: AI 엔진 아키텍처 문서 세트 · 최종 점검일 2026-07-15 · 브랜치 `11-feature-langgraph-멀티에이전트-구현`
 > 상위: [README](./README.md) · 원본 코드 정독 + 적대적 교차검증(코드 재대조) 완료
 
+> **주의 — 2026-11-11 부분 갱신**: 출력 가드레일의 LLM Judge 부분만 현행 코드로 고쳤다. 4절, 5.2·5.4의 `output_guardrail`, 6절의 LLM Judge 항목이 해당한다. 고친 내용은 Judge가 보는 범위(리포트 12,000자, 근거 20건×800자), 호출자가 넘기는 근거 순서(약관 → 장해분류표 → 판례), 검증 범위 필드(`judge_*`), 판정 불가 응답 처리(`JUDGE_UNAVAILABLE`)다. 그 밖의 `파일:라인`과 서술은 07-15 스냅숏 그대로다("96줄", `mask_pii`·`count_masked_pii` 없음 등). 현행 기준은 [`src/guardrail/README.md`](../../src/guardrail/README.md)다.
+
 ## 🎯 한 문장 요약
 
 가드레일은 AI가 만든 보험·법률 답변에서 개인정보를 가리고, 위험한 단정 표현을 완화하고, 법적 고지문을 붙이고, 근거 없는 주장(환각)을 점검하는 3단계 안전장치 모듈이다.
@@ -3288,7 +3339,7 @@ docs·README는 생성 단계에서 "모든 사실 주장에 `[조항번호][판
 
 ## 4. 출력 가드레일 — `guard_output`
 
-### 4.1 전체 코드(verbatim)
+### 4.1 코드 (2026-11-11 기준 발췌, verbatim)
 
 ```python
 DISCLAIMER = (
@@ -3296,85 +3347,111 @@ DISCLAIMER = (
     "정확한 보험금 지급 여부는 담당 손해사정사의 검토 후 확정됩니다."
 )
 ```
-(`guards.py:16-19`)
+(`guards.py:26-29`)
+
+```python
+JUDGE_UNAVAILABLE = "[인용 검증 미수행 — LLM Judge 호출 실패]"
+...
+JUDGE_MAX_REPORT_CHARS = 12_000  # 리포트(고지문 포함 final_text) 앞부분 글자 수
+JUDGE_MAX_EVIDENCE_CHUNKS = 20  # 약관 8 + 장해분류표 ≤8 + 판례 4가 다 들어가는 건수
+JUDGE_EVIDENCE_CHARS = 800  # 청크당 글자 수. 장해 추출 ctx와 같다(지급률 숫자가 잘리지 않게)
+```
+(`guards.py:34-41`)
 
 ```python
 async def guard_output(
-    text: str, *, run_judge: bool = True, chunks: list | None = None
+    text: str,
+    *,
+    run_judge: bool = True,
+    chunks: list[Any] | None = None,
+    max_report_chars: int = JUDGE_MAX_REPORT_CHARS,
 ) -> OutputGuardResult:
+    """..."""
+    if max_report_chars < 1:
+        raise ValueError("max_report_chars must be at least 1")
     final = text or ""
     if DISCLAIMER not in final:
         final = f"> {DISCLAIMER}\n\n{final}"
 
-    judge_failures: list[str] = []
-    if run_judge and chunks:
-        # LLM Judge: 리포트의 인용·주장이 검색 청크 원문과 부합하는지 검증
-        ctx = "\n---\n".join(
-            (c.get("text", "") if isinstance(c, dict) else str(c))[:500] for c in chunks[:6]
-        )
-        verdict = await ai_client.chat_json(
-            [
-                {
-                    "role": "system",
-                    "content": (
-                        "너는 보험 리포트 검증관이다. 리포트의 사실 주장이 제공된 약관 원문으로 "
-                        "뒷받침되는지 검증한다. JSON만 출력."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        f"[약관 원문]\n{ctx}\n\n[리포트]\n{final[:2000]}\n\n"
-                        '근거 없는(환각) 주장이 있으면 {"failures": ["문장1", ...]}, '
-                        '없으면 {"failures": []} 형식으로만 답하라.'
-                    ),
-                },
-            ]
-        )
-        if isinstance(verdict, dict):
-            judge_failures = list(verdict.get("failures", []) or [])
+    if not (run_judge and chunks):
+        return OutputGuardResult(final_text=final, judge_failures=[], judge_total_chars=len(final))
 
-    return OutputGuardResult(final_text=final, judge_failures=judge_failures)
+    # LLM Judge: 리포트의 인용·주장이 근거 원문과 부합하는지 검증
+    report_part = final[:max_report_chars]
+    evidence = [_evidence_text(chunk) for chunk in chunks[:JUDGE_MAX_EVIDENCE_CHUNKS]]
+    try:
+        verdict = await ai_client.chat_json(_judge_messages(evidence, report_part))
+    except ai_client.AiClientError as exc:
+        # 고지문은 이미 붙었다. 여기서 예외를 올리면 호출부(report safe_node)가 삼켜 고지문
+        # 없는 원본이 저장된다 — 실패를 표식으로 남기고 고지문 붙은 본문을 돌려준다.
+        logger.warning("guardrail.judge.failed", error_type=type(exc).__name__)
+        return _judge_unavailable(final)
+
+    reason = _unusable_verdict_reason(verdict)
+    if reason is not None:
+        # 형식만 어긋난 응답을 "failures 없음 = 통과"로 읽으면 검증 못 한 리포트가 통과로 남는다
+        logger.warning("guardrail.judge.unusable_verdict", reason=reason)
+        return _judge_unavailable(final)
+
+    return OutputGuardResult(
+        final_text=final,
+        judge_failures=list(verdict["failures"]),
+        judge_checked_chars=len(report_part),
+        judge_total_chars=len(final),
+        judge_evidence_chunks=len(evidence),
+    )
 ```
-(`guards.py:61-96`)
+(`guards.py:172-237`. 헬퍼 4개 `_evidence_text`·`_judge_messages`·`_unusable_verdict_reason`·`_judge_unavailable`는 `guards.py:240-286`에 있고 4.3에서 설명한다)
 
 ### 4.2 법적 고지문 삽입
 
-- 고지문 `DISCLAIMER`는 모듈 상수(`guards.py:16-19`)로, docs에 적힌 문구와 정확히 일치한다(`06_guardrail.md:25`).
-- 삽입 방식은 **멱등(idempotent, 같은 걸 여러 번 실행해도 결과가 한 번 한 것과 똑같음)**하다: `if DISCLAIMER not in final`일 때만 앞에 붙이므로(`:65-66`) 이미 고지문이 있으면 또 붙이지 않는다.
-- 붙는 형식은 Markdown 인용블록: `> {DISCLAIMER}\n\n{final}`(`:66`).
-- `text or ""`로 빈 입력을 막는다(`:64`).
+- 고지문 `DISCLAIMER`는 모듈 상수(`guards.py:26-29`)로, docs에 적힌 문구와 정확히 일치한다(`06_guardrail.md:25`).
+- 삽입 방식은 **멱등(idempotent, 같은 걸 여러 번 실행해도 결과가 한 번 한 것과 똑같음)**하다: `if DISCLAIMER not in final`일 때만 앞에 붙이므로(`:208-209`) 이미 고지문이 있으면 또 붙이지 않는다.
+- 붙는 형식은 Markdown 인용블록: `> {DISCLAIMER}\n\n{final}`(`:209`).
+- `text or ""`로 빈 입력을 막는다(`:207`).
+- Judge 결과가 어떻든(호출 실패·판정 불가 포함) 돌려주는 `final_text`에는 고지문이 붙어 있다.
 
 > 쉽게 말하면: 고지문 붙이기를 실수로 두 번 돌려도 안내문이 두 줄로 겹치지 않는다. "이미 있으면 안 붙인다"는 조건 덕분이다.
 
 ### 4.3 LLM Judge 인용검증 (`run_judge`)
 
-여기서 **LLM Judge**란, AI가 만든 리포트를 또 다른 AI가 심사관처럼 검사하는 것이다. "리포트가 근거 자료(약관 원문)에 실제로 나오는 내용만 말했는지, 아니면 없는 얘기를 지어냈는지(환각)"를 판정한다.
+여기서 **LLM Judge**란, AI가 만든 리포트를 또 다른 AI가 심사관처럼 검사하는 것이다. "리포트가 근거 자료(약관·장해분류표·판례 원문)에 실제로 나오는 내용만 말했는지, 아니면 없는 얘기를 지어냈는지(환각)"를 판정한다.
 
-- **실행 조건**: `run_judge`와 `chunks`가 **둘 다** 참이어야 검사가 돌아간다(`:69`). 기본값은 `run_judge=True`(`:62`)지만 `chunks`(근거로 쓸 검색 조각들)가 비어 있으면(`None`이거나 빈 리스트) **검사를 건너뛴다** → `judge_failures=[]`. 즉 RAG 검색이 아무것도 못 찾아 `retrieved_clauses`가 비어 있는 리포트는 환각 검사를 아예 받지 못한다.
-- **컨텍스트(심사관에게 보여줄 근거) 구성**(`:71-73`): 검색 조각을 **최대 6개**(`chunks[:6]`)까지만, 각 조각 텍스트를 **500자에서 잘라(`[:500]`)** `\n---\n`로 이어 붙인다. 조각이 dict면 `c.get("text","")`로, 아니면 `str(c)`로 안전하게 꺼낸다.
-- **프롬프트**(`:76-90`): 시스템 역할은 "보험 리포트 검증관", 유저 메시지에는 `[약관 원문]`(ctx)과 `[리포트]`(**앞 2000자만**, `final[:2000]`)를 넣고, 근거 없는(환각) 주장을 `{"failures": ["문장1", ...]}` 형식으로 답하라고 요구한다.
-- **호출**: `core.ai_client.chat_json`(`:74`). 이 도우미는 AI가 돌려준 답에서 코드펜스(백틱 표시)를 떼고 중괄호를 찾아내는 식으로 JSON을 너그럽게 해석하며, **해석에 실패하면 빈 `{}`를 돌려준다**(`ai_client.py:101-132`). HTTP 오류(`AiClientError`)는 위로 그대로 전달되는데 `guard_output`은 이를 직접 잡지 않으므로 → 더 상위의 `safe_node` 데코레이터가 처리한다(5절).
-- **결과 파싱**(`:93-94`): `if isinstance(verdict, dict): judge_failures = list(verdict.get("failures", []) or [])`. 심사관 AI가 형식을 어겨 `{}`를 주거나 `failures` 키가 없으면 → **빈 리스트(통과로 간주)**. 즉 심사관 답변이 망가지면 조용히 "실패 없음"으로 넘어간다.
+- **실행 조건**: `run_judge`와 `chunks`가 **둘 다** 참이어야 검사가 돌아간다(`:211`). 기본값은 `run_judge=True`다. `chunks`(근거로 쓸 검색 조각들)가 비어 있으면(`None`이거나 빈 리스트) **검사를 건너뛴다**. 이때 `judge_failures=[]`이고 Judge가 본 범위는 0이다(`:212`). report는 약관·장해분류표·판례를 모두 근거로 넘긴다(5.2). 그래서 셋이 다 비었을 때만 검사를 받지 못한다.
+- **컨텍스트(심사관에게 보여줄 근거) 구성**(`:216`, `_evidence_text` `:240-243`): 근거 조각을 **앞에서부터 최대 20개**(`JUDGE_MAX_EVIDENCE_CHUNKS`)까지 넣는다. 각 조각 텍스트는 **800자에서 잘라**(`JUDGE_EVIDENCE_CHARS`) `\n---\n`로 이어 붙인다. 조각이 dict면 `text` 값을 쓰고(없거나 `None`이면 빈 문자열), 아니면 `str(c)`를 쓴다. 넘친 근거는 뒤에서부터 빠지므로 **순서는 호출자가 정한다**. report는 약관 → 장해분류표 → 판례 순으로 넘긴다. 약관 8 + 장해분류표 최대 8 + 판례 4 = 20이라 지금은 다 들어간다.
+- **프롬프트**(`_judge_messages` `:246-259`): 시스템 역할은 "보험 리포트 검증관"이고, 근거를 "근거 원문(약관·장해분류표·판례)"이라 부른다. 유저 메시지에는 `[근거 원문(약관·장해분류표·판례)]`(ctx)와 `[리포트]`(**앞 12,000자**, `final[:max_report_chars]`, 기본 `JUDGE_MAX_REPORT_CHARS`)를 넣는다. 그리고 근거 없는(환각) 주장을 `{"failures": ["문장1", ...]}` 형식으로 답하라고 요구한다. 07-15에는 리포트 앞 2,000자와 근거 6개×500자만 넣었다. 그래서 본문 뒷부분과 장해분류표·판례가 검증 밖이었다.
+- **호출**: `core.ai_client.chat_json`(`:218`). 이 도우미는 AI가 돌려준 답에서 코드펜스(백틱 표시)를 떼고 중괄호를 찾아내는 식으로 JSON을 너그럽게 해석한다. **해석에 실패하면 빈 `{}`를 돌려준다**. 호출 자체가 실패하면(`AiClientError` — 거절·429·5xx·타임아웃·출력 상한 잘림) `guard_output`이 직접 잡아 `judge_failures=[JUDGE_UNAVAILABLE]`을 돌려준다(`:219-223`). 예외를 위로 올리면 `safe_node`가 삼켜 고지문 없는 원본이 저장되기 때문이다.
+- **결과 파싱**(`_unusable_verdict_reason` `:262-279`): 프롬프트가 요구한 `{"failures": [문장, ...]}` 형식일 때만 판정으로 쓴다. 형식이 어긋나면 호출 실패와 **똑같이** `[JUDGE_UNAVAILABLE]`을 남긴다(`:225-229`). 어긋난 형식은 넷이다: `{}`(파싱 실패)나 `failures` 키 없음, `failures`가 목록이 아님, 응답이 객체가 아님, 문장이 아닌 항목. 로그에는 분류값(`reason`)만 남고 응답 본문은 남지 않는다.
 
-> 쉽게 말하면: 이 검사는 실패했을 때 막는 게 아니라 통과시키는 쪽(fail-open)으로 기운다. 심사관 AI가 답을 이상하게 주면 "문제없음"으로 처리해 버린다는 뜻이다. 안전하게 막기보다 흐름을 끊지 않는 쪽을 택한 설계다.
+> 쉽게 말하면: 07-15에는 심사관 AI가 답을 이상하게 주면 "문제없음"으로 처리했다(fail-open). 이제는 답을 못 받거나 형식이 틀리면 "검증 못 함" 표식을 남긴다. 손해사정사는 그 표식을 보고 인용을 직접 확인한다. 다만 리포트 저장을 막지는 않는다(5.2).
 
-- 통신은 Ollama HTTP(EXAONE, 로컬에서 돌리는 오픈 LLM)로 이뤄지도록 설계됐고(`06_guardrail.md:50`), 실제 접속 주소와 모델은 `core.config.settings`가 넣어 준다(`ai_client.py:82`).
+**판정 결과별 반환값.** `judge_total_chars`는 모든 경우에 `len(final_text)`다.
+
+| 경우 | `judge_failures` | `judge_checked_chars` | `judge_evidence_chunks` |
+|---|---|---|---|
+| `run_judge=False`, 또는 `chunks`가 비었거나 `None` | `[]` | 0 | 0 |
+| 판정 받음 | 판정 그대로 | `min(len(final_text), max_report_chars)` | `min(len(chunks), 20)` |
+| 호출 실패(`AiClientError`) | `[JUDGE_UNAVAILABLE]` | 0 | 0 |
+| 판정 불가 응답 | `[JUDGE_UNAVAILABLE]` | 0 | 0 |
+
+- 호출할 LLM은 `LLM_PROVIDER` 설정이 정한다. 운영 기본은 Claude(`anthropic`, 코드 기본값)이고, 로컬 `.env.example`은 `openai_compat`(Ollama 등)이다. 프롬프트는 최대 약 2만 8천 자라 `openai_compat`의 작은 컨텍스트 모델에서는 넘칠 수 있다. 서버가 거절하면 `JUDGE_UNAVAILABLE`이 된다. 서버가 조용히 잘라 처리하면 `judge_checked_chars`가 Judge가 실제로 읽은 양보다 크게 나온다(`src/guardrail/README.md` "한계").
 
 ### 4.4 결과 모델 `OutputGuardResult`
 
-`core.contracts`에 정의(`contracts.py:139-143`):
+`core.contracts`에 정의(`contracts.py:153-165`, docstring 생략):
 
 ```python
 class OutputGuardResult(BaseModel):
-    """출력 가드레일 결과. 법적 고지문 삽입 + (리포트 한정) LLM Judge 인용 검증."""
-
     final_text: str  # 고지문 삽입된 최종 텍스트
     judge_failures: list[str]  # 인용 검증 실패 섹션(리포트만, run_judge=True)
+    judge_checked_chars: int = 0  # Judge 프롬프트에 넣은 리포트 글자 수(final_text 앞부분)
+    judge_total_chars: int = 0  # final_text 전체 글자 수(검증 범위 = checked / total)
+    judge_evidence_chunks: int = 0  # Judge 프롬프트에 넣은 근거 청크 수
 ```
 
 - `final_text`: 고지문이 붙은 최종 텍스트. **심사관이 환각을 찾아내더라도 `final_text`에서 그 문장을 지우거나 바꾸지 않는다** — 원문에 고지문만 얹은 채 그대로 나간다.
-- `judge_failures`: 환각으로 지목된 문장들의 목록. **모으기만 하고 텍스트에는 반영하지 않는다.** docs가 말한 "불일치가 발견되면 그 섹션을 `[인용 검증 실패 — 삭제됨]`으로 바꾼다"(`06_guardrail.md:25`)는 **아직 구현되지 않았다**(6절 참조).
+- `judge_failures`: 환각으로 지목된 문장들의 목록이다. Judge가 판정하지 못했으면 `[JUDGE_UNAVAILABLE]` 표식 하나다. **모으기만 하고 텍스트에는 반영하지 않는다.** docs가 말한 "불일치가 발견되면 그 섹션을 `[인용 검증 실패 — 삭제됨]`으로 바꾼다"(`06_guardrail.md:25`)는 **아직 구현되지 않았다**(6절 참조).
+- `judge_checked_chars`·`judge_total_chars`·`judge_evidence_chunks`(2026-11-11 추가, 기본값 0): Judge가 **실제로 본 범위**다. 빈 `judge_failures`만으로는 "전부 검증해 통과"인지 "일부만 봤다"인지 알 수 없어서 둔다. 검증 범위는 `checked / total`이다. 값은 4.3의 표를 따른다. report는 이 셋을 `judge_stats`로 옮겨 리포트 수치(`draft.metrics.verification.judge`)와 신뢰도 등급에 쓴다.
 
 > 쉽게 말하면: 심사관이 "이 문장 근거가 없어요" 하고 표시는 하지만, 실제로 그 문장을 삭제하거나 고치지는 않는다. 지적 사항을 메모로 남길 뿐, 최종 결과물은 손대지 않는 "관찰 전용" 상태다.
 
@@ -3464,21 +3541,32 @@ async def persist_blocked(state: ReportState) -> dict[str, Any]:
 
 ### 5.2 출력 가드레일 노드 → `judge_failures`를 state에 남기는 방식
 
-**`output_guardrail` 노드**(`agents.py:561-566`):
+**`output_guardrail` 노드**(2026-11-11 기준 발췌, `agents.py`의 `output_guardrail`, docstring 생략):
 
 ```python
 @safe_node
 async def output_guardrail(state: ReportState) -> dict[str, Any]:
     g = await guardrail.guard_output(
-        state.get("report", ""), run_judge=True, chunks=state.get("retrieved_clauses", [])
+        state.get("report", ""), run_judge=True, chunks=metrics.judge_evidence(state)
     )
-    return {"report": g.final_text, "judge_failures": g.judge_failures}
+    return {
+        "report": g.final_text,
+        "judge_failures": g.judge_failures,
+        "judge_stats": {
+            "checked_chars": g.judge_checked_chars,
+            "total_chars": g.judge_total_chars,
+            "evidence_chunks": g.judge_evidence_chunks,
+        },
+    }
 ```
 
-- 입력: `state["report"]`(바로 앞 `report_compose`가 만든 통합 Markdown, `agents.py:556-557`)와 `chunks=state["retrieved_clauses"]`(RAG가 채운 검색 조각, `state.py:32`).
-- `run_judge=True`로 고정 → **리포트 경로에서는 항상 심사관을 켠다**.
-- 결과로 `report`(고지문 붙은 최종본)와 `judge_failures`를 state에 합쳐 넣는다(`state.py:48`의 `judge_failures: list[str]` 칸).
-- 그래프 순서: `report_compose → output_guardrail → persist → END`(`graph.py:66-69`).
+- 입력은 `state["report"]`(바로 앞 `report_compose`가 만든 통합 Markdown)와 근거 `metrics.judge_evidence(state)`다.
+- 근거는 **약관 → 장해분류표 → 판례** 순이고, 같은 청크는 한 번만 들어간다. 약관·장해분류표는 `retrieved_clauses`(약관에 `disability_rag`가 장해분류표를 덧붙인 병합본)에서, 판례는 `legal_references`에서 온다.
+- 07-15에는 `retrieved_clauses`만 넘겨 판례가 검증 밖이었다.
+- 근거가 20건을 넘으면 뒤의 판례부터 빠진다. 그 경우 `judge_stats.evidence_chunks`가 근거 수보다 작게 나온다.
+- `run_judge=True`로 고정 → **리포트 경로에서는 항상 심사관을 켠다**. 근거가 하나도 없을 때만 건너뛴다.
+- 결과로 `report`(고지문 붙은 최종본), `judge_failures`, `judge_stats`(Judge가 실제로 본 범위)를 state에 합쳐 넣는다. 다음 노드 `collect_metrics`가 `judge_stats`로 리포트 수치와 신뢰도 등급(`reports.confidence_level`)을 계산한다.
+- 그래프 순서: `report_compose → output_guardrail → collect_metrics → persist → END`(`collect_metrics`는 2026-11-11 추가).
 
 **`persist`가 judge_failures를 어떻게 처리하나**(`agents.py:570-592`):
 
@@ -3493,7 +3581,7 @@ async def output_guardrail(state: ReportState) -> dict[str, Any]:
 ```
 
 - `judge_failures`는 `report_drafts.draft`(jsonb 컬럼, JSON을 통째로 담는 DB 자료형)에 그대로 **보관만** 된다(`agents.py:584`, `:599-604`).
-- 중요: `judge_failures`가 비어 있지 않아도(=환각이 지목돼도) **리포트 저장을 막거나 status를 바꾸지 않는다.** `persist`는 `reports.status`를 `'AWAITING_ADOPTION'`으로 평소처럼 갱신한다(`agents.py:609`). 즉 환각 지목 결과는 "기록으로만 남고 관문 역할은 하지 않는다"(fail-open, 나중에 사람이 검토할 때 참고하는 신호).
+- 중요: `judge_failures`가 비어 있지 않아도(=환각이 지목돼도) **리포트 저장을 막거나 status를 바꾸지 않는다.** `persist`는 `reports.status`를 `'AWAITING_ADOPTION'`으로 평소처럼 갱신한다(`agents.py:609`). 즉 환각 지목 결과는 "기록으로만 남고 관문 역할은 하지 않는다"(fail-open, 나중에 사람이 검토할 때 참고하는 신호). 2026-11-11부터는 신뢰도 등급(`reports.confidence_level`)을 낮추는 사유가 된다. 세 사유는 검증 미수행(판정 불가 포함), 근거 미확인 주장 n건, 검증 범위 일부다. 하나라도 걸리면 등급은 MEDIUM 이하다. 저장은 여전히 막지 않는다.
 - 고지문 문구도 draft에 별도 필드로 한 번 더 저장된다(`draft["disclaimer"] = guardrail.DISCLAIMER`, `agents.py:583`).
 
 > 쉽게 말하면: 심사관이 "이 문장 의심스럽다"고 표시해도 리포트는 그대로 저장되고 다음 단계로 넘어간다. 그 표시는 통과를 막는 문지기가 아니라, 나중에 사람이 볼 때 "여기 한 번 보세요" 하는 포스트잇에 가깝다.
@@ -3509,11 +3597,12 @@ START → load_context → input_guardrail
         └─(route_after_input)─┬─ blocked ───────────────→ persist_blocked → END
                               └─ diagnosis → ... → report_compose(guard_generation)
                                      → output_guardrail(guard_output: 고지문+Judge)
+                                     → collect_metrics(judge_stats → 수치·신뢰도 등급)
                                      → persist(judge_failures를 draft에 보존) → END
 ```
 (`graph.py:32-72`)
 
-> 표 읽는 법: 위 그림은 리포트가 거치는 길이다. 입력 검사에서 엉뚱한 질문이면 위쪽 갈래(blocked)로 빠져 곧장 끝나고, 정상이면 아래쪽 갈래(diagnosis)로 내려가 진단→작성→출력 검사→저장을 차례로 거쳐 끝난다.
+> 표 읽는 법: 위 그림은 리포트가 거치는 길이다. 입력 검사에서 엉뚱한 질문이면 위쪽 갈래(blocked)로 빠져 곧장 끝나고, 정상이면 아래쪽 갈래(diagnosis)로 내려가 진단→작성→출력 검사→수치 계산→저장을 차례로 거쳐 끝난다.
 
 ---
 
@@ -3537,7 +3626,11 @@ START → load_context → input_guardrail
 - 주민번호 앞 6자리 보존 마스킹, 전화·계좌 마스킹 — 실제로 동작한다(`guards.py:26-33`). 문서 규칙과 일치.
 - 단정 금액 표현 치환 — 동작은 하지만 서술어 4종(`받습니다/지급됩니다/지급합니다/입니다`)과 `원` 단위에만 걸리는 **좁은 규칙**이다(`guards.py:48-50`). `"원"` 없이 쓴 `"5백만 지급"`이나 `"~로 산정됩니다"` 같은 표현은 놓친다.
 - 법적 고지문 멱등 삽입 — 실제로 동작한다(`guards.py:64-66`).
-- LLM Judge — **실제 LLM 호출까지 구현돼 있다**(`guards.py:69-94`). 다만 (a) `chunks`가 없으면 건너뛰고, (b) 리포트 앞 2000자와 청크 6개×500자만 검사하며, (c) 심사관 응답이 깨지면 통과로 처리(fail-open)하고, (d) 결과가 텍스트나 저장 관문에 반영되지 않는다 — 즉 "찾아내기는 하되 손은 대지 않는" 관찰 전용 단계다.
+- LLM Judge — **실제 LLM 호출까지 구현돼 있다**(`guards.py:172-237`). 다만 한계가 셋이다. "찾아내기는 하되 손은 대지 않는" 관찰 전용 단계다.
+  - (a) `chunks`가 없으면 건너뛴다.
+  - (b) 리포트 앞 12,000자와 근거 앞 20건×800자만 검사한다. 넘쳐서 못 본 만큼은 `judge_checked_chars`·`judge_evidence_chunks`로 드러난다.
+  - (c) 결과가 텍스트나 저장 관문에는 반영되지 않는다. 신뢰도 등급에만 반영된다(5.2).
+  - 07-15 판정의 "심사관 응답이 깨지면 통과로 처리(fail-open)"는 2026-11-11에 고쳤다. 호출 실패와 판정 불가 응답은 둘 다 `JUDGE_UNAVAILABLE` 표식으로 남는다(4.3).
 
 **추가 격차/주의:**
 
