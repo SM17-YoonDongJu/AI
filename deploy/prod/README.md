@@ -43,7 +43,8 @@ Backend(prod) ──SQS brbs-ocr-job-queue-prod──▶ brbs-ocr-prod (ocr-work
      권한을 `app_owner_prod`로 직접 넣는다.
 2. **vLLM NodePort** — K8s-manifests `envs/dev/etl-vllm.values.yaml`의 `service.nodePort: 30800`이
    머지·Sync돼 있어야 한다.
-3. **GitHub Environment `prod`** — Required reviewers(승인자)와 Deployment branches(`dev`만)로 묶여 있다.
+3. **GitHub Environment `prod`** — 승인자 두 명(`donghoong2`·`jongyo0N`) + 자기 승인 금지라, 실행하지 않은 쪽이
+   승인해야 배포된다. Deployment branches는 `dev`만 허용한다.
    승인자를 바꿀 땐 레포 Settings → Environments → `prod`에서 고친다.
    기존 시크릿(`AWS_ROLE_ARN`·`AWS_REGION`·`AWS_ECR_REGISTRY`·`DISCORD_WEBHOOK_*`)을 그대로 쓴다.
    OIDC 역할 `brbs-github-deploy`는 이미 모든 인스턴스에 `ssm:SendCommand`를 할 수 있어 바꿀 게 없다.
