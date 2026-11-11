@@ -17,6 +17,7 @@ Backend(prod) ──SQS brbs-ocr-job-queue-prod──▶ brbs-ocr-prod (ocr-work
 | `docker-compose.ocr.yml` | 호스트 compose 정본. 배포 때마다 호스트 파일을 이걸로 덮는다 |
 | `.env.ocr.example` | 호스트 `/opt/ocr/.env.ocr` 템플릿(시크릿 포함 실제 파일은 git 미커밋) |
 | `bootstrap-ocr-host.sh` | EC2 user-data — Docker·AWS CLI·RDS CA 설치 |
+| `sync-env-ocr.sh` | 호스트 `.env.ocr` 생성 — Parameter Store `/brbs/prod/ocr/` + Secrets Manager `prod/ocr` |
 | `iam-ocr-prod-policy.json` | 인스턴스 역할 인라인 정책(SQS·S3 최소 권한) |
 | `../../.github/workflows/promote-ocr-prod.yml` | 배포 — dev에서 검증한 `:<sha7>`을 승인 후 올린다 |
 
@@ -105,14 +106,28 @@ S3 비식별 사본(`masked/`) 업로드는 SSE-KMS(AWS 관리형 키 `aws/s3`)�
 
 ## 호스트 설정 (1회)
 
-user-data가 끝난 뒤(약 2~3분) SSM Session Manager로 들어가 `.env.ocr`을 채운다.
+`.env.ocr`은 손으로 쓰지 않는다. 백엔드 `deploy/prod/sync-env.sh`와 같은 방식으로, 설정은
+Parameter Store `/brbs/prod/ocr/`(String), 시크릿은 Secrets Manager `prod/ocr`에 두고
+`sync-env-ocr.sh`가 호스트에서 받아 만든다. 키 목록은 `.env.ocr.example`과 같다.
+
+| 위치 | 키 |
+|---|---|
+| Parameter Store `/brbs/prod/ocr/` | `ECR_REGISTRY` `ENV` `LOG_LEVEL` `AWS_REGION` `S3_BUCKET` `SQS_OCR_JOB_QUEUE_URL` `SQS_REPORT_JOB_QUEUE_URL` `VLM_BASE_URL` `VLM_MODEL` `USE_NER` |
+| Secrets Manager `prod/ocr` | `DATABASE_URL` (`ai_owner_prod`, 비밀번호는 `prod/rds-admin`의 `AI_OWNER_PROD_PASSWORD`) |
+
+값을 바꾼 뒤엔 스크립트를 다시 돌리고 워커를 다시 띄운다. 스크립트에 시크릿이 없어 SSM 명령으로 보내도 된다.
 
 ```bash
-aws ssm start-session --target <instance-id>
-sudo -i
-cloud-init status --wait                       # bootstrap-ocr-host.sh 완료 확인
-vi /opt/ocr/.env.ocr                           # deploy/prod/.env.ocr.example을 채워 붙여넣기(OCR_TAG는 비워 둔다)
-curl -s http://<brbs-etl 사설 IP>:30800/v1/models   # vLLM 도달 확인 — PaddleOCR-VL-1.6-0.9B가 보여야 한다
+# user-data(bootstrap-ocr-host.sh)가 끝난 뒤 — 레포 루트에서
+IID=$(aws ec2 describe-instances --filters Name=tag:Name,Values=brbs-ocr-prod Name=instance-state-name,Values=running \
+  --query 'Reservations[0].Instances[0].InstanceId' --output text)
+B64=$(base64 < deploy/prod/sync-env-ocr.sh | tr -d '\n')
+aws ssm send-command --instance-ids "$IID" --document-name AWS-RunShellScript \
+  --parameters "commands=[\"echo $B64 | base64 -d | bash\"]" --query Command.CommandId --output text
+# 결과: aws ssm get-command-invocation --command-id <id> --instance-id "$IID" --query StandardOutputContent
+
+# vLLM 도달 확인(SSM 세션에서) — PaddleOCR-VL-1.6-0.9B가 보여야 한다
+curl -s http://<brbs-etl 사설 IP>:30800/v1/models
 ```
 
 ## 배포
