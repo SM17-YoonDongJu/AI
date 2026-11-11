@@ -246,3 +246,29 @@ jobs:
           service: report
           environment: prod
           image_tag: brbs/report:${{ steps.v.outputs.sha7 }} (REPORT_TAG 갱신 — 백엔드 호스트 재기동 필요)
+
+  # 4) 릴리즈 — prod에 나간 커밋에 버전 태그(vX.Y.Z)와 GitHub Release를 단다. 백엔드 deploy-prod와 같은
+  #    semantic-release·conventionalcommits 설정(.releaserc.json)이다. 배포가 끝난 뒤에 돌아서 태그가
+  #    "prod에 실제로 나간 버전"을 뜻한다 — 배포가 실패하면 달지 않고, Run workflow로 재배포가 성공하면 그때 단다.
+  #    ci 타입만 있는 머지는 릴리즈 대상이 아니라(백엔드와 같은 규칙) 태그 없이 끝난다.
+  release:
+    needs: [deploy-ocr, report-tag]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # 태그·GitHub Release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 직전 태그 이후 커밋을 분석한다
+
+      # 버전을 묶는다: conventionalcommits 프리셋 10.x는 changelog writer 9를 요구하는데 semantic-release 25에
+      # 든 release-notes-generator는 writer 8이라, 묶지 않으면 릴리즈 노트 생성에서 실패한다
+      # ("Missing helper" — 2026-11-11 dry-run으로 재현, 9.x로 v1.0.0 노트 생성 확인).
+      - name: Semantic Release
+        uses: cycjimmy/semantic-release-action@v4
+        with:
+          semantic_version: 25
+          extra_plugins: |
+            conventional-changelog-conventionalcommits@9
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
