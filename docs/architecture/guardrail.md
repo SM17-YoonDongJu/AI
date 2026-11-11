@@ -3,6 +3,8 @@
 > 출처: AI 엔진 아키텍처 문서 세트 · 최종 점검일 2026-07-15 · 브랜치 `11-feature-langgraph-멀티에이전트-구현`
 > 상위: [README](./README.md) · 원본 코드 정독 + 적대적 교차검증(코드 재대조) 완료
 
+> **주의 — 2026-11-11 부분 갱신**: 출력 가드레일의 LLM Judge 부분만 현행 코드로 고쳤다. 4절, 5.2·5.4의 `output_guardrail`, 6절의 LLM Judge 항목이 해당한다. 고친 내용은 Judge가 보는 범위(리포트 12,000자, 근거 20건×800자), 호출자가 넘기는 근거 순서(약관 → 장해분류표 → 판례), 검증 범위 필드(`judge_*`), 판정 불가 응답 처리(`JUDGE_UNAVAILABLE`)다. 그 밖의 `파일:라인`과 서술은 07-15 스냅숏 그대로다("96줄", `mask_pii`·`count_masked_pii` 없음 등). 현행 기준은 [`src/guardrail/README.md`](../../src/guardrail/README.md)다.
+
 ## 🎯 한 문장 요약
 
 가드레일은 AI가 만든 보험·법률 답변에서 개인정보를 가리고, 위험한 단정 표현을 완화하고, 법적 고지문을 붙이고, 근거 없는 주장(환각)을 점검하는 3단계 안전장치 모듈이다.
@@ -208,7 +210,7 @@ docs·README는 생성 단계에서 "모든 사실 주장에 `[조항번호][판
 
 ## 4. 출력 가드레일 — `guard_output`
 
-### 4.1 전체 코드(verbatim)
+### 4.1 코드 (2026-11-11 기준 발췌, verbatim)
 
 ```python
 DISCLAIMER = (
@@ -216,85 +218,111 @@ DISCLAIMER = (
     "정확한 보험금 지급 여부는 담당 손해사정사의 검토 후 확정됩니다."
 )
 ```
-(`guards.py:16-19`)
+(`guards.py:26-29`)
+
+```python
+JUDGE_UNAVAILABLE = "[인용 검증 미수행 — LLM Judge 호출 실패]"
+...
+JUDGE_MAX_REPORT_CHARS = 12_000  # 리포트(고지문 포함 final_text) 앞부분 글자 수
+JUDGE_MAX_EVIDENCE_CHUNKS = 20  # 약관 8 + 장해분류표 ≤8 + 판례 4가 다 들어가는 건수
+JUDGE_EVIDENCE_CHARS = 800  # 청크당 글자 수. 장해 추출 ctx와 같다(지급률 숫자가 잘리지 않게)
+```
+(`guards.py:34-41`)
 
 ```python
 async def guard_output(
-    text: str, *, run_judge: bool = True, chunks: list | None = None
+    text: str,
+    *,
+    run_judge: bool = True,
+    chunks: list[Any] | None = None,
+    max_report_chars: int = JUDGE_MAX_REPORT_CHARS,
 ) -> OutputGuardResult:
+    """..."""
+    if max_report_chars < 1:
+        raise ValueError("max_report_chars must be at least 1")
     final = text or ""
     if DISCLAIMER not in final:
         final = f"> {DISCLAIMER}\n\n{final}"
 
-    judge_failures: list[str] = []
-    if run_judge and chunks:
-        # LLM Judge: 리포트의 인용·주장이 검색 청크 원문과 부합하는지 검증
-        ctx = "\n---\n".join(
-            (c.get("text", "") if isinstance(c, dict) else str(c))[:500] for c in chunks[:6]
-        )
-        verdict = await ai_client.chat_json(
-            [
-                {
-                    "role": "system",
-                    "content": (
-                        "너는 보험 리포트 검증관이다. 리포트의 사실 주장이 제공된 약관 원문으로 "
-                        "뒷받침되는지 검증한다. JSON만 출력."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        f"[약관 원문]\n{ctx}\n\n[리포트]\n{final[:2000]}\n\n"
-                        '근거 없는(환각) 주장이 있으면 {"failures": ["문장1", ...]}, '
-                        '없으면 {"failures": []} 형식으로만 답하라.'
-                    ),
-                },
-            ]
-        )
-        if isinstance(verdict, dict):
-            judge_failures = list(verdict.get("failures", []) or [])
+    if not (run_judge and chunks):
+        return OutputGuardResult(final_text=final, judge_failures=[], judge_total_chars=len(final))
 
-    return OutputGuardResult(final_text=final, judge_failures=judge_failures)
+    # LLM Judge: 리포트의 인용·주장이 근거 원문과 부합하는지 검증
+    report_part = final[:max_report_chars]
+    evidence = [_evidence_text(chunk) for chunk in chunks[:JUDGE_MAX_EVIDENCE_CHUNKS]]
+    try:
+        verdict = await ai_client.chat_json(_judge_messages(evidence, report_part))
+    except ai_client.AiClientError as exc:
+        # 고지문은 이미 붙었다. 여기서 예외를 올리면 호출부(report safe_node)가 삼켜 고지문
+        # 없는 원본이 저장된다 — 실패를 표식으로 남기고 고지문 붙은 본문을 돌려준다.
+        logger.warning("guardrail.judge.failed", error_type=type(exc).__name__)
+        return _judge_unavailable(final)
+
+    reason = _unusable_verdict_reason(verdict)
+    if reason is not None:
+        # 형식만 어긋난 응답을 "failures 없음 = 통과"로 읽으면 검증 못 한 리포트가 통과로 남는다
+        logger.warning("guardrail.judge.unusable_verdict", reason=reason)
+        return _judge_unavailable(final)
+
+    return OutputGuardResult(
+        final_text=final,
+        judge_failures=list(verdict["failures"]),
+        judge_checked_chars=len(report_part),
+        judge_total_chars=len(final),
+        judge_evidence_chunks=len(evidence),
+    )
 ```
-(`guards.py:61-96`)
+(`guards.py:172-237`. 헬퍼 4개 `_evidence_text`·`_judge_messages`·`_unusable_verdict_reason`·`_judge_unavailable`는 `guards.py:240-286`에 있고 4.3에서 설명한다)
 
 ### 4.2 법적 고지문 삽입
 
-- 고지문 `DISCLAIMER`는 모듈 상수(`guards.py:16-19`)로, docs에 적힌 문구와 정확히 일치한다(`06_guardrail.md:25`).
-- 삽입 방식은 **멱등(idempotent, 같은 걸 여러 번 실행해도 결과가 한 번 한 것과 똑같음)**하다: `if DISCLAIMER not in final`일 때만 앞에 붙이므로(`:65-66`) 이미 고지문이 있으면 또 붙이지 않는다.
-- 붙는 형식은 Markdown 인용블록: `> {DISCLAIMER}\n\n{final}`(`:66`).
-- `text or ""`로 빈 입력을 막는다(`:64`).
+- 고지문 `DISCLAIMER`는 모듈 상수(`guards.py:26-29`)로, docs에 적힌 문구와 정확히 일치한다(`06_guardrail.md:25`).
+- 삽입 방식은 **멱등(idempotent, 같은 걸 여러 번 실행해도 결과가 한 번 한 것과 똑같음)**하다: `if DISCLAIMER not in final`일 때만 앞에 붙이므로(`:208-209`) 이미 고지문이 있으면 또 붙이지 않는다.
+- 붙는 형식은 Markdown 인용블록: `> {DISCLAIMER}\n\n{final}`(`:209`).
+- `text or ""`로 빈 입력을 막는다(`:207`).
+- Judge 결과가 어떻든(호출 실패·판정 불가 포함) 돌려주는 `final_text`에는 고지문이 붙어 있다.
 
 > 쉽게 말하면: 고지문 붙이기를 실수로 두 번 돌려도 안내문이 두 줄로 겹치지 않는다. "이미 있으면 안 붙인다"는 조건 덕분이다.
 
 ### 4.3 LLM Judge 인용검증 (`run_judge`)
 
-여기서 **LLM Judge**란, AI가 만든 리포트를 또 다른 AI가 심사관처럼 검사하는 것이다. "리포트가 근거 자료(약관 원문)에 실제로 나오는 내용만 말했는지, 아니면 없는 얘기를 지어냈는지(환각)"를 판정한다.
+여기서 **LLM Judge**란, AI가 만든 리포트를 또 다른 AI가 심사관처럼 검사하는 것이다. "리포트가 근거 자료(약관·장해분류표·판례 원문)에 실제로 나오는 내용만 말했는지, 아니면 없는 얘기를 지어냈는지(환각)"를 판정한다.
 
-- **실행 조건**: `run_judge`와 `chunks`가 **둘 다** 참이어야 검사가 돌아간다(`:69`). 기본값은 `run_judge=True`(`:62`)지만 `chunks`(근거로 쓸 검색 조각들)가 비어 있으면(`None`이거나 빈 리스트) **검사를 건너뛴다** → `judge_failures=[]`. 즉 RAG 검색이 아무것도 못 찾아 `retrieved_clauses`가 비어 있는 리포트는 환각 검사를 아예 받지 못한다.
-- **컨텍스트(심사관에게 보여줄 근거) 구성**(`:71-73`): 검색 조각을 **최대 6개**(`chunks[:6]`)까지만, 각 조각 텍스트를 **500자에서 잘라(`[:500]`)** `\n---\n`로 이어 붙인다. 조각이 dict면 `c.get("text","")`로, 아니면 `str(c)`로 안전하게 꺼낸다.
-- **프롬프트**(`:76-90`): 시스템 역할은 "보험 리포트 검증관", 유저 메시지에는 `[약관 원문]`(ctx)과 `[리포트]`(**앞 2000자만**, `final[:2000]`)를 넣고, 근거 없는(환각) 주장을 `{"failures": ["문장1", ...]}` 형식으로 답하라고 요구한다.
-- **호출**: `core.ai_client.chat_json`(`:74`). 이 도우미는 AI가 돌려준 답에서 코드펜스(백틱 표시)를 떼고 중괄호를 찾아내는 식으로 JSON을 너그럽게 해석하며, **해석에 실패하면 빈 `{}`를 돌려준다**(`ai_client.py:101-132`). HTTP 오류(`AiClientError`)는 위로 그대로 전달되는데 `guard_output`은 이를 직접 잡지 않으므로 → 더 상위의 `safe_node` 데코레이터가 처리한다(5절).
-- **결과 파싱**(`:93-94`): `if isinstance(verdict, dict): judge_failures = list(verdict.get("failures", []) or [])`. 심사관 AI가 형식을 어겨 `{}`를 주거나 `failures` 키가 없으면 → **빈 리스트(통과로 간주)**. 즉 심사관 답변이 망가지면 조용히 "실패 없음"으로 넘어간다.
+- **실행 조건**: `run_judge`와 `chunks`가 **둘 다** 참이어야 검사가 돌아간다(`:211`). 기본값은 `run_judge=True`다. `chunks`(근거로 쓸 검색 조각들)가 비어 있으면(`None`이거나 빈 리스트) **검사를 건너뛴다**. 이때 `judge_failures=[]`이고 Judge가 본 범위는 0이다(`:212`). report는 약관·장해분류표·판례를 모두 근거로 넘긴다(5.2). 그래서 셋이 다 비었을 때만 검사를 받지 못한다.
+- **컨텍스트(심사관에게 보여줄 근거) 구성**(`:216`, `_evidence_text` `:240-243`): 근거 조각을 **앞에서부터 최대 20개**(`JUDGE_MAX_EVIDENCE_CHUNKS`)까지 넣는다. 각 조각 텍스트는 **800자에서 잘라**(`JUDGE_EVIDENCE_CHARS`) `\n---\n`로 이어 붙인다. 조각이 dict면 `text` 값을 쓰고(없거나 `None`이면 빈 문자열), 아니면 `str(c)`를 쓴다. 넘친 근거는 뒤에서부터 빠지므로 **순서는 호출자가 정한다**. report는 약관 → 장해분류표 → 판례 순으로 넘긴다. 약관 8 + 장해분류표 최대 8 + 판례 4 = 20이라 지금은 다 들어간다.
+- **프롬프트**(`_judge_messages` `:246-259`): 시스템 역할은 "보험 리포트 검증관"이고, 근거를 "근거 원문(약관·장해분류표·판례)"이라 부른다. 유저 메시지에는 `[근거 원문(약관·장해분류표·판례)]`(ctx)와 `[리포트]`(**앞 12,000자**, `final[:max_report_chars]`, 기본 `JUDGE_MAX_REPORT_CHARS`)를 넣는다. 그리고 근거 없는(환각) 주장을 `{"failures": ["문장1", ...]}` 형식으로 답하라고 요구한다. 07-15에는 리포트 앞 2,000자와 근거 6개×500자만 넣었다. 그래서 본문 뒷부분과 장해분류표·판례가 검증 밖이었다.
+- **호출**: `core.ai_client.chat_json`(`:218`). 이 도우미는 AI가 돌려준 답에서 코드펜스(백틱 표시)를 떼고 중괄호를 찾아내는 식으로 JSON을 너그럽게 해석한다. **해석에 실패하면 빈 `{}`를 돌려준다**. 호출 자체가 실패하면(`AiClientError` — 거절·429·5xx·타임아웃·출력 상한 잘림) `guard_output`이 직접 잡아 `judge_failures=[JUDGE_UNAVAILABLE]`을 돌려준다(`:219-223`). 예외를 위로 올리면 `safe_node`가 삼켜 고지문 없는 원본이 저장되기 때문이다.
+- **결과 파싱**(`_unusable_verdict_reason` `:262-279`): 프롬프트가 요구한 `{"failures": [문장, ...]}` 형식일 때만 판정으로 쓴다. 형식이 어긋나면 호출 실패와 **똑같이** `[JUDGE_UNAVAILABLE]`을 남긴다(`:225-229`). 어긋난 형식은 넷이다: `{}`(파싱 실패)나 `failures` 키 없음, `failures`가 목록이 아님, 응답이 객체가 아님, 문장이 아닌 항목. 로그에는 분류값(`reason`)만 남고 응답 본문은 남지 않는다.
 
-> 쉽게 말하면: 이 검사는 실패했을 때 막는 게 아니라 통과시키는 쪽(fail-open)으로 기운다. 심사관 AI가 답을 이상하게 주면 "문제없음"으로 처리해 버린다는 뜻이다. 안전하게 막기보다 흐름을 끊지 않는 쪽을 택한 설계다.
+> 쉽게 말하면: 07-15에는 심사관 AI가 답을 이상하게 주면 "문제없음"으로 처리했다(fail-open). 이제는 답을 못 받거나 형식이 틀리면 "검증 못 함" 표식을 남긴다. 손해사정사는 그 표식을 보고 인용을 직접 확인한다. 다만 리포트 저장을 막지는 않는다(5.2).
 
-- 통신은 Ollama HTTP(EXAONE, 로컬에서 돌리는 오픈 LLM)로 이뤄지도록 설계됐고(`06_guardrail.md:50`), 실제 접속 주소와 모델은 `core.config.settings`가 넣어 준다(`ai_client.py:82`).
+**판정 결과별 반환값.** `judge_total_chars`는 모든 경우에 `len(final_text)`다.
+
+| 경우 | `judge_failures` | `judge_checked_chars` | `judge_evidence_chunks` |
+|---|---|---|---|
+| `run_judge=False`, 또는 `chunks`가 비었거나 `None` | `[]` | 0 | 0 |
+| 판정 받음 | 판정 그대로 | `min(len(final_text), max_report_chars)` | `min(len(chunks), 20)` |
+| 호출 실패(`AiClientError`) | `[JUDGE_UNAVAILABLE]` | 0 | 0 |
+| 판정 불가 응답 | `[JUDGE_UNAVAILABLE]` | 0 | 0 |
+
+- 호출할 LLM은 `LLM_PROVIDER` 설정이 정한다. 운영 기본은 Claude(`anthropic`, 코드 기본값)이고, 로컬 `.env.example`은 `openai_compat`(Ollama 등)이다. 프롬프트는 최대 약 2만 8천 자라 `openai_compat`의 작은 컨텍스트 모델에서는 넘칠 수 있다. 서버가 거절하면 `JUDGE_UNAVAILABLE`이 된다. 서버가 조용히 잘라 처리하면 `judge_checked_chars`가 Judge가 실제로 읽은 양보다 크게 나온다(`src/guardrail/README.md` "한계").
 
 ### 4.4 결과 모델 `OutputGuardResult`
 
-`core.contracts`에 정의(`contracts.py:139-143`):
+`core.contracts`에 정의(`contracts.py:153-165`, docstring 생략):
 
 ```python
 class OutputGuardResult(BaseModel):
-    """출력 가드레일 결과. 법적 고지문 삽입 + (리포트 한정) LLM Judge 인용 검증."""
-
     final_text: str  # 고지문 삽입된 최종 텍스트
     judge_failures: list[str]  # 인용 검증 실패 섹션(리포트만, run_judge=True)
+    judge_checked_chars: int = 0  # Judge 프롬프트에 넣은 리포트 글자 수(final_text 앞부분)
+    judge_total_chars: int = 0  # final_text 전체 글자 수(검증 범위 = checked / total)
+    judge_evidence_chunks: int = 0  # Judge 프롬프트에 넣은 근거 청크 수
 ```
 
 - `final_text`: 고지문이 붙은 최종 텍스트. **심사관이 환각을 찾아내더라도 `final_text`에서 그 문장을 지우거나 바꾸지 않는다** — 원문에 고지문만 얹은 채 그대로 나간다.
-- `judge_failures`: 환각으로 지목된 문장들의 목록. **모으기만 하고 텍스트에는 반영하지 않는다.** docs가 말한 "불일치가 발견되면 그 섹션을 `[인용 검증 실패 — 삭제됨]`으로 바꾼다"(`06_guardrail.md:25`)는 **아직 구현되지 않았다**(6절 참조).
+- `judge_failures`: 환각으로 지목된 문장들의 목록이다. Judge가 판정하지 못했으면 `[JUDGE_UNAVAILABLE]` 표식 하나다. **모으기만 하고 텍스트에는 반영하지 않는다.** docs가 말한 "불일치가 발견되면 그 섹션을 `[인용 검증 실패 — 삭제됨]`으로 바꾼다"(`06_guardrail.md:25`)는 **아직 구현되지 않았다**(6절 참조).
+- `judge_checked_chars`·`judge_total_chars`·`judge_evidence_chunks`(2026-11-11 추가, 기본값 0): Judge가 **실제로 본 범위**다. 빈 `judge_failures`만으로는 "전부 검증해 통과"인지 "일부만 봤다"인지 알 수 없어서 둔다. 검증 범위는 `checked / total`이다. 값은 4.3의 표를 따른다. report는 이 셋을 `judge_stats`로 옮겨 리포트 수치(`draft.metrics.verification.judge`)와 신뢰도 등급에 쓴다.
 
 > 쉽게 말하면: 심사관이 "이 문장 근거가 없어요" 하고 표시는 하지만, 실제로 그 문장을 삭제하거나 고치지는 않는다. 지적 사항을 메모로 남길 뿐, 최종 결과물은 손대지 않는 "관찰 전용" 상태다.
 
@@ -384,21 +412,32 @@ async def persist_blocked(state: ReportState) -> dict[str, Any]:
 
 ### 5.2 출력 가드레일 노드 → `judge_failures`를 state에 남기는 방식
 
-**`output_guardrail` 노드**(`agents.py:561-566`):
+**`output_guardrail` 노드**(2026-11-11 기준 발췌, `agents.py`의 `output_guardrail`, docstring 생략):
 
 ```python
 @safe_node
 async def output_guardrail(state: ReportState) -> dict[str, Any]:
     g = await guardrail.guard_output(
-        state.get("report", ""), run_judge=True, chunks=state.get("retrieved_clauses", [])
+        state.get("report", ""), run_judge=True, chunks=metrics.judge_evidence(state)
     )
-    return {"report": g.final_text, "judge_failures": g.judge_failures}
+    return {
+        "report": g.final_text,
+        "judge_failures": g.judge_failures,
+        "judge_stats": {
+            "checked_chars": g.judge_checked_chars,
+            "total_chars": g.judge_total_chars,
+            "evidence_chunks": g.judge_evidence_chunks,
+        },
+    }
 ```
 
-- 입력: `state["report"]`(바로 앞 `report_compose`가 만든 통합 Markdown, `agents.py:556-557`)와 `chunks=state["retrieved_clauses"]`(RAG가 채운 검색 조각, `state.py:32`).
-- `run_judge=True`로 고정 → **리포트 경로에서는 항상 심사관을 켠다**.
-- 결과로 `report`(고지문 붙은 최종본)와 `judge_failures`를 state에 합쳐 넣는다(`state.py:48`의 `judge_failures: list[str]` 칸).
-- 그래프 순서: `report_compose → output_guardrail → persist → END`(`graph.py:66-69`).
+- 입력은 `state["report"]`(바로 앞 `report_compose`가 만든 통합 Markdown)와 근거 `metrics.judge_evidence(state)`다.
+- 근거는 **약관 → 장해분류표 → 판례** 순이고, 같은 청크는 한 번만 들어간다. 약관·장해분류표는 `retrieved_clauses`(약관에 `disability_rag`가 장해분류표를 덧붙인 병합본)에서, 판례는 `legal_references`에서 온다.
+- 07-15에는 `retrieved_clauses`만 넘겨 판례가 검증 밖이었다.
+- 근거가 20건을 넘으면 뒤의 판례부터 빠진다. 그 경우 `judge_stats.evidence_chunks`가 근거 수보다 작게 나온다.
+- `run_judge=True`로 고정 → **리포트 경로에서는 항상 심사관을 켠다**. 근거가 하나도 없을 때만 건너뛴다.
+- 결과로 `report`(고지문 붙은 최종본), `judge_failures`, `judge_stats`(Judge가 실제로 본 범위)를 state에 합쳐 넣는다. 다음 노드 `collect_metrics`가 `judge_stats`로 리포트 수치와 신뢰도 등급(`reports.confidence_level`)을 계산한다.
+- 그래프 순서: `report_compose → output_guardrail → collect_metrics → persist → END`(`collect_metrics`는 2026-11-11 추가).
 
 **`persist`가 judge_failures를 어떻게 처리하나**(`agents.py:570-592`):
 
@@ -413,7 +452,7 @@ async def output_guardrail(state: ReportState) -> dict[str, Any]:
 ```
 
 - `judge_failures`는 `report_drafts.draft`(jsonb 컬럼, JSON을 통째로 담는 DB 자료형)에 그대로 **보관만** 된다(`agents.py:584`, `:599-604`).
-- 중요: `judge_failures`가 비어 있지 않아도(=환각이 지목돼도) **리포트 저장을 막거나 status를 바꾸지 않는다.** `persist`는 `reports.status`를 `'AWAITING_ADOPTION'`으로 평소처럼 갱신한다(`agents.py:609`). 즉 환각 지목 결과는 "기록으로만 남고 관문 역할은 하지 않는다"(fail-open, 나중에 사람이 검토할 때 참고하는 신호).
+- 중요: `judge_failures`가 비어 있지 않아도(=환각이 지목돼도) **리포트 저장을 막거나 status를 바꾸지 않는다.** `persist`는 `reports.status`를 `'AWAITING_ADOPTION'`으로 평소처럼 갱신한다(`agents.py:609`). 즉 환각 지목 결과는 "기록으로만 남고 관문 역할은 하지 않는다"(fail-open, 나중에 사람이 검토할 때 참고하는 신호). 2026-11-11부터는 신뢰도 등급(`reports.confidence_level`)을 낮추는 사유가 된다. 세 사유는 검증 미수행(판정 불가 포함), 근거 미확인 주장 n건, 검증 범위 일부다. 하나라도 걸리면 등급은 MEDIUM 이하다. 저장은 여전히 막지 않는다.
 - 고지문 문구도 draft에 별도 필드로 한 번 더 저장된다(`draft["disclaimer"] = guardrail.DISCLAIMER`, `agents.py:583`).
 
 > 쉽게 말하면: 심사관이 "이 문장 의심스럽다"고 표시해도 리포트는 그대로 저장되고 다음 단계로 넘어간다. 그 표시는 통과를 막는 문지기가 아니라, 나중에 사람이 볼 때 "여기 한 번 보세요" 하는 포스트잇에 가깝다.
@@ -429,11 +468,12 @@ START → load_context → input_guardrail
         └─(route_after_input)─┬─ blocked ───────────────→ persist_blocked → END
                               └─ diagnosis → ... → report_compose(guard_generation)
                                      → output_guardrail(guard_output: 고지문+Judge)
+                                     → collect_metrics(judge_stats → 수치·신뢰도 등급)
                                      → persist(judge_failures를 draft에 보존) → END
 ```
 (`graph.py:32-72`)
 
-> 표 읽는 법: 위 그림은 리포트가 거치는 길이다. 입력 검사에서 엉뚱한 질문이면 위쪽 갈래(blocked)로 빠져 곧장 끝나고, 정상이면 아래쪽 갈래(diagnosis)로 내려가 진단→작성→출력 검사→저장을 차례로 거쳐 끝난다.
+> 표 읽는 법: 위 그림은 리포트가 거치는 길이다. 입력 검사에서 엉뚱한 질문이면 위쪽 갈래(blocked)로 빠져 곧장 끝나고, 정상이면 아래쪽 갈래(diagnosis)로 내려가 진단→작성→출력 검사→수치 계산→저장을 차례로 거쳐 끝난다.
 
 ---
 
@@ -457,7 +497,11 @@ START → load_context → input_guardrail
 - 주민번호 앞 6자리 보존 마스킹, 전화·계좌 마스킹 — 실제로 동작한다(`guards.py:26-33`). 문서 규칙과 일치.
 - 단정 금액 표현 치환 — 동작은 하지만 서술어 4종(`받습니다/지급됩니다/지급합니다/입니다`)과 `원` 단위에만 걸리는 **좁은 규칙**이다(`guards.py:48-50`). `"원"` 없이 쓴 `"5백만 지급"`이나 `"~로 산정됩니다"` 같은 표현은 놓친다.
 - 법적 고지문 멱등 삽입 — 실제로 동작한다(`guards.py:64-66`).
-- LLM Judge — **실제 LLM 호출까지 구현돼 있다**(`guards.py:69-94`). 다만 (a) `chunks`가 없으면 건너뛰고, (b) 리포트 앞 2000자와 청크 6개×500자만 검사하며, (c) 심사관 응답이 깨지면 통과로 처리(fail-open)하고, (d) 결과가 텍스트나 저장 관문에 반영되지 않는다 — 즉 "찾아내기는 하되 손은 대지 않는" 관찰 전용 단계다.
+- LLM Judge — **실제 LLM 호출까지 구현돼 있다**(`guards.py:172-237`). 다만 한계가 셋이다. "찾아내기는 하되 손은 대지 않는" 관찰 전용 단계다.
+  - (a) `chunks`가 없으면 건너뛴다.
+  - (b) 리포트 앞 12,000자와 근거 앞 20건×800자만 검사한다. 넘쳐서 못 본 만큼은 `judge_checked_chars`·`judge_evidence_chunks`로 드러난다.
+  - (c) 결과가 텍스트나 저장 관문에는 반영되지 않는다. 신뢰도 등급에만 반영된다(5.2).
+  - 07-15 판정의 "심사관 응답이 깨지면 통과로 처리(fail-open)"는 2026-11-11에 고쳤다. 호출 실패와 판정 불가 응답은 둘 다 `JUDGE_UNAVAILABLE` 표식으로 남는다(4.3).
 
 **추가 격차/주의:**
 

@@ -191,6 +191,8 @@
 }
 ```
 - 금액은 **단정 금지** → 항상 `estimated_range`(범위)로만 표현(가드레일 강제).
+- `draft.metrics`(2026-11-11 추가, 선택 키): 리포트 생성 과정의 기술 수치(입력 품질·검색 근거·검증·처리 경로·신뢰도 등급과 사유). 구조는 `src/report_worker/README.md`의 "리포트 수치" 절이 단일 출처다. 계산에 실패하면 키가 없을 수 있다 — 읽는 쪽은 없음을 허용해야 한다. PII 없음: 건수·분류값·조항 번호·노드명과 소요 ms만 담는다. 예외 하나는 `verification.disability.reclassified[].injury`(LLM이 붙인 손상명 — 같은 값이 이미 `draft.disability`에 있다, 건강정보이며 식별자 아님).
+- `core.reports.confidence_level`(backend 소유 컬럼, varchar(10))에 `HIGH`·`MEDIUM`·`LOW` 중 하나를 쓴다(`draft.metrics.confidence.level`과 같은 값). backend가 고객 상세·검수 화면에 내려주고 프론트가 추정 보상 범위의 신뢰도 게이지로 보여준다. 쓰려면 `ai_owner`(prod는 `ai_owner_prod`)에 이 컬럼 UPDATE 권한이 있어야 한다(`deploy/schema_split*.sql`). 권한이 없으면 이 값만 건너뛰고 리포트는 저장된다.
 
 ---
 
@@ -252,7 +254,11 @@ class RagResult(BaseModel):
 async def guard_input(text: str) -> InputGuardResult: ...
 def guard_generation(text: str) -> str: ...                       # 단정표현 치환·인용 강제 검사
 async def guard_output(
-    text: str, *, run_judge: bool, chunks: list[Chunk] | None = None
+    text: str,
+    *,
+    run_judge: bool = True,
+    chunks: list[Chunk] | None = None,      # Judge 근거(약관·장해분류표·판례). 호출자가 고른다
+    max_report_chars: int = JUDGE_MAX_REPORT_CHARS,  # Judge에 넣을 리포트 앞부분 글자 수
 ) -> OutputGuardResult: ...
 
 class InputGuardResult(BaseModel):
@@ -263,8 +269,14 @@ class InputGuardResult(BaseModel):
 class OutputGuardResult(BaseModel):
     final_text: str          # 고지문 삽입됨
     judge_failures: list[str]  # 인용 검증 실패 섹션(리포트만, run_judge=True)
+    judge_checked_chars: int = 0    # Judge가 실제로 본 리포트 글자 수(미수행·호출 실패면 0)
+    judge_total_chars: int = 0      # final_text 전체 글자 수 → 검증 범위 = checked / total
+    judge_evidence_chunks: int = 0  # Judge가 본 근거 청크 수(미수행·호출 실패면 0)
 ```
-- `run_judge`: 리포트=True(EXAONE/LLM Judge로 인용↔원문 검증).
+- `judge_*` 세 필드는 2026-11-11 추가(backward-compatible, 기본값 0). 빈 `judge_failures`가 "전부 검증해 통과"인지 "일부만 봤다"인지 구분하려고 둔다 — 리포트 `draft.metrics.verification.judge`의 근거.
+- Judge 범위: 리포트(고지문 포함) 앞 `max_report_chars`자(기본 `JUDGE_MAX_REPORT_CHARS` 12,000)와 `chunks` 앞 `JUDGE_MAX_EVIDENCE_CHUNKS`(20)건 × `JUDGE_EVIDENCE_CHARS`(800)자. 근거 순서는 호출자가 정한다(리포트는 약관 → 장해분류표 → 판례). `max_report_chars < 1`이면 `ValueError`(호출자 버그).
+- `judge_failures`에 `JUDGE_UNAVAILABLE` 표식 하나만 들어 있으면 Judge가 판정하지 못한 것이다 — 호출 실패(`AiClientError`, 거절 포함) **또는 판정 불가 응답**(2026-11-11부터: 파싱 실패 `{}`, `failures`가 없거나 문자열 리스트가 아님). 이때 `judge_checked_chars`·`judge_evidence_chunks`는 0이다. 예외를 올리지 않는다(고지문 붙은 본문이 저장돼야 하므로).
+- `run_judge`: 리포트=True(LLM Judge로 인용↔원문 검증). 코드 기본값도 True다.
 - PII 마스킹 규칙은 `ocr_worker` 입력단과 **동일 정의** 공유.
 
 ---

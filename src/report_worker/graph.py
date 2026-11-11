@@ -73,6 +73,7 @@ def build_graph() -> CompiledStateGraph[ReportState, None, ReportState, ReportSt
     g.add_node("payment_calc", agents.payment_calc)
     g.add_node("report_compose", agents.report_compose)
     g.add_node("output_guardrail", agents.output_guardrail)
+    g.add_node("collect_metrics", agents.collect_metrics)
     g.add_node("persist", agents.persist)
     g.add_node("persist_blocked", agents.persist_blocked)
     g.add_node("persist_refused", agents.persist_refused)
@@ -118,9 +119,11 @@ def build_graph() -> CompiledStateGraph[ReportState, None, ReportState, ReportSt
 
     _edge(g, "payment_calc", "report_compose")
     _edge(g, "report_compose", "output_guardrail")
-    # 출력 가드레일의 Judge 실패는 guard_output이 JUDGE_UNAVAILABLE 표식으로 바꿔 돌려준다(예외
-    # 아님) → 본문이 완성됐으므로 저장으로 간다.
-    _edge(g, "output_guardrail", "persist")
+    # 출력 가드레일의 Judge 실패(호출 실패·거절, 또는 판정 형식이 아닌 응답)는 guard_output이
+    # JUDGE_UNAVAILABLE 표식으로 바꿔 돌려준다(예외 아님) → 본문이 완성됐으므로 저장으로 간다.
+    _edge(g, "output_guardrail", "collect_metrics")
+    # 리포트 수치는 부가 정보다. 계산이 실패해도(collect_metrics_failed:*, 소프트) 저장으로 간다.
+    _edge(g, "collect_metrics", "persist")
     for node in TERMINAL_NODES:
         g.add_edge(node, END)
 

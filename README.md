@@ -82,12 +82,13 @@ load_context → input_guardrail ─┬─▶ persist_blocked                   
                                     → case_search ─┬─▶ disability_rag → disability_verify → disability_calc ─┐
                                                    └─────────────────────────────────────────────────────────┤  (3)
                                     payment_calc ◀───────────────────────────────────────────────────────────┘
-                                    → report_compose → output_guardrail → persist
+                                    → report_compose → output_guardrail → collect_metrics → persist   (4)
 ```
 
 1. 보험·법률 외 질문이거나 PII 복호화에 실패하면 `reports.status=BLOCKED`만 기록하고 종료
 2. 약관이 `policy_chunks`에 없을 때만 런타임 파싱
 3. 후유장해 검토가 필요 없으면 `payment_calc`로 바로 이동
+4. `collect_metrics`가 리포트 수치(`report_drafts.draft.metrics`)와 신뢰도 등급(`reports.confidence_level`)을 계산한다(LLM·DB 없음, 실패해도 저장은 계속) — [src/report_worker/README.md](src/report_worker/README.md) "리포트 수치"
 
 상세: [docs/architecture/langgraph.md](docs/architecture/langgraph.md)
 </details>

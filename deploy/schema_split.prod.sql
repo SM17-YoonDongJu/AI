@@ -26,7 +26,7 @@
 -- =============================================================================================
 -- 거는 권한 — dev에 걸린 서비스 간 권한(2026-11-11 조회)을 롤 이름만 바꾼 것
 -- =============================================================================================
---   ai_owner_prod     → core  : USAGE, reports SELECT + 7개 컬럼 UPDATE, user_claims·user_insurances
+--   ai_owner_prod     → core  : USAGE, reports SELECT + 8개 컬럼 UPDATE, user_claims·user_insurances
 --                               SELECT, report_issues INSERT·DELETE + report_id SELECT   (report_worker)
 --   ai_owner_prod     → corpus: USAGE, policy_chunks·case_chunks·schedule_chunks·search_terms SELECT (RAG)
 --   app_owner_prod    → ai    : USAGE, report_drafts·ocr_job_failures·report_job_failures SELECT,
@@ -131,11 +131,13 @@ BEGIN
     FOR g IN
         SELECT * FROM (VALUES
             -- ai_owner_prod → core (report_worker가 읽고, 정해진 컬럼만 쓴다)
+            -- confidence_level(2026-11-11 추가): 리포트 신뢰도 등급. 없으면 워커가 이 값만 건너뛴다.
             ('core.reports',
              'GRANT SELECT ON core.reports TO ai_owner_prod'),
             ('core.reports',
              'GRANT UPDATE (applicable_guarantees, basis_terms_precedents, claimed_max_amount,
-                            claimed_min_amount, omitted_special_contract, status, updated_at)
+                            claimed_min_amount, omitted_special_contract, status, updated_at,
+                            confidence_level)
               ON core.reports TO ai_owner_prod'),
             ('core.user_claims',
              'GRANT SELECT ON core.user_claims TO ai_owner_prod'),
