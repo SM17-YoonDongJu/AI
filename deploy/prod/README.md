@@ -43,8 +43,8 @@ Backend(prod) ──SQS brbs-ocr-job-queue-prod──▶ brbs-ocr-prod (ocr-work
      권한을 `app_owner_prod`로 직접 넣는다.
 2. **vLLM NodePort** — K8s-manifests `envs/dev/etl-vllm.values.yaml`의 `service.nodePort: 30800`이
    머지·Sync돼 있어야 한다.
-3. **GitHub Environment `prod`** — 레포 Settings → Environments → `prod` 생성 → Required reviewers 지정,
-   Deployment branches는 `dev`만 허용.
+3. **GitHub Environment `prod`** — Required reviewers(승인자)와 Deployment branches(`dev`만)로 묶여 있다.
+   승인자를 바꿀 땐 레포 Settings → Environments → `prod`에서 고친다.
    기존 시크릿(`AWS_ROLE_ARN`·`AWS_REGION`·`AWS_ECR_REGISTRY`·`DISCORD_WEBHOOK_*`)을 그대로 쓴다.
    OIDC 역할 `brbs-github-deploy`는 이미 모든 인스턴스에 `ssm:SendCommand`를 할 수 있어 바꿀 게 없다.
 
@@ -116,7 +116,15 @@ curl -s http://<brbs-etl 사설 IP>:30800/v1/models   # vLLM 도달 확인 — P
 
 ## 배포
 
-Actions → **Promote OCR to prod** → `tag`에 dev에서 검증한 sha7 입력 → `prod` 승인.
+dev에서 검증한 sha7로 실행한 뒤, Environment `prod` 승인자가 승인하면 배포된다.
+
+```bash
+gh workflow run promote-ocr-prod.yml --ref dev -f tag=<sha7>
+```
+
+기본 브랜치(`main`)에 이 파일이 없어서, 워크플로는 dev push 트리거로 등록된다(그 push 실행은 배포 없이
+건너뛴다). Actions 탭의 Run workflow 버튼은 기본 브랜치 기준이라 안 보일 수 있으니 CLI(또는 API)로 실행한다.
+승인 대기 중인 실행은 Actions 탭의 해당 실행 화면에서 승인자가 Review deployments로 승인한다.
 
 1. 태그 형식(7자리 sha) 확인 → ECR에 이미지가 있는지 확인
 2. `Name=brbs-ocr-prod`이고 running인 인스턴스 조회
