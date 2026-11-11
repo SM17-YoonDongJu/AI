@@ -32,6 +32,10 @@
 --   app_owner_prod    → ai    : USAGE, report_drafts·ocr_job_failures·report_job_failures SELECT,
 --                               ocr_results 7개 컬럼 SELECT + REFERENCES                 (backend 읽기 전용)
 --   corpus_owner_prod → ai    : USAGE, corpus_source·corpus_file·corpus_file_part 읽기·쓰기 (corpus_worker)
+-- prod에만 있는 권한(dev에 없음):
+--   ai_owner_prod     → core  : encryption_keys 4개 컬럼 SELECT — report의 PII 복호화(core.crypto)가 prod에서
+--                               KMS로 풀 wrapped DEK를 읽는다. dev·local은 env 키(PII_ENC_KEY)를 써서 이 테이블을
+--                               읽지 않는다. 2026-11-11 prod DB에 직접 GRANT됐던 것을 여기로 옮겼다(원본 유지).
 -- ai → app_owner_prod 권한은 AI 마이그레이션(007·008·011·012)도 기동마다 다시 건다(접속 롤에서 받는 롤을
 -- 끌어낸다). 여기서도 거는 건 실행 시점과 상관없이 결과를 같게 하려는 것이다.
 --
@@ -142,6 +146,11 @@ BEGIN
             -- DELETE ... WHERE report_id = $1이 조건 컬럼을 읽으므로 그 컬럼만 SELECT를 준다.
             ('core.report_issues',
              'GRANT SELECT (report_id) ON core.report_issues TO ai_owner_prod'),
+            -- 활성 PII 키 조회(SELECT key_version, wrapped_dek ... WHERE purpose = 'PII' AND is_active)에
+            -- 쓰는 컬럼만. kms_key_id·created_at·retired_at·id는 열지 않는다. prod 전용(위 머리말).
+            ('core.encryption_keys',
+             'GRANT SELECT (purpose, is_active, key_version, wrapped_dek)
+              ON core.encryption_keys TO ai_owner_prod'),
             -- ai_owner_prod → corpus (RAG 검색, 읽기만) — 4단계 적재 뒤 다시 실행하면 걸린다
             ('corpus.policy_chunks',   'GRANT SELECT ON corpus.policy_chunks TO ai_owner_prod'),
             ('corpus.case_chunks',     'GRANT SELECT ON corpus.case_chunks TO ai_owner_prod'),
@@ -179,7 +188,8 @@ $$;
 
 COMMIT;
 
--- 5. 결과 — 모든 테이블이 있으면 dev 조회와 같은 표(테이블 권한 15행, 컬럼 권한 3행)가 나와야 한다.
+-- 5. 결과 — 모든 테이블이 있으면 테이블 권한 15행(dev와 같음), 컬럼 권한 4행(dev 3행 + prod 전용
+--    encryption_keys 1행)이 나와야 한다.
 SELECT g.table_schema, g.table_name, g.grantee,
        string_agg(g.privilege_type, ',' ORDER BY g.privilege_type) AS privileges
 FROM information_schema.role_table_grants g

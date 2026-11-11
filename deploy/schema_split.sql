@@ -330,6 +330,10 @@ BEGIN
         EXECUTE 'GRANT SELECT (report_id) ON core.report_issues TO ai_owner';
     END IF;
 
+    -- core.encryption_keys는 여기서 열지 않는다. report의 PII 복호화(core.crypto)는 dev·local에서 env 키
+    -- (PII_ENC_KEY)를 쓰고, KMS로 wrapped DEK를 푸는 건 prod뿐이다. prod 권한(4개 컬럼 SELECT)은
+    -- deploy/schema_split.prod.sql에 있다. dev를 KMS 경로로 바꾸면 같은 컬럼을 ai_owner에 열어야 한다.
+
     -- 기존 FK(user_insurances.ocr_result_id, report_attachments.ocr_result_id →
     -- ai.ocr_results(id))는 이동 후에도 유효하지만, backend가 앞으로 ai.ocr_results를
     -- 참조하는 새 FK를 추가하려면 REFERENCES 권한이 필요하다 — 미리 열어둔다(당장 안 써도 무해).
