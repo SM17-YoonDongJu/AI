@@ -21,14 +21,22 @@
       "Resource": "arn:aws:sqs:ap-northeast-2:REPLACE_ME_ACCOUNT_ID:brbs-report-job-queue-prod"
     },
     {
-      "Sid": "OriginalsAndMaskedCopies",
+      "Sid": "ReadAndDeleteOriginals",
       "Effect": "Allow",
       "Action": [
         "s3:GetObject",
-        "s3:PutObject",
         "s3:DeleteObject"
       ],
-      "Resource": "arn:aws:s3:::REPLACE_ME_BUCKET/*"
+      "Resource": "arn:aws:s3:::REPLACE_ME_BUCKET/report-documents/*"
+    },
+    {
+      "Sid": "WriteMaskedCopies",
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject",
+        "s3:GetObject"
+      ],
+      "Resource": "arn:aws:s3:::REPLACE_ME_BUCKET/masked/*"
     },
     {
       "Sid": "ReadOcrConfig",

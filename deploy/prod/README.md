@@ -18,7 +18,8 @@ Backend(prod) ──SQS brbs-ocr-job-queue-prod──▶ brbs-ocr-prod (ocr-work
 | `.env.ocr.example` | 호스트 `/opt/ocr/.env.ocr` 템플릿(시크릿 포함 실제 파일은 git 미커밋) |
 | `bootstrap-ocr-host.sh` | EC2 user-data — Docker·AWS CLI·RDS CA 설치 |
 | `sync-env-ocr.sh` | 호스트 `.env.ocr` 생성 — Parameter Store `/brbs/prod/ocr/` + Secrets Manager `prod/ocr` |
-| `iam-ocr-prod-policy.json` | 인스턴스 역할 인라인 정책(SQS·S3 최소 권한) |
+| `iam-ocr-prod-policy.json` | 인스턴스 역할 인라인 정책(SQS·S3 두 경로·설정/시크릿 읽기만) |
+| `setup-ocr-alerts.sh` | 스팟 회수·인스턴스 상태·큐 적체 → Discord 알림(EventBridge) |
 | `../../.github/workflows/promote-ocr-prod.yml` | 배포 — dev에서 검증한 `:<sha7>`을 승인 후 올린다 |
 
 ## 왜 이렇게
@@ -93,16 +94,28 @@ aws ec2 run-instances --image-id "$AMI" --instance-type t3.large \
   --iam-instance-profile Name=brbs-ocr-prod-profile \
   --instance-market-options 'MarketType=spot,SpotOptions={SpotInstanceType=persistent,InstanceInterruptionBehavior=stop}' \
   --metadata-options HttpTokens=required,HttpPutResponseHopLimit=2,HttpEndpoint=enabled \
-  --block-device-mappings 'DeviceName=/dev/sda1,Ebs={VolumeSize=30,VolumeType=gp3,DeleteOnTermination=true}' \
+  --block-device-mappings 'DeviceName=/dev/sda1,Ebs={VolumeSize=30,VolumeType=gp3,Encrypted=true,DeleteOnTermination=true}' \
   --user-data file://deploy/prod/bootstrap-ocr-host.sh \
   --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=brbs-ocr-prod}]' \
                        'ResourceType=volume,Tags=[{Key=Name,Value=brbs-ocr-prod}]' \
                        'ResourceType=spot-instances-request,Tags=[{Key=Name,Value=brbs-ocr-prod}]'
 ```
 
-S3 비식별 사본(`masked/`) 업로드는 SSE-KMS(AWS 관리형 키 `aws/s3`)다. 관리형 키 정책이 계정 안
-주체의 S3 경유 사용을 허용하므로 별도 `kms:*` 권한은 필요 없다. OCR은 PII 컬럼 복호화(`core.crypto`)를
-쓰지 않아 백엔드 KMS 키도 필요 없다.
+- **루트 볼륨 암호화(`Encrypted=true`)**: 진단서 원본을 내려받아 처리하는 서버라, 처리 중 이미지·로그·
+  컨테이너 레이어가 디스크에 남는다. 계정에 EBS 기본 암호화가 켜져 있으면 생략해도 암호화되지만, 이 명령은
+  그 설정에 기대지 않는다.
+- **S3는 두 경로만**: 원본 `report-documents/`(읽기·삭제)와 비식별 사본 `masked/`(쓰기·읽기). 같은 버킷의
+  다른 경로(dev 채팅 첨부·자격증 파일·ETL corpus 등)에는 권한이 없다. OCR은 S3 오류를 모두 같은 실패로
+  다루므로 `s3:ListBucket` 없이 404가 403으로 보여도 동작이 같다.
+- `masked/` 업로드는 SSE-KMS(AWS 관리형 키 `aws/s3`)다. 관리형 키 정책이 계정 안 주체의 S3 경유 사용을
+  허용하므로 별도 `kms:*` 권한은 필요 없다. OCR은 PII 컬럼 복호화(`core.crypto`)를 쓰지 않아 백엔드 KMS
+  키도 필요 없다.
+
+```bash
+# 4) 알림 — 스팟 회수 예고·인스턴스 stopped/running·OCR 큐 적체(15분)를 Discord critical 채널로.
+#    인스턴스를 새로 띄울 때마다 다시 돌린다(규칙의 instance-id 갱신).
+bash deploy/prod/setup-ocr-alerts.sh
+```
 
 ## 호스트 설정 (1회)
 
@@ -154,7 +167,8 @@ gh workflow run promote-ocr-prod.yml --ref dev -f tag=<sha7>
 
 - **스팟 회수**: 2분 전 통지 → stop. 컨테이너는 SIGTERM 뒤 최대 60초 안에 내려간다. 용량이 돌아오면
   자동으로 start되고 `restart: unless-stopped`로 워커가 다시 뜬다. 그동안 OCR 요청은 큐에 쌓인다(유실 없음).
-  회수 중에 배포하면 "running 인스턴스 없음"으로 실패한다.
+  회수 예고·stopped·running과 큐 적체(가장 오래된 요청 15분 초과)는 `setup-ocr-alerts.sh`가 만든
+  EventBridge 규칙이 Discord critical 채널로 알린다. 회수 중에 배포하면 "running 인스턴스 없음"으로 실패한다.
 - **영구 종료**: 스팟 요청을 먼저 취소해야 한다. 인스턴스만 terminate하면 영구 요청이 새로 띄운다.
   ```bash
   aws ec2 cancel-spot-instance-requests --spot-instance-request-ids <sir-id>
