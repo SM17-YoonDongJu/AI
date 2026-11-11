@@ -14,12 +14,19 @@
 -- 매핑하려면 Hibernate가 식별자(@Id)로 쓸 컬럼이 있어야 한다(Backend QA 피드백).
 --
 -- 로컬 PG·RDS에 **같은 SQL**을 적용해 스키마 드리프트를 차단한다(이슈 #19).
+--
+-- 받는 롤은 접속 롤에서 끌어낸다(ai_owner → app_owner, ai_owner_prod → app_owner_prod). dev·prod
+-- 롤이 같은 RDS 인스턴스에 함께 있어서, 'app_owner'를 박아 두면 prod에서 dev 롤이 권한을 받는다.
 
 DO $$
+DECLARE
+    backend_role text := CASE WHEN current_user ~ '^ai_owner'
+                              THEN regexp_replace(current_user, '^ai_owner', 'app_owner')
+                              ELSE 'app_owner' END;
 BEGIN
-    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_owner') THEN
-        EXECUTE 'GRANT SELECT (id, report_id, claim_id, attachment_id, doc_type, doc_index, ocr_quality)
-                 ON ai.ocr_results TO app_owner';
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = backend_role) THEN
+        EXECUTE format('GRANT SELECT (id, report_id, claim_id, attachment_id, doc_type, doc_index, ocr_quality)
+                        ON ai.ocr_results TO %I', backend_role);
     END IF;
 END
 $$;
