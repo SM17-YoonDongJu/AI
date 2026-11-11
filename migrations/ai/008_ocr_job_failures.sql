@@ -67,16 +67,10 @@ $$;
 -- 이 파일을 재실행할 때마다(매 기동) 자동으로 적용되므로, deploy/schema_split.sql(수동
 -- 1회성 부트스트랩)의 실행 여부와 무관하게 이 GRANT는 항상 최신 상태로 유지된다.
 -- app_owner는 절대 write하지 않는다(SELECT만 — §14).
--- 받는 롤은 접속 롤에서 끌어낸다(ai_owner → app_owner, ai_owner_prod → app_owner_prod). dev·prod
--- 롤이 같은 RDS 인스턴스에 함께 있어서, 'app_owner'를 박아 두면 prod에서 dev 롤이 권한을 받는다.
 DO $$
-DECLARE
-    backend_role text := CASE WHEN current_user ~ '^ai_owner'
-                              THEN regexp_replace(current_user, '^ai_owner', 'app_owner')
-                              ELSE 'app_owner' END;
 BEGIN
-    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = backend_role) THEN
-        EXECUTE format('GRANT SELECT ON ai.ocr_job_failures TO %I', backend_role);
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_owner') THEN
+        EXECUTE 'GRANT SELECT ON ai.ocr_job_failures TO app_owner';
     END IF;
 END
 $$;

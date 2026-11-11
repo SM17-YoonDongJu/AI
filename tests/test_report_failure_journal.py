@@ -206,9 +206,9 @@ def test_migration_indexes_terminal_rows_only() -> None:
     ("role_guard", "grant"),
     [
         pytest.param(
-            "IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = backend_role) THEN",
-            "EXECUTE format('GRANT SELECT ON ai.report_job_failures TO %I', backend_role)",
-            id="backend_role",
+            "IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_owner') THEN",
+            "EXECUTE 'GRANT SELECT ON ai.report_job_failures TO app_owner'",
+            id="app_owner",
         ),
         pytest.param(
             "IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'rds_pgaudit') THEN",

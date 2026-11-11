@@ -34,16 +34,10 @@ $$;
 -- @Subselect 소비(§14, deploy/schema_split.sql과 동일한 SELECT-only 방침). ai_owner가
 -- 자기 소유 테이블에 SELECT만 내주는 self-grant라 별도 권한이 필요 없다 — ocr_worker가
 -- 이 파일을 재실행할 때마다(매 기동) 자동 적용된다. app_owner에는 UPDATE를 주지 않는다.
--- 받는 롤은 접속 롤에서 끌어낸다(ai_owner → app_owner, ai_owner_prod → app_owner_prod). dev·prod
--- 롤이 같은 RDS 인스턴스에 함께 있어서, 'app_owner'를 박아 두면 prod에서 dev 롤이 권한을 받는다.
 DO $$
-DECLARE
-    backend_role text := CASE WHEN current_user ~ '^ai_owner'
-                              THEN regexp_replace(current_user, '^ai_owner', 'app_owner')
-                              ELSE 'app_owner' END;
 BEGIN
-    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = backend_role) THEN
-        EXECUTE format('GRANT SELECT ON ai.report_drafts TO %I', backend_role);
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_owner') THEN
+        EXECUTE 'GRANT SELECT ON ai.report_drafts TO app_owner';
     END IF;
 END
 $$;
