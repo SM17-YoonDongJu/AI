@@ -4,8 +4,8 @@
 **테스트 → 변경 감지 → 빌드·ECR push → EC2 SSM 배포**까지 잇는다.
 `dev` 브랜치 기준으로 동작하며, 서비스별로 대상 EC2에 직접 배포한다.
 
-> prod OCR(전용 EC2 `brbs-ocr-prod`, dev에서 검증한 sha7을 승인 후 수동 승격)은
-> [`deploy/prod/README.md`](prod/README.md)를 본다.
+> prod는 dev→main PR 머지로 배포된다(`.github/workflows/deploy-prod.yml`, 백엔드 deploy-prod와 같은 흐름).
+> OCR 전용 EC2·report 태그·승인 규칙은 [`deploy/prod/README.md`](prod/README.md)를 본다.
 
 ---
 
@@ -192,5 +192,5 @@ docker image prune -f
 - `.github/workflows/ci.yml` — 파이프라인 정의
 - `.github/actions/discord-notify/` — 알림 액션
 - `deploy/docker-compose.ocr.yml`, `deploy/.env.ocr.example` — GPU EC2 배포 정본
-- `deploy/prod/` · `.github/workflows/promote-ocr-prod.yml` — prod OCR 전용 EC2 배포(수동 승격)
+- `deploy/prod/` · `.github/workflows/deploy-prod.yml` — prod 배포(dev→main PR 머지 시)
 - `migrations/ai/*.sql`, `migrations/corpus/*.sql` — DB 스키마(확장·테이블, role별 소유 스키마로 분리 — `migrations/README.md` 참고)

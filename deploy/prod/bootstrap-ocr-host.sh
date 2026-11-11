@@ -3,7 +3,7 @@
 # 대상 AMI: Ubuntu 24.04(SSM Agent 기본 탑재). GPU·NVIDIA 드라이버는 설치하지 않는다(CPU 워커).
 #
 # 여기서 하지 않는 것: .env.ocr 값 채우기(시크릿) — README 절차대로 SSM 세션에서 직접 쓴다.
-# 컨테이너 기동도 하지 않는다 — 첫 기동은 promote-ocr-prod.yml 배포가 한다.
+# 컨테이너 기동도 하지 않는다 — 첫 기동은 deploy-prod.yml 배포가 한다.
 set -euxo pipefail
 export DEBIAN_FRONTEND=noninteractive
 

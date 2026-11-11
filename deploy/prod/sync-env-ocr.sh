@@ -5,7 +5,7 @@
 #
 # 호스트의 .env.ocr는 언제든 이 스크립트로 다시 만들 수 있는 사본이다 — 직접 고치지 말고 원본을 고친 뒤
 # 다시 돌린다. 레포가 public이라 설정값도 레포에 두지 않는다.
-# OCR_TAG만 예외다: 배포 워크플로(promote-ocr-prod.yml)가 배포한 sha7을 기록하는 값이라 기존 파일 값을
+# OCR_TAG만 예외다: 배포 워크플로(deploy-prod.yml)가 배포한 sha7을 기록하는 값이라 기존 파일 값을
 # 그대로 이어 쓴다.
 #
 # 시크릿을 Parameter Store SecureString에 두지 않는 이유: 인스턴스 롤의 AmazonSSMManagedInstanceCore가

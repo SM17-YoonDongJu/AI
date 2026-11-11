@@ -1,5 +1,5 @@
 # prod OCR 워커 전용 EC2(brbs-ocr-prod, t3.large 스팟) 배포용 compose — 단일 진실원.
-# 서버에서 수동 편집 금지, PR로 수정한다. 배포 워크플로(promote-ocr-prod.yml)가 매번 이 파일로
+# 서버에서 수동 편집 금지, PR로 수정한다. 배포 워크플로(deploy-prod.yml)가 매번 이 파일로
 # 호스트의 /opt/ocr/docker-compose.ocr.yml을 덮어쓴다.
 # 사용: docker compose -f docker-compose.ocr.yml --env-file .env.ocr up -d
 #

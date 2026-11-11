@@ -8,8 +8,8 @@
 # 테스트는 ci.yml을 workflow_call로 재사용해 게이팅한다(needs: test). 워크플로 간 needs는
 # 불가하므로 "재사용 호출"로 잇는다. push 직접 트리거라 workflow_run의 기본브랜치 제약도 없다.
 #
-# prod(main) 배포는 인프라(PROD_* vars·.env.prod·:prod 태그 compose)가 준비되면 추가한다.
-# 그때: on.push.branches에 main 추가 + tag/target을 github.ref_name으로 분기.
+# prod는 별도 워크플로(deploy-prod.yml)다 — dev→main PR 머지(main push)로 돈다. 배포 대상(전용 EC2·
+# 백엔드 호스트)과 승인(main 브랜치 보호)이 dev와 달라 이 파일에 분기로 넣지 않았다.
 name: Deploy
 
 on:

@@ -20,7 +20,7 @@ Backend(prod) ──SQS brbs-ocr-job-queue-prod──▶ brbs-ocr-prod (ocr-work
 | `sync-env-ocr.sh` | 호스트 `.env.ocr` 생성 — Parameter Store `/brbs/prod/ocr/` + Secrets Manager `prod/ocr` |
 | `iam-ocr-prod-policy.json` | 인스턴스 역할 인라인 정책(SQS·S3 두 경로·설정/시크릿 읽기만) |
 | `setup-ocr-alerts.sh` | 스팟 회수·인스턴스 상태·큐 적체 → Discord 알림(EventBridge) |
-| `../../.github/workflows/promote-ocr-prod.yml` | 배포 — dev에서 검증한 `:<sha7>`을 승인 후 올린다 |
+| `../../.github/workflows/deploy-prod.yml` | 배포 — dev→main PR 머지 시 테스트·빌드 후 OCR 반영·report 태그 갱신 |
 
 ## 왜 이렇게
 
@@ -30,26 +30,24 @@ Backend(prod) ──SQS brbs-ocr-job-queue-prod──▶ brbs-ocr-prod (ocr-work
   멱등 재처리된다. 영구 요청 + 중단 동작 `stop`이라 회수 뒤에도 인스턴스 ID·사설 IP·EBS가 남는다.
 - **백엔드 호스트와 분리**: OCR은 CPU를 몰아 쓰고 메모리가 튄다. t3는 CPU 크레딧을 호스트 단위로
   쓰므로 같이 두면 백엔드 API까지 느려진다. 분리해야 OCR만 스팟으로 내릴 수도 있다.
-- **배포는 수동 승격**: `main`이 아직 쓰이지 않아 push 트리거 대신 `workflow_dispatch`로 sha7을 받는다.
+- **배포는 dev→main PR 머지**: 백엔드 deploy-prod와 같은 흐름이다. 승인은 main 브랜치 보호(PR 승인 1명)가
+  건다 — PR 작성자는 자기 PR을 승인할 수 없어 교차 승인이 된다. 이미지는 main 커밋에서 다시 빌드한다.
 
 ## 선행 조건
 
-1. **DB 롤** — `brbs_prod`에 `ai_owner_prod`가 있어야 한다. `deploy/schema_split.sql`을 prod 롤
-   이름(`*_owner_prod`)으로 바꿔 마스터 계정으로 실행한다. 롤은 RDS 인스턴스 단위라 dev 롤(`ai_owner`)을
-   그대로 쓰면 dev 자격증명이 prod DB에 닿는다.
-   **OCR은 이 실행이 끝난 뒤에 처음 띄운다.** OCR이 기동마다 `migrations/ai`를 적용하므로, 먼저 뜨면
-   `ai` 스키마·테이블 소유자가 첫 기동 계정으로 굳는다.
-   - 알려진 이슈: `migrations/ai/007·008·011·012`의 self-grant가 백엔드 롤을 `app_owner`로
-     하드코딩한다. prod에선 dev의 `app_owner`가 권한을 받고 `app_owner_prod`는 못 받는다. 고치기 전까지는
-     prod용 `schema_split` 실행분에 011(`ai.ocr_results` 컬럼 SELECT)·012(`ai.report_job_failures`)
-     권한을 `app_owner_prod`로 직접 넣는다.
+1. **DB** — prod DB 작업은 순서가 있다. 자세한 건 `deploy/schema_split.prod.sql` 머리말.
+   1) backend 첫 기동(Flyway) → 2) AI 마이그레이션(이 워크플로의 첫 OCR 배포, `ai_owner_prod`로 접속) →
+   3) `schema_split.prod.sql` → 4) corpus 적재 → 5) `schema_split.prod.sql` 다시 실행.
+   OCR은 `ai_owner_prod`로 접속한다(롤은 RDS 인스턴스 단위라 dev 롤을 쓰면 dev 자격증명이 prod DB에 닿는다).
+   AI 마이그레이션은 접속 롤에서 backend 롤을 끌어내(`ai_owner_prod` → `app_owner_prod`) 읽기 권한을 건다.
 2. **vLLM NodePort** — K8s-manifests `envs/dev/etl-vllm.values.yaml`의 `service.nodePort: 30800`이
    머지·Sync돼 있어야 한다.
-3. **GitHub Environment `prod`** — 승인자 두 명(`donghoong2`·`jongyo0N`) + 자기 승인 금지라, 실행하지 않은 쪽이
-   승인해야 배포된다. Deployment branches는 `dev`만 허용한다.
-   승인자를 바꿀 땐 레포 Settings → Environments → `prod`에서 고친다.
-   기존 시크릿(`AWS_ROLE_ARN`·`AWS_REGION`·`AWS_ECR_REGISTRY`·`DISCORD_WEBHOOK_*`)을 그대로 쓴다.
-   OIDC 역할 `brbs-github-deploy`는 이미 모든 인스턴스에 `ssm:SendCommand`를 할 수 있어 바꿀 게 없다.
+3. **승인·배포 권한**
+   - main 브랜치 보호: PR 필수, 승인 1명, `test` 통과, 관리자도 예외 없음(백엔드 main과 같음).
+   - GitHub Environment `prod`: 승인자 없이 main에서 온 실행만 받는다(다른 브랜치에서 prod를 건드리지 못하게).
+   - 기존 시크릿(`AWS_ROLE_ARN`·`AWS_REGION`·`AWS_ECR_REGISTRY`·`DISCORD_WEBHOOK_*`)을 그대로 쓴다.
+   - OIDC 역할 `brbs-github-deploy`: 모든 인스턴스에 `ssm:SendCommand`가 이미 있고, report 태그용으로
+     `/brbs/prod/env/REPORT_TAG` 한 파라미터의 `ssm:PutParameter`만 더했다.
 
 ## 인프라 만들기 (1회)
 
@@ -145,23 +143,17 @@ curl -s http://<brbs-etl 사설 IP>:30800/v1/models
 
 ## 배포
 
-dev에서 검증한 sha7로 실행한 뒤, Environment `prod` 승인자가 승인하면 배포된다.
+dev→main PR을 올리고 다른 사람이 승인해 머지하면 `deploy-prod.yml`이 돈다.
 
-```bash
-gh workflow run promote-ocr-prod.yml --ref dev -f tag=<sha7>
-```
-
-기본 브랜치(`main`)에 이 파일이 없어서, 워크플로는 dev push 트리거로 등록된다(그 push 실행은 배포 없이
-건너뛴다). Actions 탭의 Run workflow 버튼은 기본 브랜치 기준이라 안 보일 수 있으니 CLI(또는 API)로 실행한다.
-승인 대기 중인 실행은 Actions 탭의 해당 실행 화면에서 승인자가 Review deployments로 승인한다.
-
-1. 태그 형식(7자리 sha) 확인 → ECR에 이미지가 있는지 확인
-2. `Name=brbs-ocr-prod`이고 running인 인스턴스 조회
-3. SSM으로 compose를 레포 내용으로 덮고, `.env.ocr`의 `OCR_TAG` 갱신 → pull → up
-4. 45초 뒤 컨테이너가 `running`이고 재시작 0회인지 확인해 실패를 드러낸다
+1. `test` — dev 배포와 같은 `ci.yml`(ruff·pytest)
+2. `build` — main 커밋에서 OCR·report 이미지를 빌드해 `:<sha7>`·`:prod`로 push(한쪽이라도 실패하면 배포 안 함)
+3. `deploy-ocr` — `Name=brbs-ocr-prod`·running 인스턴스에 SSM으로 compose를 레포 내용으로 덮고
+   `.env.ocr`의 `OCR_TAG`를 `<sha7>`로 → pull → up → 45초 뒤 `running`·재시작 0회인지 확인
+4. `report-tag` — `/brbs/prod/env/REPORT_TAG`를 `<sha7>`로 갱신. report는 백엔드 prod 호스트에서 돈다 —
+   `/home/ubuntu/backend`에서 `sudo bash sync-env.sh && docker compose --env-file .env.prod up -d report`로 반영한다.
 5. Discord 알림(성공 DEPLOYMENT / 실패 CI_FAILURES)
 
-**롤백**: 이전 sha7로 다시 실행한다.
+**재시도**: Actions → Deploy Prod → Run workflow(main). **롤백**: main에 revert PR을 머지한다.
 
 ## 운영
 
