@@ -151,7 +151,15 @@ class InputGuardResult(BaseModel):
 
 
 class OutputGuardResult(BaseModel):
-    """출력 가드레일 결과. 법적 고지문 삽입 + (리포트 한정) LLM Judge 인용 검증."""
+    """출력 가드레일 결과. 법적 고지문 삽입 + (리포트 한정) LLM Judge 인용 검증.
+
+    `judge_*` 세 필드는 Judge가 **실제로 본 범위**다. 빈 `judge_failures`만으로는 "전부 검증해
+    통과"인지 "일부만 봤다"인지 구분이 안 된다 — 리포트 수치(검증 범위 %)의 근거로 쓴다.
+    Judge를 돌리지 않았거나 호출이 실패하면 `judge_checked_chars`·`judge_evidence_chunks`는 0이다.
+    """
 
     final_text: str  # 고지문 삽입된 최종 텍스트
     judge_failures: list[str]  # 인용 검증 실패 섹션(리포트만, run_judge=True)
+    judge_checked_chars: int = 0  # Judge 프롬프트에 넣은 리포트 글자 수(final_text 앞부분)
+    judge_total_chars: int = 0  # final_text 전체 글자 수(검증 범위 = checked / total)
+    judge_evidence_chunks: int = 0  # Judge 프롬프트에 넣은 근거 청크 수

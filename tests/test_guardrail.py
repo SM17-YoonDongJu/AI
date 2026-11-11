@@ -1,7 +1,8 @@
-"""guardrail 테스트 — PII 마스킹(mask_pii·guard_input)·도메인 차단·단정금액 치환·고지문 삽입.
+"""guardrail 테스트 — PII 마스킹(mask_pii·guard_input)·도메인 차단·단정금액 치환·고지문 삽입·
+LLM Judge 검증 범위와 판정 처리·마스킹 건수(count_masked_pii).
 
-LLM Judge(run_judge=True)는 ai_client에 의존하므로 여기서는 run_judge=False로
-LLM 없이 검증한다(Judge 경로는 e2e에서 확인).
+LLM Judge(run_judge=True)는 ai_client.chat_json을 페이크로 바꿔 LLM 없이 검증한다. 프롬프트에
+들어간 범위와 응답 처리만 본다. 실제 모델의 판정 품질은 e2e에서 확인한다.
 
 mask_pii 테스트는 OCR 기본 마스커를 정규식 전용으로 고정한다(autouse 픽스처). 운영 report
 설정(USE_NER=false)과 같고, 셸·.env의 USE_NER 값과 상관없이 결과가 같게 하려는 것이다.
@@ -20,7 +21,11 @@ from core.config import get_settings
 from core.contracts import InputGuardResult, OutputGuardResult
 from guardrail import (
     DISCLAIMER,
+    JUDGE_EVIDENCE_CHARS,
+    JUDGE_MAX_EVIDENCE_CHUNKS,
+    JUDGE_MAX_REPORT_CHARS,
     MaskingError,
+    count_masked_pii,
     guard_generation,
     guard_input,
     guard_output,
@@ -69,6 +74,86 @@ def test_guard_generation_softens_absolute_amount() -> None:
     assert "받습니다" not in out
 
 
+# ── guard_output: 고지문 + LLM Judge(페이크) ─────────────────────
+class _FakeJudge:
+    """ai_client.chat_json 대역. 받은 메시지를 남기고 정해 둔 응답을 그대로 돌려준다."""
+
+    def __init__(self, verdict: object) -> None:
+        self.verdict = verdict
+        self.calls: list[list[dict[str, str]]] = []
+
+    async def chat_json(self, messages: list[dict[str, str]], **opts: object) -> object:
+        self.calls.append(messages)
+        return self.verdict
+
+    @property
+    def system_prompt(self) -> str:
+        return self.calls[-1][0]["content"]
+
+    @property
+    def user_prompt(self) -> str:
+        return self.calls[-1][1]["content"]
+
+
+def _install_judge(monkeypatch: pytest.MonkeyPatch, verdict: object) -> _FakeJudge:
+    judge = _FakeJudge(verdict)
+    monkeypatch.setattr(ai_client, "chat_json", judge.chat_json)
+    return judge
+
+
+async def _refusing_judge(messages: list[dict[str, str]], **opts: object) -> object:
+    """Judge 호출 실패 대역(거절 — 429·잘림도 같은 AiClientError 계열이다)."""
+    raise ai_client.LlmRefusalError("거절")
+
+
+class _WarningRecorder:
+    """guards.logger 대역. 이벤트와 필드를 그대로 남긴다(로그에 본문이 없는지 확인용)."""
+
+    def __init__(self) -> None:
+        self.records: list[tuple[str, dict[str, object]]] = []
+
+    def warning(self, event: str, **fields: object) -> None:
+        self.records.append((event, fields))
+
+
+def _install_log_recorder(monkeypatch: pytest.MonkeyPatch) -> _WarningRecorder:
+    recorder = _WarningRecorder()
+    monkeypatch.setattr(guards, "logger", recorder)
+    return recorder
+
+
+# 약관·장해분류표·판례가 섞인 근거(호출자가 넘기는 순서 그대로).
+_EVIDENCE: list[dict[str, str]] = [
+    {"text": "제3조(상해입원일당) 1일당 3만원을 지급한다"},
+    {"text": "별표3 척추에 약간의 운동장해를 남긴 때 지급률 10%"},
+    {"text": "2020-123 요추 염좌 후유장해 지급 분쟁 사례"},
+]
+
+# 근거 상한보다 1건 많은 근거. 마지막(21번째) 건은 Judge 프롬프트에서 빠져야 한다.
+# 표식을 꺾쇠로 닫아 "<근거2>"가 "<근거20>"에 부분 일치하지 않게 한다.
+_EVIDENCE_OVER_LIMIT: list[dict[str, str]] = [
+    {"text": f"<근거{n}>"} for n in range(1, JUDGE_MAX_EVIDENCE_CHUNKS + 2)
+]
+_LAST_INCLUDED_EVIDENCE = f"<근거{JUDGE_MAX_EVIDENCE_CHUNKS}>"
+_FIRST_EXCLUDED_EVIDENCE = f"<근거{JUDGE_MAX_EVIDENCE_CHUNKS + 1}>"
+
+# 판정으로 쓸 수 없는 Judge 응답과 로그에 남는 분류. chat_json은 파싱에 실패하면 {}를 준다.
+_UNUSABLE_VERDICTS = [
+    pytest.param({}, "failures_missing", id="parse-failure-empty-object"),
+    pytest.param({"failures": None}, "failures_not_list", id="failures-null"),
+    pytest.param({"failures": "환자 홍길동 관련 문장"}, "failures_not_list", id="failures-string"),
+    pytest.param({"failures": {"문장": "제3조"}}, "failures_not_list", id="failures-object"),
+    pytest.param(["제3조 문장"], "verdict_not_object", id="verdict-array"),
+    pytest.param("근거 없음", "verdict_not_object", id="verdict-string"),
+    pytest.param(None, "verdict_not_object", id="verdict-null"),
+    pytest.param(
+        {"failures": [{"문장": "제99조", "사유": "근거 없음"}]},
+        "failure_item_not_str",
+        id="failure-item-object",
+    ),
+]
+
+
 async def test_guard_output_inserts_disclaimer_without_judge() -> None:
     result = await guard_output("리포트 본문", run_judge=False, chunks=None)
     assert isinstance(result, OutputGuardResult)
@@ -76,21 +161,174 @@ async def test_guard_output_inserts_disclaimer_without_judge() -> None:
     assert result.judge_failures == []
 
 
+@pytest.mark.parametrize(
+    ("run_judge", "chunks"),
+    [
+        pytest.param(False, _EVIDENCE, id="run-judge-false"),
+        pytest.param(True, [], id="empty-chunks"),
+        pytest.param(True, None, id="no-chunks"),
+    ],
+)
+async def test_guard_output_skips_judge_without_flag_or_evidence(
+    monkeypatch: pytest.MonkeyPatch, run_judge: bool, chunks: list[dict[str, str]] | None
+) -> None:
+    # Arrange
+    judge = _install_judge(monkeypatch, {"failures": ["불리면 안 된다"]})
+
+    # Act
+    result = await guard_output("리포트 본문", run_judge=run_judge, chunks=chunks)
+
+    # Assert: Judge를 부르지 않았고, 본 범위는 0이지만 전체 길이는 채운다
+    assert judge.calls == []
+    assert result.judge_failures == []
+    assert result.judge_checked_chars == 0
+    assert result.judge_evidence_chunks == 0
+    assert result.judge_total_chars == len(result.final_text)
+
+
+async def test_guard_output_reports_judge_scope_on_verdict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Arrange
+    _install_judge(monkeypatch, {"failures": ["제99조에 따라 전액 지급된다"]})
+
+    # Act
+    result = await guard_output("리포트 본문", run_judge=True, chunks=_EVIDENCE)
+
+    # Assert: 판정을 그대로 돌려주고, 짧은 리포트는 전부 봤다(검증 범위 100%)
+    assert result.judge_failures == ["제99조에 따라 전액 지급된다"]
+    assert result.judge_checked_chars == len(result.final_text)
+    assert result.judge_total_chars == len(result.final_text)
+    assert result.judge_evidence_chunks == len(_EVIDENCE)
+
+
+async def test_guard_output_judges_report_up_to_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Arrange: 고지문 포함 정확히 창 크기. 끝 표식은 예전 창(앞 2,000자) 밖에 있다
+    tail = "<<본문 끝>>"
+    report = DISCLAIMER + "가" * (JUDGE_MAX_REPORT_CHARS - len(DISCLAIMER) - len(tail)) + tail
+    judge = _install_judge(monkeypatch, {"failures": []})
+
+    # Act
+    result = await guard_output(report, run_judge=True, chunks=_EVIDENCE)
+
+    # Assert
+    assert f"[리포트]\n{report}\n\n" in judge.user_prompt
+    assert result.judge_checked_chars == JUDGE_MAX_REPORT_CHARS
+    assert result.judge_total_chars == JUDGE_MAX_REPORT_CHARS
+
+
+async def test_guard_output_cuts_report_after_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Arrange: 창 바로 뒤에 표식
+    overflow = "<<창 밖>>"
+    report = DISCLAIMER + "가" * (JUDGE_MAX_REPORT_CHARS - len(DISCLAIMER)) + overflow
+    judge = _install_judge(monkeypatch, {"failures": []})
+
+    # Act
+    result = await guard_output(report, run_judge=True, chunks=_EVIDENCE)
+
+    # Assert: 앞 창만 들어갔고, 전체 길이와 본 길이로 검증 범위를 알 수 있다
+    assert f"[리포트]\n{report[:JUDGE_MAX_REPORT_CHARS]}\n\n" in judge.user_prompt
+    assert overflow not in judge.user_prompt
+    assert result.judge_checked_chars == JUDGE_MAX_REPORT_CHARS
+    assert result.judge_total_chars == JUDGE_MAX_REPORT_CHARS + len(overflow)
+
+
+async def test_guard_output_honors_custom_report_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Arrange
+    judge = _install_judge(monkeypatch, {"failures": []})
+
+    # Act
+    result = await guard_output(
+        "리포트 본문", run_judge=True, chunks=_EVIDENCE, max_report_chars=10
+    )
+
+    # Assert
+    assert f"[리포트]\n{result.final_text[:10]}\n\n" in judge.user_prompt
+    assert result.judge_checked_chars == 10
+    assert result.judge_total_chars == len(result.final_text)
+
+
+@pytest.mark.parametrize("max_report_chars", [0, -1])
+async def test_guard_output_rejects_non_positive_report_window(
+    monkeypatch: pytest.MonkeyPatch, max_report_chars: int
+) -> None:
+    # Arrange: 잘못 통과하더라도 실제 LLM을 부르지 않게 페이크를 깐다
+    judge = _install_judge(monkeypatch, {"failures": []})
+
+    # Act / Assert
+    with pytest.raises(ValueError, match="max_report_chars"):
+        await guard_output(
+            "리포트 본문", run_judge=True, chunks=_EVIDENCE, max_report_chars=max_report_chars
+        )
+    assert judge.calls == []
+
+
+async def test_guard_output_excludes_evidence_beyond_chunk_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Arrange
+    judge = _install_judge(monkeypatch, {"failures": []})
+
+    # Act
+    result = await guard_output("리포트 본문", run_judge=True, chunks=_EVIDENCE_OVER_LIMIT)
+
+    # Assert: 20번째까지 들어가고 21번째는 빠진다
+    assert _LAST_INCLUDED_EVIDENCE in judge.user_prompt
+    assert _FIRST_EXCLUDED_EVIDENCE not in judge.user_prompt
+    assert result.judge_evidence_chunks == JUDGE_MAX_EVIDENCE_CHUNKS
+
+
+async def test_guard_output_cuts_each_evidence_chunk(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Arrange: 청크 상한 바로 뒤에 표식(예전 상한 500자보다 긴 원문)
+    kept = "나" * JUDGE_EVIDENCE_CHARS
+    cut = "<<청크 밖>>"
+    judge = _install_judge(monkeypatch, {"failures": []})
+
+    # Act
+    await guard_output("리포트 본문", run_judge=True, chunks=[{"text": kept + cut}])
+
+    # Assert: 청크는 정확히 상한 글자에서 끝나고 바로 리포트가 이어진다
+    assert f"{kept}\n\n[리포트]" in judge.user_prompt
+    assert cut not in judge.user_prompt
+
+
+async def test_guard_output_reads_evidence_text_leniently(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Arrange: text가 없는 dict·None인 dict·문자열 청크가 섞여 있다
+    judge = _install_judge(monkeypatch, {"failures": []})
+    chunks: list[object] = [{"source_ref": "[별표3]"}, {"text": None}, "제3조 원문"]
+
+    # Act
+    result = await guard_output("리포트 본문", run_judge=True, chunks=chunks)
+
+    # Assert: 예외 없이 판정을 받는다(예외가 나면 고지문 없는 원본이 저장된다). None 원문은
+    # 빈 문자열로 읽어 "None"이라는 글자를 근거처럼 Judge에 보내지 않는다
+    assert "제3조 원문" in judge.user_prompt
+    assert "None" not in judge.user_prompt
+    assert result.judge_failures == []
+
+
+async def test_guard_output_labels_evidence_as_mixed_sources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Arrange
+    judge = _install_judge(monkeypatch, {"failures": []})
+
+    # Act
+    await guard_output("리포트 본문", run_judge=True, chunks=_EVIDENCE)
+
+    # Assert: 근거가 약관만이 아니다(장해분류표·판례가 함께 온다)
+    assert "[근거 원문(약관·장해분류표·판례)]" in judge.user_prompt
+    assert "[약관 원문]" not in judge.user_prompt
+    assert "근거 원문(약관·장해분류표·판례)" in judge.system_prompt
+    assert "약관 원문" not in judge.system_prompt
+
+
 async def test_guard_output_keeps_disclaimer_when_judge_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Arrange: Judge 호출이 거절(또는 429·잘림)로 실패
-    async def failing_judge(messages: list[dict[str, str]], **opts: object) -> object:
-        raise ai_client.LlmRefusalError("거절")
-
-    records: list[tuple[str, dict[str, object]]] = []
-
-    class _Recorder:
-        def warning(self, event: str, **fields: object) -> None:
-            records.append((event, fields))
-
-    monkeypatch.setattr(ai_client, "chat_json", failing_judge)
-    monkeypatch.setattr(guards, "logger", _Recorder())
+    monkeypatch.setattr(ai_client, "chat_json", _refusing_judge)
+    recorder = _install_log_recorder(monkeypatch)
 
     # Act
     result = await guard_output("리포트 본문", run_judge=True, chunks=[{"text": "약관 원문"}])
@@ -98,7 +336,94 @@ async def test_guard_output_keeps_disclaimer_when_judge_fails(
     # Assert: 고지문은 남고, 검증 미수행이 표식으로 기록된다
     assert result.final_text.startswith(f"> {DISCLAIMER}")
     assert result.judge_failures == [JUDGE_UNAVAILABLE]
-    assert records == [("guardrail.judge.failed", {"error_type": "LlmRefusalError"})]
+    assert recorder.records == [("guardrail.judge.failed", {"error_type": "LlmRefusalError"})]
+
+
+async def test_guard_output_reports_zero_scope_when_judge_call_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Arrange
+    monkeypatch.setattr(ai_client, "chat_json", _refusing_judge)
+
+    # Act
+    result = await guard_output("리포트 본문", run_judge=True, chunks=_EVIDENCE)
+
+    # Assert: Judge가 본 범위는 0(검증 미수행), 전체 길이는 채운다
+    assert result.judge_checked_chars == 0
+    assert result.judge_evidence_chunks == 0
+    assert result.judge_total_chars == len(result.final_text)
+
+
+@pytest.mark.parametrize(("verdict", "reason"), _UNUSABLE_VERDICTS)
+async def test_guard_output_treats_unusable_verdict_as_unavailable(
+    monkeypatch: pytest.MonkeyPatch, verdict: object, reason: str
+) -> None:
+    # Arrange: 호출은 성공했지만 응답이 {"failures": [문장, ...]} 형식이 아니다
+    _install_judge(monkeypatch, verdict)
+    recorder = _install_log_recorder(monkeypatch)
+
+    # Act
+    result = await guard_output("리포트 본문", run_judge=True, chunks=_EVIDENCE)
+
+    # Assert: "실패 없음 = 통과"로 읽지 않고 호출 실패와 똑같이 남긴다. 로그엔 분류만
+    assert result.final_text.startswith(f"> {DISCLAIMER}")
+    assert result.judge_failures == [JUDGE_UNAVAILABLE]
+    assert result.judge_checked_chars == 0
+    assert result.judge_evidence_chunks == 0
+    assert result.judge_total_chars == len(result.final_text)
+    assert recorder.records == [("guardrail.judge.unusable_verdict", {"reason": reason})]
+
+
+# ── count_masked_pii: OCR 마스킹 토큰 건수 ───────────────────────
+# PiiLabel 토큰을 한 번씩 이어 붙인 텍스트와 기대 건수. [면허번호]와 [운전면허번호]처럼 이름이
+# 겹치는 라벨도 대괄호 덕분에 서로의 건수에 섞이지 않아야 한다.
+_EVERY_LABEL_TOKEN_ONCE = "".join(label.token for label in PiiLabel)
+_EVERY_LABEL_COUNTED_ONCE = {label.value: 1 for label in PiiLabel}
+
+
+def test_count_masked_pii_counts_tokens_by_label() -> None:
+    # Arrange
+    text = "환자 성명: [이름], 보호자 성명: [이름], 주민번호 [주민등록번호], 연락처 [전화번호]"
+
+    # Act
+    counts = count_masked_pii(text)
+
+    # Assert: 개수가 있는 라벨만, 한국어 라벨값을 키로
+    assert counts == {"이름": 2, "주민등록번호": 1, "전화번호": 1}
+
+
+def test_count_masked_pii_knows_every_ocr_label() -> None:
+    assert count_masked_pii(_EVERY_LABEL_TOKEN_ONCE) == _EVERY_LABEL_COUNTED_ONCE
+
+
+def test_count_masked_pii_keeps_overlapping_label_names_apart() -> None:
+    assert count_masked_pii("면허 [운전면허번호] 의사 [면허번호] [운전면허번호]") == {
+        "운전면허번호": 2,
+        "면허번호": 1,
+    }
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param("", id="empty"),
+        pytest.param(None, id="none"),
+        pytest.param("진단명: 경추 염좌(S13.4) [별표3] [참고]", id="no-pii-tokens"),
+    ],
+)
+def test_count_masked_pii_returns_empty_without_tokens(text: str | None) -> None:
+    assert count_masked_pii(text) == {}
+
+
+def test_count_masked_pii_counts_what_mask_pii_emits() -> None:
+    # Arrange: 실제 OCR 규칙으로 가린 텍스트(토큰 형식이 갈라지면 여기서 깨진다)
+    masked = mask_pii("환자 성명: 홍길동, 보호자 성명: 김영희, 주민번호 860312-1948571")
+
+    # Act
+    counts = count_masked_pii(masked)
+
+    # Assert
+    assert counts == {"이름": 2, "주민등록번호": 1}
 
 
 # ── mask_pii: 외부 전송 전 마스킹(OCR 입력단 규칙 공유) ─────────────────
