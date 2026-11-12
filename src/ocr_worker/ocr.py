@@ -148,6 +148,7 @@ class PaddleOcrEngine:
         cpu_threads: int,
         enable_mkldnn: bool = True,
         det_limit_side_len: int = 0,
+        mkldnn_cache_capacity: int | None = None,
         factory: Callable[..., Any] | None = None,
     ) -> None:
         """엔진을 구성한다(모델은 아직 로드하지 않는다).
@@ -158,6 +159,8 @@ class PaddleOcrEngine:
             textline_orientation: 줄 방향 분류(뒤집힌 줄 보정) 사용 여부.
             cpu_threads: paddle 추론 스레드 수.
             enable_mkldnn: x86 oneDNN 가속 사용 여부(``ocr_enable_mkldnn`` 설정 주석 참고).
+            mkldnn_cache_capacity: oneDNN이 모델마다 캐시하는 입력 모양 수
+                (``ocr_mkldnn_cache_capacity`` 설정 주석 참고). ``None``이면 PaddleOCR 기본값(10).
             det_limit_side_len: 검출 입력의 긴 변 상한(픽셀). 큰 사진의 검출 메모리를 묶는다
                 (``ocr_det_limit_side_len`` 설정 주석 참고). 0이면 PaddleOCR 기본값(긴 변
                 4000까지 그대로).
@@ -175,6 +178,11 @@ class PaddleOcrEngine:
             "use_textline_orientation": textline_orientation,
             "cpu_threads": cpu_threads,
             "enable_mkldnn": enable_mkldnn,
+            **(
+                {"mkldnn_cache_capacity": mkldnn_cache_capacity}
+                if mkldnn_cache_capacity is not None
+                else {}
+            ),
             **det_limit,
             **_FIXED_PADDLE_OPTIONS,
         }
@@ -193,6 +201,7 @@ class PaddleOcrEngine:
             cpu_threads=settings.ocr_cpu_threads,
             enable_mkldnn=settings.ocr_enable_mkldnn,
             det_limit_side_len=settings.ocr_det_limit_side_len,
+            mkldnn_cache_capacity=settings.ocr_mkldnn_cache_capacity,
         )
 
     def load(self) -> None:
