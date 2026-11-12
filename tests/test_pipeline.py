@@ -3087,3 +3087,50 @@ async def test_publish_mark_is_written_before_the_report_is_sent() -> None:
     # Assert: 타임라인에서 mark_published가 publish보다 **앞**이어야 한다.
     assert "mark_published" in pool.events and "publish" in pool.events
     assert pool.events.index("mark_published") < pool.events.index("publish")
+
+
+# ── 성능 계측(ocr.job.finished · ocr.stage.finished) ──────────────────
+# 문서 1건이 가시성 안에 끝나는지 보는 SLI다. 단계 이름은 대시보드·쿼리가 기대는 계약이라 고정한다.
+async def test_process_emits_stage_and_job_timing_events() -> None:
+    # Arrange: VLM 보완이 필요 없는 단독 진단서(고신뢰도)
+    pool = FakePool(existing=None)
+    producer = FakeProducer()
+    processor = FakeProcessor(_result("진단서", "상병명 골절"))
+    pipeline = _pipeline(pool, producer, processor)
+
+    # Act
+    with capture_logs() as logs:
+        await pipeline.handle(_job(doc_total=None))
+
+    # Assert: 단계는 실행 순서대로 1건씩, VLM 단계는 트리거되지 않아 없다
+    stages = [e for e in logs if e["event"] == "ocr.stage.finished"]
+    assert [e["stage"] for e in stages] == [
+        "analyze",
+        "quality_check",
+        "image_pipeline",
+        "db_save",
+        "publish",
+    ]
+    assert all(e["status"] == "ok" and isinstance(e["duration_ms"], int) for e in stages)
+    # 문서 단위 요약 — 분류값·건수·불리언만(원문 없음, §9)
+    [job] = [e for e in logs if e["event"] == "ocr.job.finished"]
+    assert job["status"] == "ok"
+    assert (job["pages"], job["doc_type"], job["needs_vlm"]) == (1, "diagnosis", False)
+    assert (job["vlm_adopted"], job["ocr_quality"]) == (False, "ok")
+    assert job["duration_ms"] >= max(e["duration_ms"] for e in stages)
+    assert "골절" not in str(job)
+
+
+async def test_failed_process_still_emits_job_timing_with_error_type() -> None:
+    # Arrange: OCR 단계 실패(일시 장애) — 실패한 문서의 시간도 SLI 모수에 들어가야 한다
+    pool = FakePool(existing=None)
+    pipeline = _pipeline(pool, FakeProducer(), _RaisingProcessor(OcrError("S3 다운로드 실패")))
+
+    # Act
+    with capture_logs() as logs, pytest.raises(OcrError):
+        await pipeline.handle(_job())
+
+    # Assert: 예외는 그대로 올라가고(처분 불변), 이벤트엔 타입만 남는다
+    [job] = [e for e in logs if e["event"] == "ocr.job.finished"]
+    assert (job["status"], job["error_type"]) == ("failed", "OcrError")
+    assert "다운로드" not in str(job)
