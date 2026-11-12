@@ -1252,6 +1252,23 @@ async def payment_calc(state: ReportState) -> dict[str, Any]:
 
 
 # ── 리포트 통합 (8섹션 + issues, 생성 가드레일) ────────────────
+async def _gather_or_cancel(*calls: Awaitable[Any]) -> list[Any]:
+    """서로 독립인 호출을 동시에 돌린다. 하나가 실패하면 나머지를 취소하고 **그 예외를 그대로** 올린다.
+
+    `asyncio.gather`는 첫 예외를 올려도 나머지 task를 취소하지 않는다 — 결과를 버릴 LLM 호출이 끝까지
+    돌며 과금된다. `TaskGroup`은 예외를 `ExceptionGroup`으로 감싸 safe_node의 `AiClientError` 분류
+    (`llm_failure` → 그래프 중단·재전달)를 깨뜨린다. 그래서 직접 취소하고 원래 예외를 올린다.
+    """
+    tasks = [asyncio.ensure_future(call) for call in calls]
+    try:
+        return list(await asyncio.gather(*tasks))
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+
 @safe_node
 async def report_compose(state: ReportState) -> dict[str, Any]:
     ci = state.get("case_info", {})
@@ -1270,7 +1287,9 @@ async def report_compose(state: ReportState) -> dict[str, Any]:
         disability_line = f"현재 확정 장해 없음 — 재평가 대상. ※ {da.get('caveat', '')}"
     else:
         disability_line = "해당 없음(후유장해 미검토)"
-    body = await ai_client.chat(
+    # 본문과 쟁점 추출은 서로의 결과를 쓰지 않는다 — 동시에 부른다(성능 실험 R1, docs/perf). 리포트
+    # 기준선에서 이 노드가 가장 길었고(p50 53.5초), 짧은 쪽 호출만큼(p50 16초) 줄어든다.
+    body_call = ai_client.chat(
         [
             {
                 "role": "system",
@@ -1293,9 +1312,7 @@ async def report_compose(state: ReportState) -> dict[str, Any]:
             },
         ]
     )
-    body = guardrail.guard_generation(body)
-
-    issues = await ai_client.chat_json(
+    issues_call = ai_client.chat_json(
         [
             {
                 "role": "system",
@@ -1311,6 +1328,8 @@ async def report_compose(state: ReportState) -> dict[str, Any]:
             },
         ]
     )
+    body_raw, issues = await _gather_or_cancel(body_call, issues_call)
+    body = guardrail.guard_generation(body_raw)
     issue_list = issues.get("issues", []) if isinstance(issues, dict) else []
 
     sections = {

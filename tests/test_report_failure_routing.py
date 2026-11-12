@@ -263,6 +263,12 @@ class _FakeSearch:
         return {"ranked_chunks": [dict(chunk)], "citations": [chunk["source_ref"]]}
 
 
+def _calls_through_node(node: str) -> list[str]:
+    """그 노드의 마지막 호출까지의 호출 노드 목록 — 노드 안 호출은 동시에 나갈 수 있다(R1)."""
+    end = max(i for i, (name, _) in enumerate(_LLM_CALL_ORDER) if name == node) + 1
+    return [name for name, _ in _LLM_CALL_ORDER[:end]]
+
+
 def _call_sites(system_prompts: list[str]) -> list[str]:
     """LLM 호출을 호출한 노드 이름으로 바꾼다(_LLM_CALL_ORDER의 system 프롬프트 힌트로 구분)."""
     return [
@@ -540,8 +546,9 @@ async def test_llm_system_failure_anywhere_stops_further_llm_calls_and_saves_not
     with pytest.raises(worker.ReportWorkerError) as caught:
         await worker.handle_job(_job())
 
-    # Assert: 실패한 그 호출에서 멈췄고(이후 LLM 0회) 저장·상태 갱신이 없다. 재전달 대상이다
-    assert _call_sites(llm.system_prompts) == [name for name, _ in _LLM_CALL_ORDER[:fail_at]]
+    # Assert: 실패한 노드에서 멈췄고(이후 노드의 LLM 0회) 저장·상태 갱신이 없다. 재전달 대상이다.
+    # report_compose는 본문·쟁점을 동시에 부르므로(R1) 그 노드의 두 호출은 함께 나간다.
+    assert _call_sites(llm.system_prompts) == _calls_through_node(node)
     assert conn.executed == []
     assert not isinstance(caught.value, NonRetryableError)
     assert f"{node}_failed:AiClientError" in str(caught.value)
@@ -619,8 +626,9 @@ async def test_refusal_after_partial_progress_still_blocks_without_draft(
     with pytest.raises(worker.ReportRefusedError) as caught:
         await worker.handle_job(_job())
 
-    # Assert: 쟁점 추출·Judge는 안 불렸고, 부분 결과도 저장하지 않고 상태만 남겼다
-    assert _call_sites(llm.system_prompts) == [node for node, _ in _LLM_CALL_ORDER[:6]]
+    # Assert: 쟁점 추출은 본문과 동시에 출발했고(R1) Judge는 안 불렸다. 부분 결과도 저장하지 않고
+    # 상태만 남겼다
+    assert _call_sites(llm.system_prompts) == _calls_through_node("report_compose")
     assert [q for q, _ in conn.executed] == [agents._MARK_BLOCKED_SQL]
     assert isinstance(caught.value, NonRetryableError)
     assert "report_compose_failed:LlmRefusalError" in str(caught.value)
