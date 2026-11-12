@@ -17,11 +17,13 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+import pytest
 from pydantic import BaseModel
 from structlog.testing import capture_logs
 
 from core.config import Settings
 from core.exceptions import NonRetryableError
+from core.sqs import consumer as consumer_module
 from core.sqs.consumer import SqsConsumer
 
 _QUEUE = "https://sqs.ap-northeast-2.amazonaws.com/123456789012/ocr-job-queue"
@@ -371,3 +373,107 @@ async def test_poison_hook_not_called_for_terminal_handler_failure() -> None:
 
     assert calls == 0
     assert client.deleted == ["rh-1"]
+
+
+# ── 성능 계측(큐 대기·처리 시간) ──────────────────────────────────
+_NOW_MS = 1_800_000_000_000
+
+
+class _RecordingSqsClient(FakeSqsClient):
+    """receive_message 인자를 기록하는 대역(요청 속성 검증용)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.receive_kwargs: list[dict[str, object]] = []
+
+    def receive_message(self, **kwargs: object) -> dict[str, Any]:
+        self.receive_kwargs.append(kwargs)
+        return super().receive_message(**kwargs)
+
+
+def _timed_message(body: str, attributes: dict[str, str]) -> dict[str, Any]:
+    message = _message(body)
+    message["Attributes"] = {**message["Attributes"], **attributes}
+    return message
+
+
+async def test_receive_requests_sent_timestamp() -> None:
+    # Arrange
+    client = _RecordingSqsClient()
+    consumer = _consumer(_noop_handler, client=client)
+
+    # Act
+    await consumer._receive()
+
+    # Assert: poison 판정용 수신 횟수와 큐 대기 계산용 발행 시각을 함께 받는다
+    assert client.receive_kwargs[0]["AttributeNames"] == [
+        "ApproximateReceiveCount",
+        "SentTimestamp",
+    ]
+
+
+async def _failing_handler(_job: _Job) -> None:
+    raise RuntimeError("일시 장애")
+
+
+async def _terminal_handler(_job: _Job) -> None:
+    raise _Terminal("결정적 실패")
+
+
+@pytest.mark.parametrize(
+    ("handler", "outcome"),
+    [(_noop_handler, "done"), (_failing_handler, "retry"), (_terminal_handler, "terminal")],
+)
+async def test_finished_event_reports_queue_wait_and_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+    handler: Callable[[_Job], Awaitable[None]],
+    outcome: str,
+) -> None:
+    # Arrange: 발행 5초 뒤에 받은 메시지
+    monkeypatch.setattr(consumer_module.time, "time", lambda: _NOW_MS / 1000)
+    message = _timed_message('{"job_id": "j1", "value": 7}', {"SentTimestamp": str(_NOW_MS - 5000)})
+    consumer = _consumer(handler)
+
+    # Act
+    with capture_logs() as logs:
+        await consumer._process(message)
+
+    # Assert: 처분과 무관하게 메시지당 1건 — 큐 대기·처리 시간·가시성 상한을 함께 싣는다
+    [event] = [e for e in logs if e["event"] == "sqs.message.finished"]
+    assert event["outcome"] == outcome
+    assert event["queue_wait_ms"] == 5000
+    assert event["receive_count"] == 1
+    assert event["message_id"] == "m-1"
+    assert isinstance(event["handle_ms"], int)
+    assert event["visibility_timeout_ms"] == consumer._settings.sqs_visibility_timeout * 1000
+
+
+@pytest.mark.parametrize("attributes", [{}, {"SentTimestamp": "not-a-number"}])
+async def test_queue_wait_is_none_without_valid_sent_timestamp(
+    attributes: dict[str, str],
+) -> None:
+    # Arrange: 속성이 없거나 깨진 메시지(계측값이 없다고 처리를 막으면 안 된다)
+    client = FakeSqsClient()
+    consumer = _consumer(_noop_handler, client=client)
+
+    # Act
+    with capture_logs() as logs:
+        await consumer._process(_timed_message('{"job_id": "j1", "value": 7}', attributes))
+
+    # Assert: 처리·ack는 그대로, 대기 시간만 비운다
+    assert client.deleted == ["rh-1"]
+    [event] = [e for e in logs if e["event"] == "sqs.message.finished"]
+    assert event["queue_wait_ms"] is None
+
+
+async def test_poison_and_invalid_messages_emit_no_finished_event() -> None:
+    # Arrange: 핸들러까지 가지 않는 메시지 — 처리 시간 SLI 모수에 섞이면 분포가 왜곡된다
+    consumer = _consumer(_noop_handler)
+
+    # Act
+    with capture_logs() as logs:
+        await consumer._process(_message('{"job_id": "j1", "value": 7}', receive_count=6))
+        await consumer._process(_message('{"oops": true}'))
+
+    # Assert
+    assert [e for e in logs if e["event"] == "sqs.message.finished"] == []

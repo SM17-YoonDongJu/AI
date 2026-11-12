@@ -19,6 +19,9 @@ import re
 import socket
 import sys
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
+from time import perf_counter
 from typing import Any
 
 import structlog
@@ -28,12 +31,15 @@ from core.config import settings
 
 __all__ = [
     "bind_context",
+    "bound_context",
     "clear_context",
     "configure_logging",
+    "elapsed_ms",
     "get_logger",
     "log_event",
     "mask_pii",
     "new_request_context",
+    "timed",
 ]
 
 # --------------------------------------------------------------------------- #
@@ -272,3 +278,55 @@ def log_event(logger: structlog.stdlib.BoundLogger, event_type: str, **fields: A
         **fields: 이벤트 속성(analysis_id·policy_id·duration_ms 등).
     """
     logger.info(event_type, event_type=event_type, **fields)
+
+
+@contextmanager
+def bound_context(**fields: Any) -> Iterator[None]:
+    """블록 안에서만 컨텍스트 필드를 바인딩한다. 블록을 나가면 이전 값으로 되돌린다.
+
+    `bind_context`는 작업 경계(진입~`clear_context`)용이고, 이것은 작업 안의 더 좁은 구간용이다
+    (예: 리포트 그래프 노드 하나 — 그 노드에서 나간 LLM 호출 로그에 노드 이름이 붙는다).
+    """
+    with structlog.contextvars.bound_contextvars(**fields):
+        yield
+
+
+def elapsed_ms(started: float) -> int:
+    """`perf_counter()` 시작값부터 지금까지 걸린 시간(ms, 정수 반올림)."""
+    return round((perf_counter() - started) * 1000)
+
+
+@contextmanager
+def timed(
+    logger: structlog.stdlib.BoundLogger, event_type: str, **fields: Any
+) -> Iterator[dict[str, Any]]:
+    """블록 소요 시간을 `duration_ms`로 담은 이벤트를 1건 남긴다(성능 SLI 계측용).
+
+    블록이 받는 dict에 값을 넣으면 같은 이벤트에 함께 실린다 — 블록을 돌아야 정해지는 값
+    (쪽 수·채택 여부 등)을 위해서다. 예외로 끝나도 이벤트는 남기되(`status="failed"`,
+    `error_type`) 예외는 그대로 올린다 — 계측이 동작을 바꾸지 않는다. 예외는 타입만 남긴다(§9).
+
+    Args:
+        logger: `get_logger`로 얻은 로거.
+        event_type: 이벤트 종류(예: "ocr.stage.finished").
+        **fields: 이벤트에 고정으로 실을 속성(예: `stage="analyze"`). PII를 넘기지 않는다.
+
+    Yields:
+        이벤트에 덧붙일 속성을 담는 dict.
+    """
+    extra: dict[str, Any] = {}
+    started = perf_counter()
+    error_type: str | None = None
+    try:
+        yield extra
+    except BaseException as exc:  # 취소(CancelledError)도 기록 — 그대로 다시 올린다
+        error_type = type(exc).__name__
+        raise
+    finally:
+        outcome: dict[str, Any] = {
+            "duration_ms": elapsed_ms(started),
+            "status": "ok" if error_type is None else "failed",
+        }
+        if error_type is not None:
+            outcome["error_type"] = error_type
+        log_event(logger, event_type, **{**fields, **extra, **outcome})

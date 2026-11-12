@@ -26,10 +26,13 @@ from typing import Any, Protocol, runtime_checkable
 
 from core.config import Settings, get_settings
 from core.exceptions import OcrError, UnreadableFileError
-from core.logging import get_logger
+from core.logging import get_logger, timed
 from ocr_worker.storage import get_object
 
 logger = get_logger(__name__)
+
+# OCR 단계 소요 시간 이벤트(pipeline.py와 같은 이름 — 한 쿼리로 단계 전체를 본다).
+_STAGE_EVENT = "ocr.stage.finished"
 
 # 외부 라이브러리(PIL.Image) 객체 — lazy 의존이라 경계에서 Any로 둔다(§3 최후수단).
 type PageImage = Any
@@ -440,9 +443,16 @@ class OcrProcessor:
         Raises:
             OcrError: 다운로드·렌더·OCR 중 실패.
         """
-        data = await self._fetch(s3_key)
-        images = await asyncio.to_thread(self._render, data, content_type)
-        lines_per_page = await asyncio.to_thread(self._engine.recognize, images)
+        # 단계별 소요 시간(ocr.stage.finished) — 문서 1건이 가시성 안에 끝나는지 보는 SLI의 분해.
+        with timed(logger, _STAGE_EVENT, stage="s3_fetch") as fetched:
+            data = await self._fetch(s3_key)
+            fetched["bytes"] = len(data)
+        with timed(logger, _STAGE_EVENT, stage="render") as rendered:
+            images = await asyncio.to_thread(self._render, data, content_type)
+            rendered["pages"] = len(images)
+        with timed(logger, _STAGE_EVENT, stage="ocr_engine", pages=len(images)) as recognized:
+            lines_per_page = await asyncio.to_thread(self._engine.recognize, images)
+            recognized["lines"] = sum(len(lines) for lines in lines_per_page)
         result = _build_result(images, lines_per_page)
         logger.info(
             "ocr_done",

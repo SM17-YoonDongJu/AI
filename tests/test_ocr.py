@@ -18,6 +18,7 @@ from typing import Any
 import numpy as np
 import pytest
 from PIL import Image
+from structlog.testing import capture_logs
 
 from core.config import Settings
 from core.exceptions import OcrError
@@ -149,6 +150,25 @@ async def test_process_raises_on_page_count_mismatch() -> None:
 
     with pytest.raises(OcrError, match="페이지 수 불일치"):
         await processor.process("uploads/x.pdf", "application/pdf")
+
+
+async def test_process_emits_stage_timing_for_fetch_render_and_engine() -> None:
+    # Arrange: 2쪽 문서
+    images = [_FakeImage(800, 600), _FakeImage(800, 600)]
+    pages = [[_line("p0", 1.0)], [_line("p1a", 0.9), _line("p1b", 0.7)]]
+    processor, _ = _make_processor(images=images, pages=pages)
+
+    # Act
+    with capture_logs() as logs:
+        await processor.process("uploads/x.pdf", "application/pdf")
+
+    # Assert: 문서 처리 시간 분해의 앞 세 단계 — 크기·쪽·라인 수만 싣는다(원문 없음)
+    stages = {e["stage"]: e for e in logs if e["event"] == "ocr.stage.finished"}
+    assert list(stages) == ["s3_fetch", "render", "ocr_engine"]
+    assert stages["s3_fetch"]["bytes"] == len(b"rawbytes")
+    assert stages["render"]["pages"] == 2
+    assert (stages["ocr_engine"]["pages"], stages["ocr_engine"]["lines"]) == (2, 3)
+    assert all(isinstance(e["duration_ms"], int) for e in stages.values())
 
 
 # ── content_type 라우팅 가드 ─────────────────────────────────────

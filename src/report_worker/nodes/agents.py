@@ -23,7 +23,7 @@ import asyncpg
 import guardrail
 from core import ai_client, crypto, db
 from core.exceptions import PiiCryptoError
-from core.logging import get_logger
+from core.logging import bound_context, get_logger
 from report_worker import metrics
 from report_worker.disability_rules import combine_disability_rate
 
@@ -87,7 +87,10 @@ def safe_node(fn: NodeFn) -> NodeFn:
         # "7_추가확인필요" 섹션에 그대로 join돼 최종 리포트에 노출된다.
         # 원문 파싱 실패 등의 예외 메시지엔 PII 조각이 섞일 수 있다(§9).
         try:
-            out = await fn(state)
+            # 노드 안에서 나간 LLM·임베딩 호출 로그(ai_client.*.finished)에 노드 이름을 붙인다 —
+            # 리포트 지연을 노드 → LLM 호출 단위로 나눠 보기 위해서다.
+            with bound_context(graph_node=fn.__name__):
+                out = await fn(state)
         except ai_client.AiClientError as e:  # LlmRefusalError 포함
             return {
                 "errors": _err(state, f"{fn.__name__}_failed:{type(e).__name__}"),
