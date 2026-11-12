@@ -348,14 +348,17 @@ async def _run(args: argparse.Namespace, picked: list[str], out_dir: Path) -> in
                     bench_phase="measure", bench_rep=rep, bench_scenario=sid
                 ):
                     final = await graph.ainvoke(state)
-                    _log_graph_finished(final)
-                wall = time.perf_counter() - t0
+                    wall = time.perf_counter() - t0
+                    _log_graph_finished(final, wall_ms=round(wall * 1000))
                 chats = [e for e in usage.events if e["event_type"] == "ai_client.chat.finished"]
                 run = {
                     "scenario": sid,
                     "rep": rep,
                     "wall_s": round(wall, 1),
                     "node_ms": {e["node"]: e["ms"] for e in final.get("node_trace") or []},
+                    "outside_nodes_s": round(
+                        wall - sum(e["ms"] for e in final.get("node_trace") or []) / 1000, 1
+                    ),
                     "llm_calls": len(chats),
                     "llm_errors": len(usage.events) - len(chats),
                     "input_tokens": sum(e.get("input_tokens") or 0 for e in chats),

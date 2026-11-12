@@ -577,6 +577,9 @@ async def test_llm_system_failure_logs_only_markers_before_redelivery(
     assert fields["failed_nodes"] == ["diagnosis"]
     assert fields["llm_failure"] == agents.LLM_SYSTEM_FAILURE
     assert fields["total_ms"] == sum(fields["node_ms"].values())
+    # 조건 분기(노드 밖) 시간까지 담은 벽시계 — 노드 합보다 작을 수 없다
+    assert fields["wall_ms"] >= 0
+    assert fields["outside_nodes_ms"] == max(0, fields["wall_ms"] - fields["total_ms"])
 
 
 # ── (c) 거절 ─────────────────────────────────────────────────
