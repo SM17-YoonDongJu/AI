@@ -271,7 +271,7 @@ AI 트래픽이 거의 없고(2026-11-12 기준 `ocr_results` 4건), 샘플을 d
 | R2 | JSON 추출성 호출(쟁점·판례 필터·진단)은 effort를 낮춰도 품질이 유지된다 | 노드별 effort 차등 | `llm.chat` 노드별 `duration_ms`·`output_tokens` + 품질 가드 | 실험 실행 시 발생 |
 | R3 | `case_search`는 진단에만 의존해 coverage 경로와 병렬화할 수 있다 | 그래프 fan-out | `total_ms` | **R0에서 `case_search` p50 0.5초 — 이득이 거의 없어 보류** |
 | R4 | (보호) 리포트도 처리 시간 상한이 가시성 안에 들어야 한다 | 기동 예산 검사 또는 가시성 연장(heartbeat) | p99 vs 600초 | 없음 |
-| **R5** | (보호) Claude 스트림이 200 OK 뒤 끝나지 않고 멈출 수 있다(R0 중 1건, 30분+). SDK 타임아웃은 청크 간격이라 못 끊는다 → 워커가 무한정 묶이고 가시성 초과 시 중복 처리 | LLM 호출 단위 전체 상한(`asyncio.timeout`) → `AiClientError`로 재전달 | 멈춘 호출 수·`ai_client.chat.finished` 누락 | 없음(재현은 어렵다) |
+| **R5** | (보호) Claude 스트림이 200 OK 뒤 끝나지 않고 멈출 수 있다(R0 중 1건, 30분+). SDK 타임아웃은 청크 간격이라 못 끊는다 → 워커가 무한정 묶이고 가시성 초과 시 중복 처리 | **구현**: `llm_call_deadline_seconds`(300초 — 관측 최대 58.5초/307건의 약 5배) 전체 상한 → `AiClientError`로 재전달, `ai_client.chat.deadline_exceeded` 로그 | `deadline_exceeded` 건수 | 없음 |
 | **G3** | 약관 존재 조회가 리포트의 17%(p50 33초)다 — `idx_policy_meta`가 상품명을 못 써 보험사 청크 수십만 행을 디스크에서 읽는다 | `EXISTS` + `(insurer, product_name)` 인덱스(#96) | `outside_nodes_ms`·`coverage_analysis` | 재측정 4건 |
 | **O3** | 5.2 재OCR 검증이 OCR 엔진 비용을 한 번 더 쓴다(**B0: 41%**) | 방식 선택 필요 — (a) 검증을 처리 경로 밖(ack 뒤)으로 (b) 텍스트 기반 잔류 검사로 대체 (c) 재OCR을 가려지지 않은 라인 인식만으로 축소 | `verify`·`ocr.job` + 삭제 판정 일치 | 없음 |
 | **O1** | NER이 같은 줄을 문서당 4번 돌고 배치도 안 된다(**B0: 14%, 빽빽한 문서 25%**) | 줄 단위 결과 재사용 + `batch_size` | `analyze`·`quality_check`·`redact`·`vlm_pages` + 지문 동일 | 없음 |

@@ -200,6 +200,11 @@ class Settings(BaseSettings):
     # anthropic 전용 — thinking과 응답을 합친 출력 상한. 스트리밍으로 받으므로 넉넉히 둔다.
     llm_max_tokens: int = 64000
     llm_timeout_seconds: float = 600.0  # anthropic 전용 SDK 요청 타임아웃(초)
+    # LLM 호출 1회의 전체 상한(초, 성능 실험 R5 — docs/perf). SDK 타임아웃은 청크 사이 간격이라
+    # 200 OK 뒤 스트림이 멈추면 끊지 못한다(dev 실측 30분+ 멈춤). 관측 최대 58.5초(307건)의
+    # 약 5배이고, 멈춘 호출이 하나 있어도 리포트 p95(142초) + 300초가 가시성(600초) 안에 든다.
+    # 넘기면 AiClientError → 재전달.
+    llm_call_deadline_seconds: float = Field(300.0, gt=0)
     # voyage: Voyage(MongoDB Atlas 모델 API) — 요청에 input_type·output_dimension을 싣는다.
     embedding_provider: Literal["openai_compat", "voyage"] = "voyage"
     embedding_base_url: str = "https://ai.mongodb.com/v1"  # 임베딩 엔드포인트(별도 노드/업체 가능)

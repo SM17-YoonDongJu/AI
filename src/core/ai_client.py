@@ -12,6 +12,7 @@ base_url·모델명·인증키는 config에서 주입한다(하드코딩 금지)
 
 from __future__ import annotations
 
+import asyncio
 import json
 from time import perf_counter
 from typing import TYPE_CHECKING, Any, Literal
@@ -215,10 +216,13 @@ async def _openai_compat_chat(messages: list[dict[str, str]], opts: dict[str, An
     client = _get_chat_client()
     started = perf_counter()
     try:
-        resp = await client.post("/chat/completions", json=payload)
+        async with asyncio.timeout(settings.llm_call_deadline_seconds):
+            resp = await client.post("/chat/completions", json=payload)
         resp.raise_for_status()
         data = resp.json()
         content: str = data["choices"][0]["message"]["content"]
+    except TimeoutError as exc:
+        raise _deadline_exceeded("openai_compat", model, started) from exc
     except httpx.HTTPError as exc:
         raise AiClientError("chat 호출 실패") from exc
     except (KeyError, IndexError, TypeError) as exc:
@@ -257,16 +261,22 @@ async def _anthropic_chat(messages: list[dict[str, str]], opts: dict[str, Any]) 
     try:
         # 긴 입력·출력(thinking 포함)은 비스트리밍이면 HTTP 타임아웃에 걸려 스트림으로 받고 최종
         # 메시지만 쓴다. thinking은 보내지 않는다 — Opus 5.5는 항상 adaptive이고 disabled는 400.
-        async with client.beta.messages.stream(
-            model=model,
-            max_tokens=settings.llm_max_tokens,
-            system=system or anthropic.omit,
-            messages=turns,
-            output_config={"effort": settings.llm_effort},
-            betas=[_SERVER_SIDE_FALLBACK_BETA],
-            fallbacks="default",
-        ) as stream:
+        # 호출 전체에 상한을 건다 — 넘기면 스트림 컨텍스트가 닫히며 연결도 끊긴다.
+        async with (
+            asyncio.timeout(settings.llm_call_deadline_seconds),
+            client.beta.messages.stream(
+                model=model,
+                max_tokens=settings.llm_max_tokens,
+                system=system or anthropic.omit,
+                messages=turns,
+                output_config={"effort": settings.llm_effort},
+                betas=[_SERVER_SIDE_FALLBACK_BETA],
+                fallbacks="default",
+            ) as stream,
+        ):
             message = await stream.get_final_message()
+    except TimeoutError as exc:
+        raise _deadline_exceeded("anthropic", model, started) from exc
     except (anthropic.APIError, httpx2.HTTPError) as exc:
         # 예외 메시지엔 응답 본문이 섞일 수 있어 남기지 않는다(§9) — 분류값만.
         logger.warning(
@@ -292,6 +302,23 @@ async def _anthropic_chat(messages: list[dict[str, str]], opts: dict[str, Any]) 
         effort=settings.llm_effort,
     )
     return _final_text(message, requested_model=model)
+
+
+def _deadline_exceeded(provider: str, model: str, started: float) -> AiClientError:
+    """호출 전체 상한(`llm_call_deadline_seconds`)을 넘긴 호출을 남기고 올릴 예외를 만든다.
+
+    SDK·httpx 타임아웃은 청크 사이 간격이라, 200 OK 뒤 스트림이 멈추거나 조금씩만 흘러 끝나지 않는
+    호출을 끊지 못한다. `AiClientError`라 리포트 그래프는 `llm_system_failure`로 멈추고 재전달된다.
+    """
+    logger.warning(
+        "ai_client.chat.deadline_exceeded",
+        provider=provider,
+        model=model,
+        deadline_s=settings.llm_call_deadline_seconds,
+        duration_ms=elapsed_ms(started),
+    )
+    deadline = settings.llm_call_deadline_seconds
+    return AiClientError(f"chat 호출이 전체 상한({deadline:g}초)을 넘었다")
 
 
 def _log_chat_finished(*, provider: str, model: str, started: float, **fields: Any) -> None:
