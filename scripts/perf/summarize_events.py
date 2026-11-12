@@ -79,6 +79,8 @@ def collect(events: Iterable[dict[str, Any]]) -> dict[str, list[float]]:
             add(f"ocr.stage|{event.get('stage')}|duration_ms", event.get("duration_ms"))
         elif kind == "report.graph.finished":
             add("report.graph|all|total_ms", event.get("total_ms"))
+            add("report.graph|all|wall_ms", event.get("wall_ms"))
+            add("report.graph|all|outside_nodes_ms", event.get("outside_nodes_ms"))
             for node, ms in (event.get("node_ms") or {}).items():
                 add(f"report.graph|{node}|ms", ms)
         elif kind == "ai_client.chat.finished":
