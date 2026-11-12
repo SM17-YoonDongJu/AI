@@ -283,6 +283,8 @@ def test_paddle_engine_from_settings_uses_ocr_settings() -> None:
     assert options["enable_mkldnn"] is False
     assert options["text_det_limit_type"] == "max"
     assert options["text_det_limit_side_len"] == 1800
+    # M1: oneDNN 캐시 기본값 2(PaddleOCR 기본 10보다 작게 — 문서별 최고 RSS 5% 감소)
+    assert options["mkldnn_cache_capacity"] == 2
 
 
 def test_paddle_engine_caps_detection_input_long_side() -> None:

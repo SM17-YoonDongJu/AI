@@ -149,9 +149,11 @@ class Settings(BaseSettings):
     # 커널로 돌아 A4 한 쪽(200DPI)에서 7.8GB VM이 OOM으로 죽었다(켜면 최대 RSS 3.7GB,
     # _workspace/20).
     ocr_enable_mkldnn: bool = True
-    # oneDNN이 모델마다 캐시하는 입력 모양 수(성능 실험 M1, docs/perf). 쪽 이미지 크기가 문서마다
-    # 달라 모양별 프리미티브·버퍼가 쌓인다는 가설을 재는 손잡이다. None이면 PaddleOCR 기본값(10).
-    ocr_mkldnn_cache_capacity: int | None = Field(None, ge=1)
+    # oneDNN이 모델마다 캐시하는 입력 모양 수(성능 실험 M1, docs/perf). PaddleOCR 기본값은 10인데
+    # 쪽 이미지 크기가 문서마다 달라 모양별 프리미티브·버퍼가 쌓인다. 2로 줄이면 dev t3.large에서
+    # 문서별 최고 RSS 중앙값 4,119→3,919MiB(5% 감소)·최대 4,334→4,145MiB였고 시간·결과 지문은
+    # 같았다. None이면 PaddleOCR 기본값(10).
+    ocr_mkldnn_cache_capacity: int | None = Field(2, ge=1)
     # 검출 입력의 긴 변 상한(픽셀, PaddleOCR text_det_limit_type="max"). 검출 메모리는 입력 화소
     # 수에 비례하는데 PaddleOCR 기본값은 긴 변 4000까지 줄이지 않는다 — 1200만 화소 폰 사진
     # (3024x4032)이 7GiB 제한에서 OOM으로 죽었다(합성 측정 2026-11-08, 운영도 4.5Gi에서 OOMKilled).
