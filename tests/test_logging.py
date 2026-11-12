@@ -8,12 +8,14 @@ import structlog
 from core import logging as core_logging
 from core.logging import (
     bind_context,
+    bound_context,
     clear_context,
     configure_logging,
     get_logger,
     log_event,
     mask_pii,
     new_request_context,
+    timed,
 )
 
 # --- PII 마스킹 (가장 위험한 로직 — 정확히 고정) --- #
@@ -118,3 +120,64 @@ def test_cap_reapplies_after_sdk_reset_its_logger() -> None:
 
     # Assert
     assert logging.getLogger("anthropic").getEffectiveLevel() == logging.INFO
+
+
+# --- 성능 계측(timed·bound_context) --- #
+
+
+def test_timed_logs_duration_status_and_block_fields() -> None:
+    # Arrange
+    logger = get_logger("test")
+
+    # Act
+    with structlog.testing.capture_logs() as logs, timed(logger, "x.stage", stage="s1") as extra:
+        extra["pages"] = 3
+
+    # Assert: 고정 필드 + 블록이 채운 필드 + 시간·상태가 이벤트 1건에 실린다
+    [event] = logs
+    assert event["event"] == "x.stage"
+    assert event["event_type"] == "x.stage"
+    assert (event["stage"], event["pages"], event["status"]) == ("s1", 3, "ok")
+    assert isinstance(event["duration_ms"], int)
+    assert event["duration_ms"] >= 0
+    assert "error_type" not in event
+
+
+def test_timed_failure_reraises_and_logs_type_only() -> None:
+    # Arrange: 예외 메시지에 원문 조각이 섞인 상황
+    logger = get_logger("test")
+
+    # Act
+    with (
+        structlog.testing.capture_logs() as logs,
+        pytest.raises(ValueError, match="원문"),
+        timed(logger, "x.stage", stage="s1"),
+    ):
+        raise ValueError("원문 홍길동")
+
+    # Assert: 계측은 예외를 삼키지 않고, 타입만 남긴다(§9)
+    [event] = logs
+    assert (event["status"], event["error_type"]) == ("failed", "ValueError")
+    assert "홍길동" not in str(event)
+
+
+def test_bound_context_applies_inside_block_only() -> None:
+    # Arrange
+    clear_context()
+    bind_context(job_id="j1")
+    logger = get_logger("test")
+
+    # Act
+    with structlog.testing.capture_logs(
+        processors=[structlog.contextvars.merge_contextvars]
+    ) as logs:
+        with bound_context(graph_node="diagnosis"):
+            logger.info("inside")
+        logger.info("outside")
+    clear_context()
+
+    # Assert: 블록 안 로그에만 붙고, 작업 단위 컨텍스트(job_id)는 그대로 남는다
+    inside, outside = logs
+    assert (inside["graph_node"], inside["job_id"]) == ("diagnosis", "j1")
+    assert "graph_node" not in outside
+    assert outside["job_id"] == "j1"
