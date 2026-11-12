@@ -546,9 +546,10 @@ def test_mask_pii_without_ner_keeps_unlabeled_names(text: str) -> None:
 class _FakeNerDetector:
     """transformers 없이 NER 경로를 확인하는 페이크. "저는 홍길동입니다"의 '홍길동' 위치를 준다."""
 
-    def __init__(self, model_name: str, score_threshold: float) -> None:
+    def __init__(self, model_name: str, score_threshold: float, *, batch_size: int = 16) -> None:
         self.model_name = model_name
         self.score_threshold = score_threshold
+        self.batch_size = batch_size
 
     def detect(self, text: str) -> list[Span]:
         return [Span(3, 6, PiiLabel.NAME, source="ner", score=0.99)]
