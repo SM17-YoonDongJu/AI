@@ -98,12 +98,19 @@ import asyncpg
 from core.config import Settings, get_settings
 from core.contracts import DocType, OcrJob, ReportJob
 from core.exceptions import NonRetryableError, OcrError, UnreadableFileError
-from core.logging import bind_context, clear_context, get_logger, timed
+from core.logging import bind_context, clear_context, get_logger, log_event, timed
 from core.sqs.producer import SqsProducer
 from ocr_worker.classify import classify
 from ocr_worker.extract import extract
 from ocr_worker.masking.image_masker import ImageMasker, RedactedPage, image_to_png_bytes
-from ocr_worker.masking.image_verify import CoverageFn, VerificationResult, verify_redacted_page
+from ocr_worker.masking.image_verify import (
+    CoverageFn,
+    VerificationResult,
+    decide,
+    measure_coverage,
+    reocr_residual_pii,
+    text_residual_pii,
+)
 from ocr_worker.masking.masker import Masker, get_masker
 from ocr_worker.masking.spans import PiiLabel
 from ocr_worker.masking.verify import MaskingError, assert_no_residual
@@ -245,6 +252,30 @@ def _masked_image_key(job_id: str, page_index: int) -> str:
 def _encode_pngs(redacted_pages: list[RedactedPage]) -> list[bytes]:
     """비식별 사본을 PNG 바이트로 인코딩한다(동기 — PIL, ``to_thread``용)."""
     return [image_to_png_bytes(page.image) for page in redacted_pages]
+
+
+def _log_verify_shadow(
+    page_index: int, reocr: VerificationResult, text: VerificationResult
+) -> None:
+    """재OCR 판정(실제 게이트)과 텍스트 판정(섀도)을 나란히 남긴다(O3 전환 근거).
+
+    값은 남기지 않는다 — 판정·건수·라벨 분류만(§9). ``agree``가 원본 삭제 판정의 일치 여부다.
+    """
+    reocr_labels = {span.label.value for span in reocr.residual_pii}
+    text_labels = {span.label.value for span in text.residual_pii}
+    log_event(
+        logger,
+        "ocr.verify.shadow",
+        page=page_index,
+        agree=reocr.passed == text.passed,
+        reocr_passed=reocr.passed,
+        text_passed=text.passed,
+        reocr_residual=len(reocr.residual_pii),
+        text_residual=len(text.residual_pii),
+        reocr_only_labels=sorted(reocr_labels - text_labels),
+        text_only_labels=sorted(text_labels - reocr_labels),
+        low_coverage_lines=len(reocr.low_coverage_lines),
+    )
 
 
 def _derive_report_id(ocr_result_id: str) -> str:
@@ -983,7 +1014,9 @@ class OcrPipeline:
             )
         logger.info("masked_images_uploaded", pages=len(keys))
         # 삭제 게이트 검증(5.1 커버리지 + 5.2 재OCR) — 재OCR이 OCR 엔진을 한 번 더 도는 단계다.
-        with timed(logger, _STAGE_EVENT, stage="verify") as verify_stage:
+        with timed(
+            logger, _STAGE_EVENT, stage="verify", mode=self._settings.ocr_verify_mode
+        ) as verify_stage:
             delete_original = await self._may_delete_original(result, redacted_pages)
             verify_stage["delete_original"] = delete_original
         return ImageTrackResult(keys=keys, delete_original=delete_original)
@@ -1241,18 +1274,25 @@ class OcrPipeline:
         Returns:
             실제로 검증한 페이지의 ``(페이지 인덱스, 결과)`` 목록.
         """
-        engine = self._processor.engine
+        mode = self._settings.ocr_verify_mode
+        measure = self._coverage or measure_coverage
         verified: list[tuple[int, VerificationResult]] = []
         for page, redacted in zip(result.pages, redacted_pages, strict=True):
             if not redacted.redacted:
                 continue
-            outcome = verify_redacted_page(
-                redacted.image,
-                page,
-                redacted.line_indices,
-                engine=engine,
-                measure=self._coverage,
+            # 5.1 커버리지는 한 번만 재서 두 판정(재OCR·텍스트)이 같이 쓴다.
+            coverage = measure(redacted.image, page, redacted.line_indices)
+            text_outcome = (
+                decide(coverage, text_residual_pii(page, redacted.line_indices))
+                if mode in ("text", "shadow")
+                else None
             )
+            if mode == "text" and text_outcome is not None:
+                verified.append((page.index, text_outcome))
+                continue
+            outcome = decide(coverage, reocr_residual_pii(redacted.image, self._processor.engine))
+            if text_outcome is not None:
+                _log_verify_shadow(page.index, outcome, text_outcome)
             verified.append((page.index, outcome))
         return verified
 

@@ -3134,3 +3134,77 @@ async def test_failed_process_still_emits_job_timing_with_error_type() -> None:
     [job] = [e for e in logs if e["event"] == "ocr.job.finished"]
     assert (job["status"], job["error_type"]) == ("failed", "OcrError")
     assert "다운로드" not in str(job)
+
+
+# ── 원본 삭제 게이트의 잔류 검사 방식(ocr_verify_mode, 성능 실험 O3) ──────────
+def _name_and_phone_page() -> OcrResult:
+    """이름 라인은 검은블럭으로 가려지고, 연락처 라인은 이미지 검출에서 빠져 그대로 남는 페이지.
+
+    텍스트 마스킹(정규식)은 연락처를 가리므로 저장 텍스트엔 문제가 없지만, 이미지 사본엔 연락처가
+    남는다 — 재OCR(5.2)과 텍스트 검사(5.2')가 서로 다르게 판정할 수 있는 경우다.
+    """
+    page = OcrPage(
+        index=0,
+        width=100,
+        height=50,
+        lines=(_line("보험증권 계약자 홍길동"), _line("연락처 010-1234-5678")),
+    )
+    return OcrResult(pages=(page,))
+
+
+async def _run_gate(mode: str, engine: _FakeReocrEngine) -> tuple[_RecordingS3, list[Any]]:
+    s3 = _RecordingS3()
+    pipeline = _gate_pipeline(
+        FakePool(existing=None),
+        FakeProducer(),
+        FakeProcessor(_name_and_phone_page(), engine=engine),
+        s3,
+        _RecordingCoverage(ratio=1.0),
+        settings=Settings(ocr_verify_mode=mode),
+    )
+    with capture_logs() as logs:
+        await pipeline.handle(_job())
+        await pipeline.wait_for_pending_deletes()
+    return s3, logs
+
+
+async def test_text_verify_mode_skips_reocr_and_keeps_original_on_residual() -> None:
+    # Arrange: 재OCR 대역은 아무것도 못 읽는다고 답한다 — text 모드면 불리지 않아야 한다
+    engine = _FakeReocrEngine("")
+
+    # Act
+    s3, logs = await _run_gate("text", engine)
+
+    # Assert: OCR 엔진을 다시 돌리지 않고, 가려지지 않은 연락처 라인 때문에 원본을 지우지 않는다
+    assert engine.seen_images == []
+    assert ("delete", "uploads/x.pdf") not in s3.events
+    assert [e for e in logs if e["event"] == "ocr.verify.shadow"] == []
+
+
+async def test_shadow_verify_mode_decides_by_reocr_and_logs_disagreement() -> None:
+    # Arrange: 재OCR은 잔류 없음(통과), 텍스트 검사는 연락처 잔류(실패) — 판정이 갈린다
+    engine = _FakeReocrEngine("")
+
+    # Act
+    s3, logs = await _run_gate("shadow", engine)
+
+    # Assert: 게이트는 재OCR 판정 그대로(원본 삭제), 텍스트 판정은 섀도 이벤트로만 남는다
+    assert engine.seen_images == ["redacted-0"]
+    assert ("delete", "uploads/x.pdf") in s3.events
+    [shadow] = [e for e in logs if e["event"] == "ocr.verify.shadow"]
+    assert (shadow["agree"], shadow["reocr_passed"], shadow["text_passed"]) == (False, True, False)
+    assert shadow["text_only_labels"] == [PiiLabel.PHONE.value]
+    assert "010-1234-5678" not in str(shadow)  # 값은 남기지 않는다(§9)
+
+
+async def test_reocr_verify_mode_keeps_previous_behavior_without_shadow() -> None:
+    # Arrange
+    engine = _FakeReocrEngine("")
+
+    # Act
+    s3, logs = await _run_gate("reocr", engine)
+
+    # Assert: 기존 동작(재OCR 판정)과 같고 섀도 계산·이벤트가 없다
+    assert engine.seen_images == ["redacted-0"]
+    assert ("delete", "uploads/x.pdf") in s3.events
+    assert [e for e in logs if e["event"] == "ocr.verify.shadow"] == []
