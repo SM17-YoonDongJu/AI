@@ -176,6 +176,8 @@ class Settings(BaseSettings):
     ner_model: str = "Leo97/KoELECTRA-small-v3-modu-ner"
     # NER 확률 임계값. 마스킹은 recall 우선이라 낮게; 과잉 마스킹 시 상향(노션 §2).
     ner_score_threshold: float = 0.5
+    # NER 배치 크기(라인 수) — 파이프라인은 batch_size 없이 리스트를 받으면 1건씩 추론한다(O1).
+    ner_batch_size: int = Field(16, ge=1)
 
     # --- AI 서빙 — 챗·임베딩 provider 스위치(env), 모델·엔드포인트도 env 주입 ---
     # 챗 기본값은 Claude(anthropic — 공식 SDK, ai_base_url 미사용, 키는 ai_api_key)다. 로컬 Ollama
