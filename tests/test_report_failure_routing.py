@@ -562,13 +562,21 @@ async def test_llm_system_failure_logs_only_markers_before_redelivery(
         await worker.handle_job(_job())
 
     # Assert: 컨슈머 로그엔 사유가 없으므로 worker가 표식(노드명·예외 타입)만 남긴다
-    assert recorder.records == [
+    graph_events = [r for r in recorder.records if r[1] == "report.graph.finished"]
+    assert [r for r in recorder.records if r[1] != "report.graph.finished"] == [
         (
             "warning",
             "report not saved → redeliver",
             {"failure": agents.LLM_SYSTEM_FAILURE, "errors": ["diagnosis_failed:AiClientError"]},
         )
     ]
+    # 성능 계측(report.graph.finished)은 저장 실패여도 남고, 노드명·수치만 싣는다
+    [(level, _, fields)] = graph_events
+    assert level == "info"
+    assert list(fields["node_ms"]) == ["load_context", "input_guardrail", "diagnosis"]
+    assert fields["failed_nodes"] == ["diagnosis"]
+    assert fields["llm_failure"] == agents.LLM_SYSTEM_FAILURE
+    assert fields["total_ms"] == sum(fields["node_ms"].values())
 
 
 # ── (c) 거절 ─────────────────────────────────────────────────

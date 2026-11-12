@@ -22,7 +22,7 @@ from typing import Any
 
 from core.contracts import ReportJob
 from core.exceptions import NonRetryableError
-from core.logging import bind_context, clear_context, get_logger
+from core.logging import bind_context, clear_context, get_logger, log_event
 from report_worker.failure_journal import (
     Executor,
     FailureClass,
@@ -117,6 +117,29 @@ def _last_node_failure(errors: list[str]) -> str | None:
     return next((error for error in reversed(errors) if "_failed:" in error), None)
 
 
+def _log_graph_finished(final: dict[str, Any]) -> None:
+    """그래프 1회 실행의 노드별 소요 시간(`node_trace`)을 이벤트 1건으로 남긴다(성능 SLI).
+
+    `node_ms`는 `{노드명: ms}`라 CloudWatch Logs Insights에서 `node_ms.diagnosis`처럼 바로
+    집계된다. 같은 노드가 두 번 돌면 합친다. 노드명·수치·건수만 싣는다(§9).
+    """
+    trace = [entry for entry in final.get("node_trace") or [] if isinstance(entry, dict)]
+    node_ms: dict[str, int] = {}
+    for entry in trace:
+        name = str(entry.get("node") or "")
+        node_ms[name] = node_ms.get(name, 0) + int(entry.get("ms") or 0)
+    log_event(
+        logger,
+        "report.graph.finished",
+        total_ms=sum(node_ms.values()),
+        node_ms=node_ms,
+        node_count=len(trace),
+        failed_nodes=[str(e.get("node")) for e in trace if e.get("status") == "failed"],
+        error_count=len(final.get("errors") or []),
+        llm_failure=final.get("llm_failure"),
+    )
+
+
 def _raise_if_failed(final: dict[str, Any]) -> None:
     """그래프 최종 상태를 메시지 처분으로 옮긴다. 저장된 결과(정상·부분)면 그냥 돌아간다.
 
@@ -199,6 +222,9 @@ async def handle_job(job: ReportJob) -> None:
             "doc_type": job.doc_type.value,
         }
         final = await _graph.ainvoke(state)
+        # 저장 여부와 무관하게 남긴다(_raise_if_failed 전) — draft.metrics는 저장된 리포트만
+        # 가져서, 실패·거절된 리포트의 지연이 빠진 기준선이 되지 않게 한다.
+        _log_graph_finished(final)
         _raise_if_failed(final)
         logger.info(
             "report generated", report_id=job.report_id, error_count=len(final.get("errors", []))
