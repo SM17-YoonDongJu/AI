@@ -614,27 +614,29 @@ async def diagnosis(state: ReportState) -> dict[str, Any]:
 
 
 # ── 분기: 사용자 약관이 우리 DB(policy_chunks)에 있나? ──────────
+_POLICY_EXISTS_BY_PRODUCT_SQL = (
+    "SELECT EXISTS (SELECT 1 FROM policy_chunks WHERE insurer = $1 AND product_name = $2)"
+)
+_POLICY_EXISTS_BY_INSURER_SQL = "SELECT EXISTS (SELECT 1 FROM policy_chunks WHERE insurer = $1)"
+
+
 async def policy_in_db(state: ReportState) -> str:
     insurer = state.get("case_info", {}).get("insurer")
     product = state.get("case_info", {}).get("product_name")
     if not insurer:
         return "terms_parse"
+    # 건수가 아니라 존재만 본다(EXISTS) — count(*)는 보험사 한 곳의 청크(수십만 행)를 전부
+    # 훑어 dev 실측 44초(콜드 캐시)가 걸렸다. 분기에 필요한 건 "한 건이라도 있나"뿐이다.
     try:
         pool = db.get_pool()
         async with pool.acquire() as c:
             if product:
-                n = await c.fetchval(
-                    "SELECT count(*) FROM policy_chunks WHERE insurer = $1 AND product_name = $2",
-                    insurer,
-                    product,
-                )
+                found = await c.fetchval(_POLICY_EXISTS_BY_PRODUCT_SQL, insurer, product)
             else:
-                n = await c.fetchval(
-                    "SELECT count(*) FROM policy_chunks WHERE insurer = $1", insurer
-                )
+                found = await c.fetchval(_POLICY_EXISTS_BY_INSURER_SQL, insurer)
     except Exception:  # DB 조회 실패 시 안전하게 런타임 파싱 경로로
         return "terms_parse"
-    return "coverage_parse" if (n or 0) > 0 else "terms_parse"
+    return "coverage_parse" if found else "terms_parse"
 
 
 # ── 분기: 입력 가드레일 차단 여부 → 차단 시 파이프라인 단락 ─────
