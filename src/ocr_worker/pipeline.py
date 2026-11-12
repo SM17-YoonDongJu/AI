@@ -507,6 +507,10 @@ class OcrPipeline:
             await self._journal_transient(job, exc)
             raise
         finally:
+            # NER 라인 캐시엔 이 문서의 라인(이름 포함 가능)이 남는다 — 문서마다 비운다.
+            clear_cache = getattr(self._masker, "clear_cache", None)
+            if callable(clear_cache):
+                clear_cache()
             clear_context()
 
     async def _replay_processed(self, job: OcrJob, existing: tuple[str, DocType, str]) -> None:
