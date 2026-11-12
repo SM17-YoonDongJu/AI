@@ -21,21 +21,34 @@ from ocr_worker.masking.spans import PiiLabel, Span
 # modu NER 태그셋에서 인물(이름) 그룹 접두. aggregation_strategy="simple" 사용 시
 # entity_group이 "PS"로 집계된다.
 _PERSON_GROUP_PREFIX = "PS"
+# 라인 결과 캐시 상한 — 문서마다 비우지만(clear_cache) 비우지 않는 호출자에서도 메모리가
+# 무한히 늘지 않게 한다. 빽빽한 1쪽이 450라인 남짓이라 수십 쪽 문서도 들어간다.
+_CACHE_MAX_LINES = 20_000
 
 
 class NerDetector:
     """이름(PS) 전용 NER 디텍터. 파이프라인은 최초 detect 시 lazy 로드된다."""
 
-    def __init__(self, model_name: str, score_threshold: float = 0.5) -> None:
+    def __init__(
+        self, model_name: str, score_threshold: float = 0.5, *, batch_size: int = 16
+    ) -> None:
         """디텍터를 만든다(모델은 아직 로드하지 않음).
 
         Args:
             model_name: HuggingFace 모델 ID(예: ``Leo97/KoELECTRA-small-v3-modu-ner``).
             score_threshold: 이 확률 미만 엔티티는 버린다. recall 우선이라 낮게
                 두되, 과잉 마스킹 시 상향(노션 §2).
+            batch_size: 한 번에 추론할 라인 수. 파이프라인은 리스트를 받아도 ``batch_size``가
+                없으면 1건씩 돈다.
         """
         self._model_name = model_name
         self._score_threshold = score_threshold
+        self._batch_size = batch_size
+        # 라인 텍스트 → 그 라인의 원시 엔티티(라인 기준 오프셋). NER은 라인 단위라 결과가 라인
+        # 텍스트에만 달렸다 — 한 문서에서 같은 라인을 여러 번 검출(텍스트 마스킹·라인 마스킹·품질
+        # 판정·검은블럭)해도 추론은 한 번만 한다. 라인엔 이름이 들어 있을 수 있어 문서가 끝나면
+        # 비운다(``clear_cache``). 비우지 않는 호출자를 위해 상한도 둔다.
+        self._cache: dict[str, list[dict[str, Any]]] = {}
         # 외부 객체(transformers Pipeline) → Any(§3).
         self._pipeline: Any = None
         # 파이프라인 로드·추론(forward)을 직렬화한다 — torch CPU 모델은 동일 인스턴스
@@ -92,15 +105,28 @@ class NerDetector:
             return []
 
         pipe = self._ensure_pipeline()
-        # forward 직렬화(동일 모델 동시 호출 비안전·CPU 오버서브스크립션 방지).
+        # forward 직렬화(동일 모델 동시 호출 비안전·CPU 오버서브스크립션 방지). 캐시도 같은 락
+        # 안에서 읽고 쓴다(VLM 쪽 마스킹이 스레드에서 동시에 들어올 수 있다).
         # _ensure_pipeline은 이미 락을 풀고 반환하므로 여기서 재획득해도 중첩 아님.
         with self._lock:
-            batch_results = pipe([line for _, line in indexed])  # 라인별 결과 리스트
+            # 캐시에 없는 라인만, 같은 라인은 한 번만 추론한다(순서 보존 중복 제거).
+            misses = list(dict.fromkeys(line for _, line in indexed if line not in self._cache))
+            if misses:
+                if len(self._cache) + len(misses) > _CACHE_MAX_LINES:
+                    self._cache.clear()
+                results = pipe(misses, batch_size=self._batch_size)
+                self._cache.update(zip(misses, results, strict=True))
+            per_line = [self._cache[line] for _, line in indexed]
 
         spans: list[Span] = []
-        for (line_index, _), entities in zip(indexed, batch_results, strict=True):
+        for (line_index, _), entities in zip(indexed, per_line, strict=True):
             spans.extend(self._to_spans(entities, line_offsets[line_index]))
         return spans
+
+    def clear_cache(self) -> None:
+        """라인 결과 캐시를 비운다(문서 하나를 끝낼 때 — 라인 텍스트엔 이름이 들어 있을 수 있다)."""
+        with self._lock:
+            self._cache.clear()
 
     @staticmethod
     def _line_offsets(lines: list[str]) -> list[int]:
