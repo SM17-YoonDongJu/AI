@@ -174,6 +174,32 @@ AI 트래픽이 거의 없고(2026-11-12 기준 `ocr_results` 4건), 샘플을 d
 4. **메모리 최고치가 상한의 98%** — 운영(prod `mem_limit: 4608m`·dev limit 4608Mi)도 같은 상한이라
    OOMKilled 직전이다. 문서마다 `malloc_trim`을 빼면 22분 만에 실제로 OOMKilled됐다(벤치 1차 시도).
 
+### 3.4 리포트 기준선 — 합성 시나리오 벤치 (R0, 2026-11-12)
+
+조건: `scripts/perf/report_bench.py`, 시나리오 A~D × 5회 = 20건, Opus 5.5 effort high(dev 설정과 같음), dev RDS
+읽기 전용(SSM 터널), Voyage 임베딩, **사용자 개인 Claude 키**(dev→Claude 차단 상태). 저장 노드는 대역.
+제외 1건: rep2 C — Claude 스트림이 200 OK 뒤 30분 넘게 끝나지 않아 중단(§5 R5). 제 쿼리(테이블 순차 스캔)와
+시간이 겹친 rep1 A·B는 표시만 하고 포함(값이 다른 실행과 같은 범위).
+
+| 지표 | 값 |
+|---|---|
+| **리포트 1건 벽시계** | **p50 146초 / p95 228초 / max 238초** |
+| 비용 | 1건 평균 **$0.29** (출력 토큰이 대부분) — 20건 $5.79 |
+| 시간 구성 | LLM 71% · **노드 밖 약관 존재 조회(`policy_in_db`) 17%** · RAG 등 비-LLM 노드 12% |
+
+| 노드 | p50 | p95 | 메모 |
+|---|---|---|---|
+| `report_compose` | 53.5초 | 71.2초 | LLM 2회 순차(본문 → 쟁점). 짧은 쪽 p50 16.2초 |
+| `coverage_analysis` | 36.7초 | 59.9초 | LLM 28초 + RAG |
+| `disability_rag` | 25.8초 | 42.0초 | |
+| `disability_verify` | 17.0초 | 21.5초 | |
+| `output_guardrail` | 9.9초 | 16.1초 | Judge |
+| `diagnosis` | 4.6초 | 7.0초 | |
+| `case_search` | 0.5초 | 0.8초 | LLM 없음 — R3(병렬화)는 이득이 거의 없다 |
+| **노드 밖(약관 존재 조회)** | **33.4초** | **44.7초** | 약관 없는 C만 0.2초. 같은 상품을 다시 조회해도 콜드(14GB 테이블 > 2GB 메모리) |
+
+시나리오별 p50: A 209초 · B 190초 · C 99초 · D 130초. 가시성 600초 안에는 넉넉히 든다(p95 228초).
+
 ## 4. SLO
 
 ### OCR — 확정 (2026-11-12)
@@ -189,11 +215,11 @@ AI 트래픽이 거의 없고(2026-11-12 기준 `ocr_results` 4건), 샘플을 d
 | 컨테이너 메모리 최고치 | 4,530MiB (98%) | **≤ 3,900MiB (85%)** | OOMKilled 여유 |
 | 마스킹 결과 | — | **고정 샘플 지문 동일** | 품질 가드레일 |
 
-### 리포트 — 보류
+### 리포트 — 기준선(R0) 확보, SLO는 G3 재측정 후 제안
 
-| SLI | 기준선 | 목표 | 메모 |
+| SLI | 기준선(R0) | 목표 | 메모 |
 |---|---|---|---|
-| `sqs.message.finished.handle_ms` (report-job, done) | 없음 | TBD | Claude 비용 보류. §1 안전선 p99 ≤ 480초는 최소 |
+| 리포트 1건 벽시계 p50 / p95 | 146초 / 228초 | TBD | G3(약관 조회 −33초)·R1(−16초) 효과를 본 뒤 정한다 |
 
 **품질 가드레일(비회귀 조건)** — 개선안이 아래를 기준선보다 나쁘게 만들면 기각한다.
 
@@ -219,8 +245,10 @@ AI 트래픽이 거의 없고(2026-11-12 기준 `ocr_results` 4건), 샘플을 d
 |---|---|---|---|---|
 | R1 | 리포트 본문·쟁점 추출은 서로 의존하지 않아 병렬화하면 `report_compose`가 짧은 쪽 호출만큼 준다 | `agents.py` 본문(`chat`)∥쟁점(`chat_json`) `gather` | `node_ms.report_compose` | 실험 실행 시 발생(호출 수는 동일) |
 | R2 | JSON 추출성 호출(쟁점·판례 필터·진단)은 effort를 낮춰도 품질이 유지된다 | 노드별 effort 차등 | `llm.chat` 노드별 `duration_ms`·`output_tokens` + 품질 가드 | 실험 실행 시 발생 |
-| R3 | `case_search`는 진단에만 의존해 coverage 경로와 병렬화할 수 있다 | 그래프 fan-out | `total_ms` | 실험 실행 시 발생 |
+| R3 | `case_search`는 진단에만 의존해 coverage 경로와 병렬화할 수 있다 | 그래프 fan-out | `total_ms` | **R0에서 `case_search` p50 0.5초 — 이득이 거의 없어 보류** |
 | R4 | (보호) 리포트도 처리 시간 상한이 가시성 안에 들어야 한다 | 기동 예산 검사 또는 가시성 연장(heartbeat) | p99 vs 600초 | 없음 |
+| **R5** | (보호) Claude 스트림이 200 OK 뒤 끝나지 않고 멈출 수 있다(R0 중 1건, 30분+). SDK 타임아웃은 청크 간격이라 못 끊는다 → 워커가 무한정 묶이고 가시성 초과 시 중복 처리 | LLM 호출 단위 전체 상한(`asyncio.timeout`) → `AiClientError`로 재전달 | 멈춘 호출 수·`ai_client.chat.finished` 누락 | 없음(재현은 어렵다) |
+| **G3** | 약관 존재 조회가 리포트의 17%(p50 33초)다 — `idx_policy_meta`가 상품명을 못 써 보험사 청크 수십만 행을 디스크에서 읽는다 | `EXISTS` + `(insurer, product_name)` 인덱스(#96) | `outside_nodes_ms`·`coverage_analysis` | 재측정 4건 |
 | **O3** | 5.2 재OCR 검증이 OCR 엔진 비용을 한 번 더 쓴다(**B0: 41%**) | 방식 선택 필요 — (a) 검증을 처리 경로 밖(ack 뒤)으로 (b) 텍스트 기반 잔류 검사로 대체 (c) 재OCR을 가려지지 않은 라인 인식만으로 축소 | `verify`·`ocr.job` + 삭제 판정 일치 | 없음 |
 | **O1** | NER이 같은 줄을 문서당 4번 돌고 배치도 안 된다(**B0: 14%, 빽빽한 문서 25%**) | 줄 단위 결과 재사용 + `batch_size` | `analyze`·`quality_check`·`redact`·`vlm_pages` + 지문 동일 | 없음 |
 | O2 | `quality_check` NER이 이벤트 루프를 막는다 | O1에 포함(결과 재사용) | `quality_check` | 없음 |
