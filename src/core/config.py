@@ -163,6 +163,12 @@ class Settings(BaseSettings):
     # 켜진다. 0.90은 surya 시절 분포(클린 PDF 0.951+ vs 폰카 사진 0.861-, 표본 3건)로 정한 값이라
     # PP-OCRv5 rec_score 분포에선 다시 맞춰야 한다 — PoC에서 env(OCR_LOW_CONFIDENCE_THRESHOLD)로.
     ocr_low_confidence_threshold: float = Field(0.90, ge=0.0, le=1.0)
+    # 원본 삭제 게이트의 잔류 PII 검사 방식(성능 실험 O3, docs/perf).
+    # - reocr: 마스킹 사본을 OCR 엔진으로 다시 읽는다(문서 시간의 약 41%)
+    # - text: 가려지지 않은 원본 라인 텍스트로 검사한다(OCR 없음)
+    # - shadow: reocr로 판정하고 text 판정을 나란히 계산해 일치 여부만 남긴다(ocr.verify.shadow)
+    # 기본 shadow는 판정을 바꾸지 않는다 — 일치가 확인되면 text로 전환한다.
+    ocr_verify_mode: Literal["reocr", "text", "shadow"] = "shadow"
 
     # --- PII 마스킹 ---
     use_ner: bool = False  # NER 디텍터 활성 여부(false면 정규식만)

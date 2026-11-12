@@ -8,6 +8,7 @@ PIL/numpy·GPU 없이 검증한다 — 판정(``decide``)은 순수이고, ``ver
 from ocr_worker.masking.image_verify import (
     COVERAGE_THRESHOLD,
     decide,
+    text_residual_pii,
     verify_redacted_page,
 )
 from ocr_worker.masking.spans import PiiLabel, Span
@@ -105,3 +106,30 @@ def test_verify_fails_when_coverage_low() -> None:
 
     assert result.passed is False
     assert result.low_coverage_lines == (0,)
+
+
+# ── 5.2' 텍스트 잔류 검사(성능 실험 O3) ─────────────────────────────
+def _page(*texts: str) -> OcrPage:
+    return OcrPage(index=0, width=100, height=50, lines=tuple(_line(text) for text in texts))
+
+
+def test_text_residual_ignores_redacted_lines() -> None:
+    # Arrange: 주민번호 라인을 검은블럭으로 가렸다 — 사본에선 읽히지 않는다
+    page = _page("성명 [이름]", "주민번호 901010-1234567")
+
+    # Act
+    residual = text_residual_pii(page, {1})
+
+    # Assert
+    assert residual == []
+
+
+def test_text_residual_finds_pii_left_on_unredacted_line() -> None:
+    # Arrange: 이름 라인만 가렸고, 연락처 라인은 검출에서 빠져 그대로 남았다(재OCR이 잡던 경우)
+    page = _page("성명 홍길동", "연락처 010-1234-5678")
+
+    # Act
+    residual = text_residual_pii(page, {0})
+
+    # Assert: 가려지지 않은 라인에서 관대한 잔류 패턴이 잡힌다
+    assert [span.label for span in residual] == [PiiLabel.PHONE]

@@ -8,6 +8,11 @@ OCR·PII 검출은 불완전하다 — 잘못 마스킹된 사본을 만들고 *
   (검정 픽셀 비율 ≥ 임계). 가장자리가 새는 부분 마스킹(B안)·좌표 오차를 잡는다.
 - **5.2 재OCR 잔류 검사**: 사본을 다시 OCR해 PII 패턴이 읽히는가
   (``find_residual_pii`` 재사용). 블럭이 빗나간 false negative를 잡는다.
+- **5.2' 텍스트 잔류 검사**(성능 실험 O3): 재OCR 대신 **원본 OCR 라인 중 가려지지 않은 라인**에
+  같은 잔류 패턴을 돌린다. 검은블럭은 라인 단위로 통째 칠해지므로(``image_masker``) 사본에서 읽힐
+  텍스트는 곧 가려지지 않은 라인의 텍스트다 — 같은 엔진이 같은 픽셀을 다시 읽는 재OCR(문서 시간의
+  약 41%)을 텍스트 검사로 대신한다. 블럭이 빗나간 경우는 5.1 커버리지가 계속 잡는다. 전환 전에
+  섀도로 두 판정의 일치율을 본다(``ocr_verify_mode``).
 
 맹점(둘 다 못 잡음): OCR이 애초에 못 읽는 PII(서명·인감·손글씨) — 라인이 없어
 가려지지도, 재OCR로 읽히지도 않는다. 이는 레이아웃/서명 탐지나 사람 검수로만
@@ -99,6 +104,25 @@ def reocr_residual_pii(image: PageImage, engine: OcrEngine) -> list[Span]:
     """마스킹 사본을 재OCR해 잔류 PII를 스캔한다(5.2)."""
     pages = engine.recognize([image])
     text = "\n".join(line.text for line in pages[0]) if pages else ""
+    return find_residual_pii(text)
+
+
+def text_residual_pii(page: OcrPage, line_indices: set[int]) -> list[Span]:
+    """가려지지 않은 라인의 원본 OCR 텍스트에서 잔류 PII를 찾는다(5.2', OCR 없음).
+
+    재OCR(``reocr_residual_pii``)이 마스킹 사본에서 읽을 텍스트를 원본 라인으로 대신한다 — 가린
+    라인은 검은블럭이 통째 덮어 사본에서 읽히지 않으므로 뺀다. 라인 순서는 원본 그대로다.
+
+    Args:
+        page: 원본 페이지 OCR 결과.
+        line_indices: 검은블럭으로 가린 라인 인덱스(``RedactedPage.line_indices``).
+
+    Returns:
+        잔류 PII 스팬(없으면 빈 목록). 오프셋은 검사용 합성 텍스트 기준이다.
+    """
+    text = "\n".join(
+        line.text for index, line in enumerate(page.lines) if index not in line_indices
+    )
     return find_residual_pii(text)
 
 
