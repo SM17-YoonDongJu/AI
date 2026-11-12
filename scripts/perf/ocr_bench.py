@@ -47,6 +47,29 @@ _CONTENT_TYPES = {
 _NO_VLM_URL = "http://127.0.0.1:9"
 
 
+def _reset_peak_rss() -> bool:
+    """최고 RSS(VmHWM)를 현재값으로 되돌린다(Linux 4.0+ ``clear_refs`` 5). 못 하면 False."""
+    try:
+        Path("/proc/self/clear_refs").write_text("5")
+    except OSError:
+        return False
+    return True
+
+
+def _rss_mib() -> tuple[int | None, int | None]:
+    """(현재 RSS, 리셋 이후 최고 RSS) MiB. Linux가 아니면 (None, None)."""
+    try:
+        status = Path("/proc/self/status").read_text()
+    except OSError:
+        return None, None
+    values = {}
+    for line in status.splitlines():
+        key, _, rest = line.partition(":")
+        if key in ("VmRSS", "VmHWM"):
+            values[key] = int(rest.split()[0]) // 1024  # kB → MiB
+    return values.get("VmRSS"), values.get("VmHWM")
+
+
 def _sha(value: object) -> str:
     raw = (
         value
@@ -207,6 +230,7 @@ async def _run(args: argparse.Namespace, out_dir: Path) -> int:
     async def run_one(path: Path, phase: str, rep: int) -> tuple[float, dict[str, Any] | None]:
         job = make_job(path)
         uploaded.clear()
+        peak_tracked = _reset_peak_rss()
         started = time.perf_counter()
         with structlog.contextvars.bound_contextvars(
             bench_phase=phase, bench_rep=rep, bench_doc=path.name
@@ -218,6 +242,18 @@ async def _run(args: argparse.Namespace, out_dir: Path) -> int:
                 logger.warning("bench_doc_failed", doc=path.name, error_type=type(exc).__name__)
                 return time.perf_counter() - started, None
         elapsed = time.perf_counter() - started
+        # 메모리: 이 문서의 최고 RSS(리셋 이후)와 힙 반납 뒤 남은 RSS — 최고점이 문서 하나의
+        # 크기인지, 문서를 거듭하며 쌓이는지(M1) 가른다. 반납은 handle_job 래퍼가 이미 했다.
+        rss_after, rss_peak = _rss_mib()
+        logger.info(
+            "bench_doc_memory",
+            doc=path.name,
+            phase=phase,
+            rep=rep,
+            rss_peak_mib=rss_peak if peak_tracked else None,
+            rss_after_mib=rss_after,
+        )
+        memory.append((path.name, rep, rss_peak if peak_tracked else None, rss_after))
         record = pipeline.saved.pop(job.job_id, None)
         if record is None:
             return elapsed, None
@@ -232,6 +268,7 @@ async def _run(args: argparse.Namespace, out_dir: Path) -> int:
         }
         return elapsed, fingerprint
 
+    memory: list[tuple[str, int, int | None, int | None]] = []
     print(f"[{args.label}] 워밍업 {args.warmup}건 (모델 로드 포함 — 측정 제외)")
     for path in docs[: args.warmup]:
         elapsed, _ = await run_one(path, "warmup", 0)
@@ -297,6 +334,10 @@ async def _run(args: argparse.Namespace, out_dir: Path) -> int:
                 f"  {row['event']:<10}{row['group']:<18}n={row['n']:<4}"
                 f"p50={row['p50']:<8}p95={row['p95']:<8}max={row['max']}"
             )
+    if any(peak is not None for _, _, peak, _ in memory):
+        print(f"\n[{args.label}] 메모리(MiB) — 문서별 최고 RSS / 반납 뒤 RSS (실행 순서)")
+        for name, rep_no, peak, after in memory:
+            print(f"  rep{rep_no} {name[:34]:<36}peak={peak}  after={after}")
     if unstable:
         print(f"\n⚠ 반복마다 결과가 달라진 문서: {sorted(unstable)}")
     print(f"\n결과: {out_dir}")

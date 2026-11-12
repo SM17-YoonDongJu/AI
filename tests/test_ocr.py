@@ -555,3 +555,17 @@ def test_paddle_engine_rejects_malformed_result() -> None:
     # Act / Assert
     with pytest.raises(OcrError, match="결과 형식 이상"):
         engine.recognize([_page_image()])
+
+
+def test_paddle_engine_passes_mkldnn_cache_capacity_only_when_set() -> None:
+    # Arrange: M1 손잡이 — 설정하면 생성 인자로 넘기고, 비우면 PaddleOCR 기본값(10)에 맡긴다
+    engine, factory = _engine(_FakePaddleOcr(), mkldnn_cache_capacity=2)
+    default_engine, default_factory = _engine(_FakePaddleOcr())
+
+    # Act
+    engine.recognize([_page_image()])
+    default_engine.recognize([_page_image()])
+
+    # Assert
+    assert factory.calls[0]["mkldnn_cache_capacity"] == 2
+    assert "mkldnn_cache_capacity" not in default_factory.calls[0]
