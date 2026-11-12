@@ -137,6 +137,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--reps", type=int, default=1, help="시나리오별 반복 수")
     parser.add_argument("--max-reports", type=int, default=1, help="과금 상한 — 리포트 수")
     parser.add_argument("--db-port", type=int, default=15432, help="dev RDS SSM 터널 로컬 포트")
+    parser.add_argument(
+        "--report-timeout",
+        type=float,
+        default=900.0,
+        help="리포트 1건 상한(초). 넘기면 중단하고 timeout으로 기록한 뒤 다음 건으로 간다",
+    )
     parser.add_argument("--aws-profile", default="brbs")
     parser.add_argument("--secret-id", default="app/report-dev")
     return parser.parse_args()
@@ -344,16 +350,28 @@ async def _run(args: argparse.Namespace, picked: list[str], out_dir: Path) -> in
                     "doc_type": "diagnosis",
                 }
                 t0 = time.perf_counter()
+                timed_out = False
                 with structlog.contextvars.bound_contextvars(
                     bench_phase="measure", bench_rep=rep, bench_scenario=sid
                 ):
-                    final = await graph.ainvoke(state)
+                    # LLM 스트림이 200 OK 뒤 끝나지 않고 멈춘 사례가 있다(dev 실측 30분+) — SDK
+                    # 타임아웃은 청크 사이 간격이라 이걸 못 끊는다. 리포트 단위 상한을 건다.
+                    try:
+                        final = await asyncio.wait_for(
+                            graph.ainvoke(state), timeout=args.report_timeout
+                        )
+                    except TimeoutError:
+                        timed_out = True
+                        final = {}
+                        logger.warning("bench_report_timeout", timeout_s=args.report_timeout)
                     wall = time.perf_counter() - t0
-                    _log_graph_finished(final, wall_ms=round(wall * 1000))
+                    if not timed_out:
+                        _log_graph_finished(final, wall_ms=round(wall * 1000))
                 chats = [e for e in usage.events if e["event_type"] == "ai_client.chat.finished"]
                 run = {
                     "scenario": sid,
                     "rep": rep,
+                    "timed_out": timed_out,
                     "wall_s": round(wall, 1),
                     "node_ms": {e["node"]: e["ms"] for e in final.get("node_trace") or []},
                     "outside_nodes_s": round(
@@ -373,6 +391,10 @@ async def _run(args: argparse.Namespace, picked: list[str], out_dir: Path) -> in
                     "judge_failures": len(final.get("judge_failures") or []),
                 }
                 runs.append(run)
+                # 실행마다 바로 쓴다 — 중단(SIGTERM 등)돼도 끝난 실행은 남는다.
+                (out_dir / "runs.json").write_text(
+                    json.dumps(runs, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
+                )
                 print(
                     f"  rep{rep} {sid}: {wall:.1f}s · LLM {run['llm_calls']}회 "
                     f"(in {run['input_tokens']:,} / out {run['output_tokens']:,} tok) · "
