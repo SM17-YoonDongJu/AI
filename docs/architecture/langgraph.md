@@ -248,16 +248,19 @@ def safe_node(fn: Callable[[ReportState], Awaitable[dict[str, Any]]]):
 ### 3-2. `input_guardrail` — 입구 검문소
 
 - **(a) 파일:라인** — `agents.py:123-129`
-- **(b) 하는 일** — 입력 가드레일(안전 필터)을 돌린다. 개인정보(PII)를 가리고, 보험과 무관한 요청은 막는다.
-- **(c) 서류철에서 읽는 항목** — `masked_text`(`agents.py:125`), `errors`(간접적으로 `_err`을 통해).
+- **(b) 하는 일** — 입력 가드레일(안전 필터)을 돌린다. 문서 본문의 개인정보(PII)를 한 번 더 가리고, 사용자가 직접 쓴 질문이 보험과 무관하면 막는다. 문서 본문과 사고 경위·추가 정보는 막는 기준으로 쓰지 않는다. 증권에 찍힌 "○○보험 주식회사"의 "주식"으로 멀쩡한 청구가 막혔고, 사고 경위에는 "요리하다가 데었다"처럼 키워드가 정상적으로 들어가기 때문이다(2026-11-14, #103).
+- **(c) 서류철에서 읽는 항목** — `masked_text`, `case_info["question"]`, `errors`(간접적으로 `_err`을 통해).
 - **(d) 서류철에 쓰는 항목** — `masked_text`(가드레일이 다시 가린 텍스트로 갱신) (`agents.py:126`), 차단된 경우 `errors` (`agents.py:128`).
 - **(e) LLM 호출** — 없음(가드레일 내부는 정규식과 NER(문장에서 이름·주소 같은 개체를 찾아내는 기술)로 처리). `await guardrail.guard_input(...)`을 부른다 (`agents.py:125`).
 - **(f) DB 쿼리** — 없음.
-- **(g) RAG/가드레일** — `guardrail.guard_input(state.get("masked_text", ""))`을 호출한다 (`agents.py:125`). 돌아온 객체 `g`에서 `g.masked_text`, `g.blocked`, `g.reason`을 쓴다.
-- **(h) 남기는 errors 표식** — 차단 시 `f"input_blocked:{g.reason}"` (`agents.py:128`). 이 표식은 뒤의 `route_after_input`이 보고 갈림길을 정한다(§4 참고).
+- **(g) RAG/가드레일** — `guardrail.guard_input(문서 본문, question=사용자 질문)`을 호출한다. 질문은 `load_context`가 `mask_pii`를 거친 값이고, 없거나 마스킹에 실패했으면 `None`이라 검사하지 않는다. 돌아온 객체 `g`에서 `g.masked_text`, `g.blocked`, `g.reason`을 쓴다.
+- **(h) 남기는 errors 표식** — 차단 시 `f"input_blocked:{g.reason}"` (예: `input_blocked:보험·법률 외 질문(코인)`). 이 표식은 뒤의 `route_after_input`이 보고 갈림길을 정한다(§4 참고).
 
 ```python
-g = await guardrail.guard_input(state.get("masked_text", ""))
+g = await guardrail.guard_input(
+    state.get("masked_text", ""),
+    question=(state.get("case_info") or {}).get("question"),
+)
 out: dict[str, Any] = {"masked_text": g.masked_text}
 if g.blocked:
     out["errors"] = _err(state, f"input_blocked:{g.reason}")
@@ -534,7 +537,7 @@ def route_after_case(state: ReportState) -> str:
 | 노드 | 읽는 키 | 추가/갱신하는 키 | 부수효과(LLM/DB/RAG/가드레일) |
 |------|---------|------------------|-------------------------------|
 | `load_context` (`agents.py:65`) | `ocr_result_id`, `report_id`, `errors` | `case_info`, `masked_text`, `entities`, `subscribed_coverages`, `errors` | DB 4쿼리(ocr_results, reports, user_claims, user_insurances). errors: `ocr_result_missing` |
-| `input_guardrail` (`agents.py:123`) | `masked_text`, `errors` | `masked_text`, (차단시)`errors` | 가드레일 `guard_input`. errors: `input_blocked:{reason}` |
+| `input_guardrail` (`agents.py:123`) | `masked_text`, `case_info["question"]`, `errors` | `masked_text`, (차단시)`errors` | 가드레일 `guard_input`(마스킹=문서 본문, 도메인 검사=사용자 질문). errors: `input_blocked:{reason}` |
 | `route_after_input` (`agents.py:195`) | `errors` | — (경로 문자열만) | 없음 |
 | `diagnosis` (`agents.py:136`) | `masked_text`, `case_info`, `errors` | `diagnosis`, (실패시)`errors` | LLM `chat_json`. errors: `diagnosis_llm_failed` |
 | `policy_in_db` (`agents.py:171`) | `case_info`(insurer, product_name) | — (경로 문자열만) | DB `count(*) FROM policy_chunks` |

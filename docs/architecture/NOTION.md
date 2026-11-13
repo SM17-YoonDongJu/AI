@@ -338,7 +338,7 @@ load_context → input_guardrail →⟨차단?⟩→ persist_blocked → END
 이걸 합쳐 `case_info`·`masked_text`·`entities`·`subscribed_coverages`를 만든다. `enrolled_at`(가입일)은 나중에 "김씨 계약 시점에 유효했던 장해분류표 판(version)"을 고르는 열쇠가 된다.
 > OCR 결과가 비면 `errors`에 `ocr_result_missing`을 남긴다 — 이건 뒤에서 "재시도해야 할 하드 실패"로 취급된다.
 
-**② `input_guardrail` — 입구 검문.** 마스킹 텍스트를 한 번 더 가리고(재마스킹), 보험·법률과 무관한 내용이면 차단한다(`agents.py:123-129`). 김씨 진단서는 통과.
+**② `input_guardrail` — 입구 검문.** 마스킹 텍스트를 한 번 더 가리고(재마스킹), 사용자가 직접 쓴 질문이 보험·법률과 무관하면 차단한다. 서류 본문과 사고 경위·추가 정보는 차단 기준으로 쓰지 않는다. 증권의 "○○보험 주식회사" 같은 회사 이름이나 "요리하다가 데었다" 같은 사고 경위에 키워드가 정상적으로 섞여 있어서다(2026-11-14, #103). 김씨 진단서는 통과.
 - 만약 차단되면 갈림길 `route_after_input`이 `blocked`을 반환해 **뒤의 LLM 단계를 전부 건너뛰고** `persist_blocked`로 직행한다. 비용·오출력을 막고, 상태가 "처리중"에 영원히 갇히는 것을 막기 위함이다.
 
 **③ `diagnosis` — 진단 분석(LLM).** 마스킹 텍스트를 LLM에 주고 진단명·ICD·사고유형(7종 중 하나)·**후유장해 검토 필요 여부**(`requires_disability_review`)를 JSON으로 뽑는다(`agents.py:136-167`). 김씨는 `accident_type=traffic`, `requires_disability_review=true`로 판정된다. 이 true 값이 나중 갈림길을 가른다.
@@ -421,7 +421,7 @@ UPDATE reports SET status = 'BLOCKED', updated_at = now() WHERE id = $1
 | 노드 | 읽는 키 | 추가/갱신하는 키 | 부수효과 |
 |------|---------|------------------|----------|
 | `load_context` | `ocr_result_id`, `report_id` | `case_info`, `masked_text`, `entities`, `subscribed_coverages`, `errors` | DB 4쿼리. errors: `ocr_result_missing` |
-| `input_guardrail` | `masked_text` | `masked_text`, (차단시)`errors` | 가드레일 `guard_input`. errors: `input_blocked:{reason}` |
+| `input_guardrail` | `masked_text`, `case_info["question"]` | `masked_text`, (차단시)`errors` | 가드레일 `guard_input`(마스킹=문서 본문, 도메인 검사=사용자 질문). errors: `input_blocked:{reason}` |
 | `diagnosis` | `masked_text`, `case_info` | `diagnosis`, (실패시)`errors` | LLM. errors: `diagnosis_llm_failed` |
 | `coverage_analysis` | `case_info`, `diagnosis`, `subscribed_coverages` | `retrieved_clauses`, `applicable_coverages`, `missing_coverages`, `coverage_analysis` | RAG(`terms`) + LLM. errors: `rag_empty` |
 | `case_search` | `case_info`, `diagnosis` | `legal_references` | RAG(`case`). errors: `case_data_missing` |
@@ -933,16 +933,19 @@ def safe_node(fn: Callable[[ReportState], Awaitable[dict[str, Any]]]):
 ### 3-2. `input_guardrail` — 입구 검문소
 
 - **(a) 파일:라인** — `agents.py:123-129`
-- **(b) 하는 일** — 입력 가드레일(안전 필터)을 돌린다. 개인정보(PII)를 가리고, 보험과 무관한 요청은 막는다.
-- **(c) 서류철에서 읽는 항목** — `masked_text`(`agents.py:125`), `errors`(간접적으로 `_err`을 통해).
+- **(b) 하는 일** — 입력 가드레일(안전 필터)을 돌린다. 문서 본문의 개인정보(PII)를 한 번 더 가리고, 사용자가 직접 쓴 질문이 보험과 무관하면 막는다. 문서 본문과 사고 경위·추가 정보는 막는 기준으로 쓰지 않는다. 증권에 찍힌 "○○보험 주식회사"의 "주식"으로 멀쩡한 청구가 막혔고, 사고 경위에는 "요리하다가 데었다"처럼 키워드가 정상적으로 들어가기 때문이다(2026-11-14, #103).
+- **(c) 서류철에서 읽는 항목** — `masked_text`, `case_info["question"]`, `errors`(간접적으로 `_err`을 통해).
 - **(d) 서류철에 쓰는 항목** — `masked_text`(가드레일이 다시 가린 텍스트로 갱신) (`agents.py:126`), 차단된 경우 `errors` (`agents.py:128`).
 - **(e) LLM 호출** — 없음(가드레일 내부는 정규식과 NER(문장에서 이름·주소 같은 개체를 찾아내는 기술)로 처리). `await guardrail.guard_input(...)`을 부른다 (`agents.py:125`).
 - **(f) DB 쿼리** — 없음.
-- **(g) RAG/가드레일** — `guardrail.guard_input(state.get("masked_text", ""))`을 호출한다 (`agents.py:125`). 돌아온 객체 `g`에서 `g.masked_text`, `g.blocked`, `g.reason`을 쓴다.
-- **(h) 남기는 errors 표식** — 차단 시 `f"input_blocked:{g.reason}"` (`agents.py:128`). 이 표식은 뒤의 `route_after_input`이 보고 갈림길을 정한다(§4 참고).
+- **(g) RAG/가드레일** — `guardrail.guard_input(문서 본문, question=사용자 질문)`을 호출한다. 질문은 `load_context`가 `mask_pii`를 거친 값이고, 없거나 마스킹에 실패했으면 `None`이라 검사하지 않는다. 돌아온 객체 `g`에서 `g.masked_text`, `g.blocked`, `g.reason`을 쓴다.
+- **(h) 남기는 errors 표식** — 차단 시 `f"input_blocked:{g.reason}"` (예: `input_blocked:보험·법률 외 질문(코인)`). 이 표식은 뒤의 `route_after_input`이 보고 갈림길을 정한다(§4 참고).
 
 ```python
-g = await guardrail.guard_input(state.get("masked_text", ""))
+g = await guardrail.guard_input(
+    state.get("masked_text", ""),
+    question=(state.get("case_info") or {}).get("question"),
+)
 out: dict[str, Any] = {"masked_text": g.masked_text}
 if g.blocked:
     out["errors"] = _err(state, f"input_blocked:{g.reason}")
@@ -1219,7 +1222,7 @@ def route_after_case(state: ReportState) -> str:
 | 노드 | 읽는 키 | 추가/갱신하는 키 | 부수효과(LLM/DB/RAG/가드레일) |
 |------|---------|------------------|-------------------------------|
 | `load_context` (`agents.py:65`) | `ocr_result_id`, `report_id`, `errors` | `case_info`, `masked_text`, `entities`, `subscribed_coverages`, `errors` | DB 4쿼리(ocr_results, reports, user_claims, user_insurances). errors: `ocr_result_missing` |
-| `input_guardrail` (`agents.py:123`) | `masked_text`, `errors` | `masked_text`, (차단시)`errors` | 가드레일 `guard_input`. errors: `input_blocked:{reason}` |
+| `input_guardrail` (`agents.py:123`) | `masked_text`, `case_info["question"]`, `errors` | `masked_text`, (차단시)`errors` | 가드레일 `guard_input`(마스킹=문서 본문, 도메인 검사=사용자 질문). errors: `input_blocked:{reason}` |
 | `route_after_input` (`agents.py:195`) | `errors` | — (경로 문자열만) | 없음 |
 | `diagnosis` (`agents.py:136`) | `masked_text`, `case_info`, `errors` | `diagnosis`, (실패시)`errors` | LLM `chat_json`. errors: `diagnosis_llm_failed` |
 | `policy_in_db` (`agents.py:171`) | `case_info`(insurer, product_name) | — (경로 문자열만) | DB `count(*) FROM policy_chunks` |
@@ -3178,7 +3181,7 @@ PII 마스킹 규칙은 `ocr_worker` 입력단과 동일해야 한다(어긋나�
 
 | 단계 | 진입 함수(guards.py) | 동기/비동기 | 반환 | 핵심 동작 |
 |---|---|---|---|---|
-| **입력** | `guard_input` (`:36`) | `async` | `InputGuardResult` | 정규식 PII 마스킹 + 도메인외 키워드 차단 |
+| **입력** | `guard_input` (`:36`) | `async` | `InputGuardResult` | 문서 본문 정규식 PII 마스킹 + 사용자 질문의 도메인외 키워드 차단 |
 | **생성** | `guard_generation` (`:53`) | **동기(sync)** | `str` | 단정적 금액 표현 → 추정 범위 문구 치환 |
 | **출력** | `guard_output` (`:61`) | `async` | `OutputGuardResult` | 법적 고지문 삽입 + (리포트 한정) LLM Judge 인용검증 |
 
@@ -3219,34 +3222,42 @@ def _mask_pii(text: str) -> str:
 
 > 쉽게 말하면: 이 정규식은 "혹시 개인정보일까 싶으면 일단 가린다"는 안전 우선 성향이다. 그래서 날짜처럼 개인정보가 아닌 것까지 가끔 가려 버리는데, 덜 가려서 정보가 새는 것보다는 안전한 쪽이라 그대로 둔 것이다.
 
-### 2.2 도메인 외 질문 차단 + 진입 함수(verbatim)
+### 2.2 도메인 외 주제 차단 + 진입 함수
 
-차단할 분야는 코드에 미리 박아 둔 **7개 키워드 묶음**이다(`guards.py:21-22`):
+차단할 분야는 코드에 미리 박아 둔 **7개 키워드 묶음**이다. 2026-11-14(#103)부터 이 검사는 **사용자가 직접 쓴 질문에만** 건다(2026-11-14 기준 발췌, 주석·docstring 생략):
 
 ```python
-# 보험·법률 외 도메인 차단 키워드(간이)
 _OFF_DOMAIN = ("부동산", "주식", "코인", "비트코인", "연애", "요리", "게임")
-```
+_COMPANY_DESIGNATION = re.compile(r"주식\s*회사")
 
-진입 함수는 먼저 개인정보를 가린 뒤, 원문에 위 키워드가 들어 있는지 검사한다(`guards.py:36-43`):
 
-```python
-async def guard_input(text: str) -> InputGuardResult:
+def _find_off_domain(text: str) -> str | None:
+    target = _COMPANY_DESIGNATION.sub(" ", text)
+    return next((kw for kw in _OFF_DOMAIN if kw in target), None)
+
+
+async def guard_input(text: str, *, question: str | None) -> InputGuardResult:
     masked = _mask_pii(text or "")
-    for kw in _OFF_DOMAIN:
-        if kw in (text or ""):
-            return InputGuardResult(
-                masked_text=masked, blocked=True, reason=f"보험·법률 외 질문({kw})"
-            )
+    keyword = _find_off_domain(question or "")
+    if keyword is not None:
+        return InputGuardResult(
+            masked_text=masked, blocked=True, reason=f"보험·법률 외 질문({keyword})"
+        )
     return InputGuardResult(masked_text=masked, blocked=False, reason=None)
 ```
 
 동작을 순서대로 보면:
 
-- `text or ""`로 입력이 비어 있어도(`None`이어도) 오류가 안 나게 막아 둔다(`:37`, `:39`).
-- **개인정보 가리기는 차단 여부와 상관없이 항상 먼저 한다**(`:37`). 그래서 질문이 차단되더라도 `masked_text`에는 이미 가려진 안전한 값이 들어 있다.
-- 키워드 검사는 `_OFF_DOMAIN`을 하나씩 훑다가 **처음 걸리는 순간 바로 결과를 돌려준다**(`:38-42`). `reason`에는 `f"보험·법률 외 질문({kw})"` 형태로 어떤 키워드 때문에 막혔는지 적힌다.
-- 걸리는 키워드가 하나도 없으면 `blocked=False, reason=None`으로 통과시킨다(`:43`).
+- 인자가 둘이고 **검사 대상이 서로 다르다.** 마스킹은 `text`(리포트: 청구 문서를 이은 OCR 본문)에, 도메인 검사는 `question`(사용자 질문 `reports.question`)에만 건다. `question`은 검사만 하고 가리지 않는다. 리포트는 이미 `mask_pii`를 거친 값을 넘긴다.
+- `question`은 **기본값 없는 키워드 인자**다. 예전처럼 `guard_input(text)` 한 인자로 부르면 도메인 검사를 조용히 잃는 대신 `TypeError`가 난다.
+- `text or ""`·`question or ""`로 입력이 비어 있어도(`None`이어도) 오류가 안 나게 막아 둔다. 질문이 없으면 막지 않는다.
+- **개인정보 가리기는 차단 여부와 상관없이 항상 먼저 한다.** 그래서 차단되더라도 `masked_text`에는 이미 가려진 안전한 값이 들어 있다.
+- 키워드를 찾기 전에 회사 표기 `주식회사`(띄어 쓴 `주식 회사` 포함)를 공백으로 바꾼다. 사용자도 보험사 정식 이름("○○손해보험 주식회사")을 그대로 쓰기 때문이다. `(주)`·`㈜`는 키워드를 품지 않아 따로 지우지 않는다. 그냥 지우지 않고 공백으로 바꾸는 건 앞뒤 글자가 붙어 없던 키워드가 생기지 않게 하려는 것이다.
+- 키워드는 `_OFF_DOMAIN` 순서로 훑어 **처음 걸리는 것**을 사유로 쓴다. `reason`에는 `f"보험·법률 외 질문({keyword})"` 형태로 어떤 키워드 때문에 막혔는지 적힌다. 걸리는 키워드가 없으면 `blocked=False, reason=None`으로 통과시킨다.
+
+**왜 질문에만 거나(#103).** 처음에는 리포트가 OCR 문서 본문을 `text`로 넘겨 그 안에서 키워드를 찾았다. 그런데 보험증권에는 거의 항상 "○○보험 주식회사"가 찍혀 있다. 그래서 dev에서 증권과 진단서로 만든 리포트가 "보험·법률 외 질문(주식)"으로 BLOCKED됐다. 화재보험 담보명의 "부동산", 화상 진단서의 "요리"도 같은 식으로 걸릴 수 있다. 반대로 사용자가 직접 쓴 질문은 `case_info`로 따로 들어가 이 검사를 거치지 않았다. 막으려던 도메인 밖 질문은 못 막고 문서 쪽에서만 오탐이 났던 셈이라, 검사 대상을 질문으로 옮겼다. 사고 경위(`description`)·추가 정보(`additional_information`)도 사용자가 쓰지만 검사하지 않는다. 사실 서술이라 "요리하다가 끓는 물에 데었다", "코인노래방 계단에서 미끄러졌다", "직업은 요리사"처럼 키워드가 정상적으로 들어가기 때문이다.
+
+> 쉽게 말하면: "엉뚱한 질문인가"는 사용자가 쓴 질문에서만 따진다. 서류와 사고 설명에는 회사 이름의 "주식회사"나 "요리하다가"처럼 키워드와 겹치는 단어가 당연히 들어 있어서, 거기까지 뒤지면 멀쩡한 청구가 막힌다.
 
 주의할 점: 이 함수는 `async`(비동기)로 선언돼 있지만 **안에서 실제로 기다리는(`await`) 지점이 하나도 없다**(정규식·문자열 비교만 하니까). docs가 말한 "정규식+NER" 중 NER(문장에서 이름·지명 같은 개체를 알아내는 AI 기술) 호출을 나중에 끼워 넣으려고 미리 비동기 형태로 만들어 둔 것으로 보이며, 지금은 사실상 즉시 끝나는 동기 로직이다(6절 참조).
 
@@ -3465,20 +3476,24 @@ class OutputGuardResult(BaseModel):
 
 ### 5.1 입력 가드레일 노드 → 차단 라우팅 → `persist_blocked`
 
-**(1) `input_guardrail` 노드**(`agents.py:123-129`):
+**(1) `input_guardrail` 노드**(2026-11-14 기준 발췌, `agents.py`의 `input_guardrail`, docstring 생략):
 
 ```python
 @safe_node
 async def input_guardrail(state: ReportState) -> dict[str, Any]:
-    g = await guardrail.guard_input(state.get("masked_text", ""))
+    g = await guardrail.guard_input(
+        state.get("masked_text", ""),
+        question=(state.get("case_info") or {}).get("question"),
+    )
     out: dict[str, Any] = {"masked_text": g.masked_text}
     if g.blocked:
         out["errors"] = _err(state, f"input_blocked:{g.reason}")
     return out
 ```
 
-- 입력으로 쓰는 `state["masked_text"]`는 바로 앞 단계 `load_context`가 DB의 `ocr_results.masked_text`에서 읽어온 값이다(`agents.py:113-119`, `state.py:24`). 즉 OCR 워커가 이미 한 번 가린 텍스트를 **여기서 또 한 번 가린다**(이중 방어). README·docstring이 강조하는 "PII 규칙은 ocr_worker 입력단과 동일해야 한다"(`guards.py:8`, `README.md:16`)는 이 이중 적용이 어긋나지 않게 하는 전제다.
-- 반환하는 dict가 `masked_text`를 다시 덮어쓴다(`:126`).
+- 마스킹 대상 `state["masked_text"]`는 바로 앞 단계 `load_context`가 DB의 `ocr_results.masked_text`에서 읽어온 값이다(청구 단위면 청구의 전 문서를 문서 경계 표식과 함께 이어붙인 값). 즉 OCR 워커가 이미 한 번 가린 텍스트를 **여기서 또 한 번 가린다**(이중 방어). README·docstring이 강조하는 "PII 규칙은 ocr_worker 입력단과 동일해야 한다"(`guards.py:8`, `README.md:16`)는 이 이중 적용이 어긋나지 않게 하는 전제다.
+- 도메인 검사 대상은 `case_info["question"]`(리포트 질문 `reports.question`)이다. `load_context`가 `mask_pii`를 거친 값만 담는다. 질문이 없거나 마스킹에 실패해 `None`으로 비웠으면 검사하지 않는다(그 질문은 LLM으로도 나가지 않는다). 문서 본문과 사고 경위·추가 정보는 검사하지 않는다(2.2 "왜 질문에만 거나" 참고).
+- 반환하는 dict가 `masked_text`를 다시 덮어쓴다.
 - 차단됐을 때만 `errors`에 `f"input_blocked:{g.reason}"` 문자열을 덧붙인다(`:127-128`). `_err`은 기존 errors 뒤에 메시지를 이어 붙이는 도우미(`agents.py:26-27`). 통과할 때는 `errors` 키를 돌려주지 않아 기존 errors가 그대로 보존된다.
 
 > 쉽게 말하면: 개인정보를 OCR 단계에서 한 번, 여기서 또 한 번 가린다. 자물쇠를 두 개 채우는 셈이라, 두 곳의 가리기 규칙이 똑같아야 한쪽이 빠뜨려도 다른 쪽이 잡아 준다.
@@ -3617,7 +3632,7 @@ START → load_context → input_guardrail
 | 입력: "정규식 **+ NER**로 PII 마스킹", "이름·주소 탐지"(`06_guardrail.md:17`, `README.md:9`) | `_mask_pii`는 **정규식 3종뿐**. NER 모델 import·호출 전혀 없음. 이름/주소 마스킹 없음 | **NER 미구현** — `guard_input`이 `async`인데 `await` 없는 이유는 향후 NER 자리 예약으로 추정 |
 | 생성: "모든 사실 주장에 `[조항][판례]` 인용 **강제**"(`06_guardrail.md:21`, `README.md:10`) | `guard_generation`은 금액 치환만. 인용 관련 코드 없음 | **인용 강제 미구현** — 강제성은 `report_compose` 프롬프트 지침(`agents.py:504`)뿐, 검증/차단 없음 |
 | 출력: "불일치 발견 시 해당 섹션을 `[인용 검증 실패 — 삭제됨]`으로 치환"(`06_guardrail.md:25`, `README.md:11`) | `guard_output`은 `judge_failures` 수집만. `final_text`에서 삭제·치환 없음 | **섹션 치환 미구현** — 결과는 기록만 되고 텍스트에 미반영 |
-| 도메인 차단 | `_OFF_DOMAIN` 7개 키워드 substring 매칭(`guards.py:22`, `:38-39`) | **단순 규칙(스텁성)** — 오탐/누락 가능(예: "주식형 보험" 오차단, 미등록 도메인 통과) |
+| 도메인 차단 | `_OFF_DOMAIN` 7개 키워드 substring 매칭. 사용자 질문에만 걸고 회사 표기 `주식회사`는 뺀다(2026-11-14, #103) | **단순 규칙(스텁성)** — 오탐/누락 가능(예: 질문 속 "주식형 보험"·"요리하다 화상"·"코인노래방" 오차단, 미등록 도메인 통과) |
 
 > 표 읽는 법: 왼쪽은 "문서가 하겠다고 적어 둔 것", 가운데는 "코드가 실제로 하는 것", 오른쪽은 그 둘을 대조한 결론이다. 요약하면 문서의 약속 중 고급 기능 세 가지가 아직 코드에 없다.
 
