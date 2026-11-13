@@ -61,7 +61,7 @@ class _FakePool:
         return _FakeAcquire(self._conn)
 
 
-async def _blocked_guard_input(text: str) -> InputGuardResult:
+async def _blocked_guard_input(text: str, *, question: str | None) -> InputGuardResult:
     return InputGuardResult(masked_text=text, blocked=True, reason="off_domain")
 
 

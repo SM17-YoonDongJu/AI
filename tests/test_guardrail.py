@@ -55,17 +55,57 @@ def test_mask_pii_preserves_rrn_front6_and_masks_rest() -> None:
     assert "110-234-567890" not in masked  # 계좌 마스킹
 
 
-async def test_guard_input_blocks_off_domain() -> None:
-    result = await guard_input("비트코인 시세랑 부동산 투자 문의입니다.")
+async def test_guard_input_blocks_off_domain_question() -> None:
+    result = await guard_input("", question="비트코인 시세랑 부동산 투자 문의입니다.")
     assert isinstance(result, InputGuardResult)
     assert result.blocked is True
-    assert result.reason is not None
+    assert result.reason == "보험·법률 외 질문(부동산)"
 
 
 async def test_guard_input_allows_domain_and_masks() -> None:
-    result = await guard_input("진단명 경추 염좌, 환자 860312-1948571")
+    result = await guard_input("진단명 경추 염좌, 환자 860312-1948571", question=None)
     assert result.blocked is False
     assert "860312-*******" in result.masked_text
+
+
+# ── guard_input: 도메인 검사 대상 (#103) ─────────────────────────
+# 실제 증권·진단서처럼 키워드가 정상적으로 들어간 문서 본문(가상 보험사).
+_DOCUMENT_WITH_KEYWORDS = (
+    "--- 문서 1: 보험증권 ---\n누리손해보험 주식회사 누리화재보험 담보: 부동산 화재손해\n\n"
+    "--- 문서 2: 진단서 ---\n병명: 손목 2도 화상 발병 경위: 요리 중 끓는 물에 데임"
+)
+
+
+async def test_guard_input_skips_domain_check_on_document_text() -> None:
+    result = await guard_input(_DOCUMENT_WITH_KEYWORDS, question=None)
+    assert result.blocked is False
+    assert result.reason is None
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "누리손해보험 주식회사에서 보험금을 덜 받았어요",
+        "누리손해보험 주식 회사에 청구했습니다",
+        # 회사 표기를 공백 대신 빈 문자열로 지우면 "에코인천"이 되어 "코인"이 생긴다.
+        "에코주식회사인천지점 직원인데 출장 중에 다쳤어요",
+    ],
+)
+async def test_guard_input_ignores_company_designation_in_question(question: str) -> None:
+    result = await guard_input("", question=question)
+    assert result.blocked is False
+
+
+async def test_guard_input_blocks_stock_question_next_to_company_name() -> None:
+    result = await guard_input("", question="누리손해보험 주식회사 주식을 사도 될까요?")
+    assert result.blocked is True
+    assert result.reason == "보험·법률 외 질문(주식)"
+
+
+async def test_guard_input_requires_question_argument() -> None:
+    # 한 인자 호출이 도메인 검사를 조용히 잃지 않고 드러나야 한다.
+    with pytest.raises(TypeError):
+        await guard_input("문서 본문")  # type: ignore[call-arg]
 
 
 def test_guard_generation_softens_absolute_amount() -> None:

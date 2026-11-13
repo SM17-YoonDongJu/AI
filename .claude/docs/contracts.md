@@ -251,7 +251,11 @@ class RagResult(BaseModel):
 `src/guardrail` — 단계별 함수로 분리(호출자가 필요한 것만 조립). 리포트=3단계 전부.
 
 ```python
-async def guard_input(text: str) -> InputGuardResult: ...
+async def guard_input(
+    text: str,               # 마스킹 대상(리포트: OCR 문서 본문)
+    *,
+    question: str | None,    # 도메인 검사 대상(사용자 질문 reports.question). 필수 키워드 인자
+) -> InputGuardResult: ...
 def guard_generation(text: str) -> str: ...                       # 단정표현 치환·인용 강제 검사
 async def guard_output(
     text: str,
@@ -273,6 +277,7 @@ class OutputGuardResult(BaseModel):
     judge_total_chars: int = 0      # final_text 전체 글자 수 → 검증 범위 = checked / total
     judge_evidence_chunks: int = 0  # Judge가 본 근거 청크 수(미수행·호출 실패면 0)
 ```
+- `guard_input`은 마스킹을 `text`에, 보험·법률 외 주제 검사를 `question`에만 건다. 회사 표기(`주식회사`)는 빼고 찾는다. 차단 사유 형식 `보험·법률 외 질문({키워드})`은 그대로다. 2026-11-14 변경(#103): 전에는 `text`(청구 문서를 이은 OCR 본문)에 검사를 걸었다. 그래서 증권에 찍힌 "○○보험 주식회사"의 "주식" 때문에 리포트가 BLOCKED로 끝났고, 정작 사용자 질문은 검사하지 않았다. 사고 경위·추가 정보(`user_claims.description`·`additional_information`)도 검사하지 않는다. 사실 서술이라 "요리하다가 데었다", "직업은 요리사"처럼 키워드가 정상적으로 들어간다. `question`은 기본값 없는 키워드 인자다. 옛 한 인자 호출(`guard_input(text)`)은 도메인 검사를 조용히 잃지 않고 `TypeError`로 드러난다.
 - `judge_*` 세 필드는 2026-11-11 추가(backward-compatible, 기본값 0). 빈 `judge_failures`가 "전부 검증해 통과"인지 "일부만 봤다"인지 구분하려고 둔다 — 리포트 `draft.metrics.verification.judge`의 근거.
 - Judge 범위: 리포트(고지문 포함) 앞 `max_report_chars`자(기본 `JUDGE_MAX_REPORT_CHARS` 12,000)와 `chunks` 앞 `JUDGE_MAX_EVIDENCE_CHUNKS`(20)건 × `JUDGE_EVIDENCE_CHARS`(800)자. 근거 순서는 호출자가 정한다(리포트는 약관 → 장해분류표 → 판례). `max_report_chars < 1`이면 `ValueError`(호출자 버그).
 - `judge_failures`에 `JUDGE_UNAVAILABLE` 표식 하나만 들어 있으면 Judge가 판정하지 못한 것이다 — 호출 실패(`AiClientError`, 거절 포함) **또는 판정 불가 응답**(2026-11-11부터: 파싱 실패 `{}`, `failures`가 없거나 문자열 리스트가 아님). 이때 `judge_checked_chars`·`judge_evidence_chunks`는 0이다. 예외를 올리지 않는다(고지문 붙은 본문이 저장돼야 하므로).

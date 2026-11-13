@@ -1,6 +1,7 @@
 """가드레일 구현 — 입력/생성/출력 3단계 + 외부 전송 전 PII 마스킹.
 
-- 입력: 정규식 PII 마스킹(주민번호 앞 6자리 보존) + 보험·법률 외 도메인 차단
+- 입력: 문서 본문 정규식 PII 마스킹(주민번호 앞 6자리 보존) + 사용자 질문의 보험·법률 외
+  주제 차단
 - 외부 전송 전 마스킹(`mask_pii`): OCR 입력단과 같은 규칙(`ocr_worker.masking` 재사용)
 - 마스킹 건수(`count_masked_pii`): OCR 마스커가 남긴 `[분류]` 토큰을 분류별로 센다
 - 생성: 단정적 금액 표현 → "참고 추정 범위"로 치환
@@ -40,8 +41,14 @@ JUDGE_MAX_REPORT_CHARS = 12_000  # 리포트(고지문 포함 final_text) 앞부
 JUDGE_MAX_EVIDENCE_CHUNKS = 20  # 약관 8 + 장해분류표 ≤8 + 판례 4가 다 들어가는 건수
 JUDGE_EVIDENCE_CHARS = 800  # 청크당 글자 수. 장해 추출 ctx와 같다(지급률 숫자가 잘리지 않게)
 
-# 보험·법률 외 도메인 차단 키워드(간이)
+# 보험·법률 외 주제 차단 키워드(간이). 사용자가 직접 쓴 질문에만 건다. 문서 본문과 사고 경위·
+# 추가 정보에는 이 단어들이 정상적으로 나온다(증권의 "○○보험 주식회사", 화재보험 담보의
+# "부동산", 사고 경위의 "요리하다가 데었다", 추가 정보의 "직업은 요리사"). 문서 본문에 걸었을
+# 때는 실사용 리포트 대부분이 막혔다(#103).
 _OFF_DOMAIN = ("부동산", "주식", "코인", "비트코인", "연애", "요리", "게임")
+# 회사 표기. 사용자도 보험사 정식 이름("○○손해보험 주식회사")을 그대로 쓰므로 빼고 찾는다.
+# "(주)"·"㈜"는 키워드를 품지 않아 뺄 필요가 없다.
+_COMPANY_DESIGNATION = re.compile(r"주식\s*회사")
 
 
 # ── 입력 가드레일 ──────────────────────────────────────────────
@@ -60,25 +67,42 @@ def _mask_pii(text: str) -> str:
     return text
 
 
-async def guard_input(text: str) -> InputGuardResult:
-    """입력 가드레일 — `_mask_pii` 마스킹 + 보험·법률 외 도메인 차단.
+def _find_off_domain(text: str) -> str | None:
+    """`_OFF_DOMAIN` 순서로 처음 걸리는 키워드. 없으면 None.
 
-    report는 OCR이 이미 마스킹한 `masked_text`를 넣는다. 복호화한 자유입력 원문을 외부
-    API로 보내기 전에는 이 함수가 아니라 `mask_pii`를 쓴다. 이 함수는 주민번호 앞 6자리를
-    남기고, 이름·주소·이메일·카드는 가리지 않는다.
+    회사 표기는 지우지 않고 공백으로 바꾼 뒤 찾는다. 그냥 지우면 앞뒤 글자가 붙어 없던 키워드가
+    생길 수 있다.
+    """
+    target = _COMPANY_DESIGNATION.sub(" ", text)
+    return next((kw for kw in _OFF_DOMAIN if kw in target), None)
+
+
+async def guard_input(text: str, *, question: str | None) -> InputGuardResult:
+    """입력 가드레일 — 문서 본문 `_mask_pii` 마스킹 + 사용자 질문의 보험·법률 외 주제 차단.
+
+    두 검사의 대상이 다르다. 마스킹은 `text`에 건다. report는 OCR이 이미 마스킹한 문서 본문
+    `masked_text`를 넣는다. 도메인 검사는 사용자가 직접 쓴 `question`에만 건다. 문서 본문과 사고
+    경위·추가 정보에는 걸지 않는다(`_OFF_DOMAIN` 주석 참고). 회사 표기("주식회사")는 빼고 찾는다.
+
+    `question`은 필수 키워드 인자다. 예전처럼 한 인자로 부르는 호출이 도메인 검사를 조용히 잃지
+    않고 TypeError로 드러나게 하려는 것이다. 질문은 검사만 하고 가리지 않는다. report는
+    `mask_pii`를 거친 값을 넘긴다. 복호화한 자유입력 원문을 외부 API로 보내기 전에는 이 함수가
+    아니라 `mask_pii`를 쓴다. 이 함수의 마스킹은 주민번호 앞 6자리를 남기고, 이름·주소·이메일·
+    카드는 가리지 않는다.
 
     Args:
-        text: 검사할 텍스트.
+        text: 마스킹할 문서 본문.
+        question: 도메인 검사를 걸 사용자 질문. None이나 빈 문자열이면 막지 않는다.
 
     Returns:
-        마스킹된 텍스트와 차단 여부·사유.
+        `text`의 마스킹본과 차단 여부·사유. 사유는 `보험·법률 외 질문({키워드})` 형식이다.
     """
     masked = _mask_pii(text or "")
-    for kw in _OFF_DOMAIN:
-        if kw in (text or ""):
-            return InputGuardResult(
-                masked_text=masked, blocked=True, reason=f"보험·법률 외 질문({kw})"
-            )
+    keyword = _find_off_domain(question or "")
+    if keyword is not None:
+        return InputGuardResult(
+            masked_text=masked, blocked=True, reason=f"보험·법률 외 질문({keyword})"
+        )
     return InputGuardResult(masked_text=masked, blocked=False, reason=None)
 
 
