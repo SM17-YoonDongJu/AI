@@ -192,10 +192,18 @@ class PaddleOcrEngine:
         self._lock = threading.Lock()
 
     @classmethod
-    def from_settings(cls, settings: Settings) -> "PaddleOcrEngine":
-        """설정(``ocr_*``)으로 엔진을 만든다."""
+    def from_settings(
+        cls, settings: Settings, *, det_model: str | None = None
+    ) -> "PaddleOcrEngine":
+        """설정(``ocr_*``)으로 엔진을 만든다.
+
+        Args:
+            settings: 환경설정.
+            det_model: 검출 모델을 바꿀 때(재OCR 검증 전용 엔진 — ``ocr_verify_det_model``).
+                ``None``이면 ``ocr_det_model``.
+        """
         return cls(
-            det_model=settings.ocr_det_model,
+            det_model=det_model or settings.ocr_det_model,
             rec_model=settings.ocr_rec_model,
             textline_orientation=settings.ocr_textline_orientation,
             cpu_threads=settings.ocr_cpu_threads,

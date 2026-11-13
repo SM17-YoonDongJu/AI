@@ -571,3 +571,19 @@ def test_paddle_engine_passes_mkldnn_cache_capacity_only_when_set() -> None:
     # Assert
     assert factory.calls[0]["mkldnn_cache_capacity"] == 2
     assert "mkldnn_cache_capacity" not in default_factory.calls[0]
+
+
+def test_paddle_engine_from_settings_can_override_det_model() -> None:
+    # Arrange: 재OCR 검증 전용 엔진(O3b)은 검출 모델만 바꾸고 나머지 설정은 메인과 같다
+    settings = Settings(_env_file=None, ocr_det_model="PP-OCRv5_server_det", ocr_cpu_threads=3)
+    factory = _RecordingFactory(_FakePaddleOcr())
+
+    # Act
+    engine = PaddleOcrEngine.from_settings(settings, det_model="PP-OCRv5_mobile_det")
+    engine._factory = factory
+    engine.load()
+
+    # Assert
+    options = factory.calls[0]
+    assert options["text_detection_model_name"] == "PP-OCRv5_mobile_det"
+    assert options["cpu_threads"] == 3

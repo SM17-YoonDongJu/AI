@@ -3208,3 +3208,69 @@ async def test_reocr_verify_mode_keeps_previous_behavior_without_shadow() -> Non
     assert engine.seen_images == ["redacted-0"]
     assert ("delete", "uploads/x.pdf") in s3.events
     assert [e for e in logs if e["event"] == "ocr.verify.shadow"] == []
+
+
+# ── 재OCR 검증 전용 엔진(ocr_verify_det_model, 성능 실험 O3b) ─────────────────
+async def test_reocr_uses_dedicated_verify_engine_not_main_engine() -> None:
+    # Arrange: 메인 엔진은 아무것도 못 읽고, 검증 전용 엔진은 사본에서 주민번호를 읽는다
+    main_engine = _FakeReocrEngine("")
+    verify_engine = _FakeReocrEngine("901010-1234567")
+    s3 = _RecordingS3()
+    pipeline = _gate_pipeline(
+        FakePool(existing=None),
+        FakeProducer(),
+        FakeProcessor(_multi_page_result("보험증권 계약자 홍길동"), engine=main_engine),
+        s3,
+        _RecordingCoverage(ratio=1.0),
+        verify_engine=verify_engine,
+        settings=Settings(ocr_verify_mode="reocr"),
+    )
+
+    # Act
+    await pipeline.handle(_job())
+    await pipeline.wait_for_pending_deletes()
+
+    # Assert: 재OCR은 검증 전용 엔진만 읽었고, 그 판정(잔류 PII)대로 원본을 지우지 않는다
+    assert verify_engine.seen_images == ["redacted-0"]
+    assert main_engine.seen_images == []
+    assert ("delete", "uploads/x.pdf") not in s3.events
+
+
+@pytest.mark.parametrize(
+    ("verify_det_model", "builds_separate"),
+    [(None, False), ("PP-OCRv5_server_det", False), ("PP-OCRv5_mobile_det", True)],
+)
+def test_verify_engine_selection_by_setting(
+    monkeypatch: pytest.MonkeyPatch, verify_det_model: str | None, builds_separate: bool
+) -> None:
+    # Arrange: 메인과 다른 검출 모델일 때만 검증 전용 엔진을 만든다(같으면 메인을 재사용)
+    built: list[str | None] = []
+    sentinel = object()
+
+    def fake_from_settings(settings: Settings, *, det_model: str | None = None) -> object:
+        built.append(det_model)
+        return sentinel
+
+    monkeypatch.setattr(pipeline_module.PaddleOcrEngine, "from_settings", fake_from_settings)
+    main_engine = _FakeReocrEngine("")
+    pipeline = _pipeline(
+        FakePool(existing=None),
+        FakeProducer(),
+        FakeProcessor(_multi_page_result("x"), engine=main_engine),
+        settings=Settings(
+            ocr_det_model="PP-OCRv5_server_det", ocr_verify_det_model=verify_det_model
+        ),
+    )
+
+    # Act: 두 번 불러도 한 번만 만든다
+    first = pipeline._verify_engine()
+    second = pipeline._verify_engine()
+
+    # Assert
+    assert first is second
+    if builds_separate:
+        assert first is sentinel
+        assert built == ["PP-OCRv5_mobile_det"]
+    else:
+        assert first is main_engine
+        assert built == []

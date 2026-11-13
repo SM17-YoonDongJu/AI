@@ -114,7 +114,15 @@ from ocr_worker.masking.image_verify import (
 from ocr_worker.masking.masker import Masker, get_masker
 from ocr_worker.masking.spans import PiiLabel
 from ocr_worker.masking.verify import MaskingError, assert_no_residual
-from ocr_worker.ocr import OcrPage, OcrProcessor, OcrResult, PageImage, get_processor
+from ocr_worker.ocr import (
+    OcrEngine,
+    OcrPage,
+    OcrProcessor,
+    OcrResult,
+    PaddleOcrEngine,
+    PageImage,
+    get_processor,
+)
 from ocr_worker.repository import (
     ClaimDocument,
     DeleteRetryState,
@@ -415,6 +423,7 @@ class OcrPipeline:
         coverage: CoverageFn | None = None,
         upload: UploadFn | None = None,
         delete: DeleteFn | None = None,
+        verify_engine: OcrEngine | None = None,
     ) -> None:
         """파이프라인을 구성한다.
 
@@ -434,6 +443,9 @@ class OcrPipeline:
                 (``image_verify.measure_coverage``) — 주입점을 둬 numpy 없이 게이트를 테스트한다.
             upload: 비식별 사본 S3 업로드 함수. ``None``이면 ``storage.put_object``.
             delete: 원본 S3 삭제 함수. ``None``이면 ``storage.delete_object``.
+            verify_engine: 재OCR 검증(5.2) 전용 엔진(주입 — 테스트는 페이크). ``None``이면
+                ``ocr_verify_det_model``이 있을 때 그 검출 모델로 첫 검증 때 만들고, 없으면 메인
+                엔진(``processor.engine``)을 쓴다.
         """
         self._pool = pool
         self._producer = producer
@@ -450,6 +462,7 @@ class OcrPipeline:
         self._upload: UploadFn = upload or put_object
         self._delete: DeleteFn = delete or delete_object
         self._image_pipeline: ImagePipeline = image_pipeline or self._default_image_pipeline
+        self._verify_engine_override = verify_engine
         # 진행 중인 원본 삭제 task의 강한 참조(fire-and-forget · GC 방지).
         # 자세한 이유는 ``_schedule_original_delete`` 참고.
         self._pending_deletes: set[asyncio.Task[None]] = set()
@@ -1262,6 +1275,21 @@ class OcrPipeline:
         logger.info("sweep_delete_succeeded", ocr_result_id=row.id, s3_key=row.original_s3_key)
         await self._mark_deleted(row.id)
 
+    def _verify_engine(self) -> OcrEngine:
+        """재OCR 검증(5.2)에 쓸 엔진. 별도 검출 모델이 설정돼 있으면 한 번 만들어 재사용한다.
+
+        메인 엔진을 그대로 쓰면 같은 모델이 같은 픽셀을 다시 읽는다 — 검은블럭 때문에 글자 영역이
+        달리 잘릴 때만 다르게 읽힌다. 다른 검출 모델은 더 가볍고, 다르게 읽을 여지도 크다(O3b).
+        """
+        if self._verify_engine_override is None:
+            det_model = self._settings.ocr_verify_det_model
+            self._verify_engine_override = (
+                PaddleOcrEngine.from_settings(self._settings, det_model=det_model)
+                if det_model and det_model != self._settings.ocr_det_model
+                else self._processor.engine
+            )
+        return self._verify_engine_override
+
     def _verify_pages(
         self, result: OcrResult, redacted_pages: list[RedactedPage]
     ) -> list[tuple[int, VerificationResult]]:
@@ -1294,7 +1322,7 @@ class OcrPipeline:
             if mode == "text" and text_outcome is not None:
                 verified.append((page.index, text_outcome))
                 continue
-            outcome = decide(coverage, reocr_residual_pii(redacted.image, self._processor.engine))
+            outcome = decide(coverage, reocr_residual_pii(redacted.image, self._verify_engine()))
             if text_outcome is not None:
                 _log_verify_shadow(page.index, outcome, text_outcome)
             verified.append((page.index, outcome))
