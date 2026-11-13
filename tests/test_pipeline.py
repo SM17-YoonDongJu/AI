@@ -3243,7 +3243,7 @@ async def test_reocr_uses_dedicated_verify_engine_not_main_engine() -> None:
 def test_verify_engine_selection_by_setting(
     monkeypatch: pytest.MonkeyPatch, verify_det_model: str | None, builds_separate: bool
 ) -> None:
-    # Arrange: 메인과 다른 검출 모델일 때만 검증 전용 엔진을 만든다(같으면 메인을 재사용)
+    # Arrange: 메인과 다른 검출 모델일 때만 가벼운 검증 엔진을 만든다(같으면 메인을 재사용)
     built: list[str | None] = []
     sentinel = object()
 
@@ -3262,15 +3262,118 @@ def test_verify_engine_selection_by_setting(
         ),
     )
 
-    # Act: 두 번 불러도 한 번만 만든다
-    first = pipeline._verify_engine()
-    second = pipeline._verify_engine()
+    # Act: 두 번 불러도 한 번만 만든다. fast=False면 언제나 메인 엔진
+    first = pipeline._verify_engine(fast=True)
+    second = pipeline._verify_engine(fast=True)
+    main = pipeline._verify_engine(fast=False)
 
     # Assert
     assert first is second
+    assert main is main_engine
     if builds_separate:
         assert first is sentinel
         assert built == ["PP-OCRv5_mobile_det"]
     else:
         assert first is main_engine
         assert built == []
+
+
+# ── 조건부 가벼운 검증(O3c): VLM 재판독이 제 몫을 한 문서에만 ──────────────────
+def _conf_result(*confidences: float) -> OcrResult:
+    """라인 신뢰도만 지정한 1쪽 결과(텍스트는 무관)."""
+    lines = tuple(_line(f"줄{i}", confidence=c) for i, c in enumerate(confidences))
+    return OcrResult(pages=(OcrPage(index=0, width=100, height=50, lines=lines),))
+
+
+def _fast_pipeline(**settings: Any) -> OcrPipeline:
+    return _pipeline(
+        FakePool(existing=None),
+        FakeProducer(),
+        FakeProcessor(_multi_page_result("x"), engine=_FakeReocrEngine("")),
+        verify_engine=_FakeReocrEngine(""),
+        settings=Settings(ocr_low_confidence_threshold=0.9, **settings),
+    )
+
+
+@pytest.mark.parametrize(
+    ("confidences", "reread", "expected"),
+    [
+        pytest.param((0.99, 0.95), None, True, id="고신뢰-재판독-불필요"),
+        pytest.param((0.99, 0.42), None, False, id="저신뢰-재판독-안-돎"),
+        pytest.param((0.99, 0.42), [["a", "b"]], True, id="저신뢰-전부-재판독"),
+        pytest.param((0.99, 0.42), [["a", None]], False, id="저신뢰-라인-재판독-실패"),
+        pytest.param((0.42, 0.99), [["a", None]], True, id="고신뢰-라인만-빔은-무관"),
+    ],
+)
+def test_use_fast_verify_only_when_reread_covered_low_confidence_lines(
+    confidences: tuple[float, ...], reread: list[list[str | None]] | None, expected: bool
+) -> None:
+    # Arrange
+    pipeline = _fast_pipeline()
+    result = _conf_result(*confidences)
+
+    # Act / Assert: 재판독이라는 1차 방어선이 제 몫을 했을 때만 가볍게 검증한다
+    assert pipeline._use_fast_verify(result, reread) is expected
+
+
+def test_use_fast_verify_always_when_condition_disabled() -> None:
+    # Arrange: 조건을 끄면 O3b(항상 가벼운 엔진) — 실험용
+    pipeline = _fast_pipeline(ocr_verify_fast_requires_reread=False)
+
+    # Act / Assert
+    assert pipeline._use_fast_verify(_conf_result(0.42), None) is True
+
+
+def test_use_fast_verify_false_without_fast_engine() -> None:
+    # Arrange: 가벼운 엔진이 없으면(기본 설정) 늘 메인 엔진
+    pipeline = _pipeline(
+        FakePool(existing=None),
+        FakeProducer(),
+        FakeProcessor(_multi_page_result("x"), engine=_FakeReocrEngine("")),
+    )
+
+    # Act / Assert
+    assert pipeline._use_fast_verify(_conf_result(0.99), None) is False
+
+
+async def test_low_confidence_doc_with_failed_reread_is_verified_by_main_engine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Arrange: 저신뢰 문서인데 VLM 재판독이 전부 실패(VLM 서버 꺼짐) — 재OCR이 마지막 방어선이다
+    async def failed_reread(images: Any, pages: Any) -> list[list[str | None]]:
+        return [[None] * len(page.lines) for page in pages]
+
+    main_engine = _FakeReocrEngine("901010-1234567")  # 메인 재OCR은 잔류 주민번호를 읽는다
+    fast_engine = _FakeReocrEngine("")
+    s3 = _RecordingS3()
+    pipeline = OcrPipeline(
+        pool=FakePool(existing=None),
+        producer=FakeProducer(),  # type: ignore[arg-type]
+        processor=FakeProcessor(  # type: ignore[arg-type]
+            _multi_page_result("보험증권 계약자 홍길동", confidence=0.4), engine=main_engine
+        ),
+        image_masker=ImageMasker(
+            detect=_detect_name,
+            redactor=_fake_redactor,
+            reread=failed_reread,
+            reread_confidence_threshold=0.9,
+        ),
+        coverage=_RecordingCoverage(ratio=1.0),
+        upload=s3.upload,
+        delete=s3.delete,
+        verify_engine=fast_engine,
+        vlm_transcribe=_RecordingVlm(error=VlmClientError("연결 실패")),
+        settings=Settings(ocr_low_confidence_threshold=0.9),
+    )
+
+    # Act
+    with capture_logs() as logs:
+        await pipeline.handle(_job())
+        await pipeline.wait_for_pending_deletes()
+
+    # Assert: 가벼운 엔진이 아니라 메인 엔진이 검증했고, 잔류 PII로 원본을 지우지 않는다
+    assert main_engine.seen_images == ["redacted-0"]
+    assert fast_engine.seen_images == []
+    assert ("delete", "uploads/x.pdf") not in s3.events
+    [verify] = [e for e in logs if e["event"] == "ocr.stage.finished" and e["stage"] == "verify"]
+    assert verify["engine"] == "main"

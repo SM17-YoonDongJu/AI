@@ -1031,15 +1031,22 @@ class OcrPipeline:
             )
         logger.info("masked_images_uploaded", pages=len(keys))
         # 삭제 게이트 검증(5.1 커버리지 + 5.2 재OCR) — 재OCR이 OCR 엔진을 한 번 더 도는 단계다.
+        fast_verify = self._use_fast_verify(result, reread_texts)
         with timed(
-            logger, _STAGE_EVENT, stage="verify", mode=self._settings.ocr_verify_mode
+            logger,
+            _STAGE_EVENT,
+            stage="verify",
+            mode=self._settings.ocr_verify_mode,
+            engine="fast" if fast_verify else "main",
         ) as verify_stage:
-            delete_original = await self._may_delete_original(result, redacted_pages)
+            delete_original = await self._may_delete_original(
+                result, redacted_pages, fast_verify=fast_verify
+            )
             verify_stage["delete_original"] = delete_original
         return ImageTrackResult(keys=keys, delete_original=delete_original)
 
     async def _may_delete_original(
-        self, result: OcrResult, redacted_pages: list[RedactedPage]
+        self, result: OcrResult, redacted_pages: list[RedactedPage], *, fast_verify: bool = False
     ) -> bool:
         """이미지 마스킹 검증(5.1+5.2)을 전 페이지가 통과했는지 판정한다(삭제는 안 한다).
 
@@ -1062,7 +1069,9 @@ class OcrPipeline:
             logger.warning("original_delete_skipped", reason="page_without_ocr_text")
             return False
 
-        verified = await asyncio.to_thread(self._verify_pages, result, redacted_pages)
+        verified = await asyncio.to_thread(
+            self._verify_pages, result, redacted_pages, fast_verify=fast_verify
+        )
         failures = [(index, outcome) for index, outcome in verified if outcome.needs_review]
         if failures:
             for index, outcome in failures:
@@ -1275,23 +1284,55 @@ class OcrPipeline:
         logger.info("sweep_delete_succeeded", ocr_result_id=row.id, s3_key=row.original_s3_key)
         await self._mark_deleted(row.id)
 
-    def _verify_engine(self) -> OcrEngine:
-        """재OCR 검증(5.2)에 쓸 엔진. 별도 검출 모델이 설정돼 있으면 한 번 만들어 재사용한다.
-
-        메인 엔진을 그대로 쓰면 같은 모델이 같은 픽셀을 다시 읽는다 — 검은블럭 때문에 글자 영역이
-        달리 잘릴 때만 다르게 읽힌다. 다른 검출 모델은 더 가볍고, 다르게 읽을 여지도 크다(O3b).
-        """
+    def _fast_engine(self) -> OcrEngine | None:
+        """가벼운 검증 엔진(주입 또는 ``ocr_verify_det_model``). 없으면 ``None``. 한 번만 만든다."""
         if self._verify_engine_override is None:
             det_model = self._settings.ocr_verify_det_model
-            self._verify_engine_override = (
-                PaddleOcrEngine.from_settings(self._settings, det_model=det_model)
-                if det_model and det_model != self._settings.ocr_det_model
-                else self._processor.engine
-            )
+            if det_model and det_model != self._settings.ocr_det_model:
+                self._verify_engine_override = PaddleOcrEngine.from_settings(
+                    self._settings, det_model=det_model
+                )
         return self._verify_engine_override
 
+    def _verify_engine(self, *, fast: bool) -> OcrEngine:
+        """재OCR 검증(5.2)에 쓸 엔진. ``fast``이고 가벼운 엔진이 있으면 그것, 아니면 메인 엔진.
+
+        메인 엔진을 그대로 쓰면 같은 모델이 같은 픽셀을 다시 읽는다 — 검은블럭 때문에 글자 영역이
+        달리 잘릴 때만 다르게 읽힌다. 가벼운 검출 모델은 빠르지만, VLM이 꺼진 날엔 메인 재OCR이
+        잡던 누락을 놓쳤다(O3b) — 그래서 ``_use_fast_verify``가 고른 문서에만 쓴다(O3c).
+        """
+        fast_engine = self._fast_engine() if fast else None
+        return fast_engine if fast_engine is not None else self._processor.engine
+
+    def _use_fast_verify(
+        self, result: OcrResult, reread_texts: list[list[str | None]] | None
+    ) -> bool:
+        """이 문서를 가벼운 엔진으로 검증해도 되는가(O3c).
+
+        재OCR이 혼자 막아야 하는 건 "1차 방어선인 VLM 재판독이 필요했는데 못 돈" 문서다. 그래서:
+        고신뢰 문서(재판독 대상 아님)거나, 저신뢰 라인(``ocr_low_confidence_threshold`` 미만)을
+        **빠짐없이** 다시 읽었으면 가볍게 검증한다. 한 줄이라도 실패·예산 초과·빈 응답이면 메인
+        엔진으로 한다(빈 응답과 실패를 가를 수 없어 보수적으로 같이 본다).
+        """
+        settings = self._settings
+        if self._fast_engine() is None:
+            return False
+        if not settings.ocr_verify_fast_requires_reread:
+            return True
+        threshold = settings.ocr_low_confidence_threshold
+        if result.mean_confidence >= threshold:
+            return True  # 재판독 대상이 아닌 고신뢰 문서
+        if reread_texts is None:
+            return False  # 재판독이 필요했는데 돌지 않았다(재판독 함수 없음 등)
+        return all(
+            texts[index] is not None
+            for page, texts in zip(result.pages, reread_texts, strict=True)
+            for index, line in enumerate(page.lines)
+            if line.confidence < threshold
+        )
+
     def _verify_pages(
-        self, result: OcrResult, redacted_pages: list[RedactedPage]
+        self, result: OcrResult, redacted_pages: list[RedactedPage], *, fast_verify: bool = False
     ) -> list[tuple[int, VerificationResult]]:
         """페이지별 5.1 커버리지 + 5.2 재OCR 잔류 검사(동기 — ``to_thread``에서 호출).
 
@@ -1322,7 +1363,8 @@ class OcrPipeline:
             if mode == "text" and text_outcome is not None:
                 verified.append((page.index, text_outcome))
                 continue
-            outcome = decide(coverage, reocr_residual_pii(redacted.image, self._verify_engine()))
+            engine = self._verify_engine(fast=fast_verify)
+            outcome = decide(coverage, reocr_residual_pii(redacted.image, engine))
             if text_outcome is not None:
                 _log_verify_shadow(page.index, outcome, text_outcome)
             verified.append((page.index, outcome))
