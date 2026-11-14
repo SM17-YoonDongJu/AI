@@ -89,7 +89,7 @@ PII 규약(§13): OCR 원문(평문)은 이 핸들러 메모리에만 존재하�
 import asyncio
 import re
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -100,7 +100,7 @@ from core.contracts import DocType, OcrJob, ReportJob
 from core.exceptions import NonRetryableError, OcrError, UnreadableFileError
 from core.logging import bind_context, clear_context, get_logger, log_event, timed
 from core.sqs.producer import SqsProducer
-from ocr_worker.classify import classify
+from ocr_worker.classify import classify, is_body_evidenced
 from ocr_worker.extract import extract
 from ocr_worker.masking.image_masker import ImageMasker, RedactedPage, image_to_png_bytes
 from ocr_worker.masking.image_verify import (
@@ -120,6 +120,7 @@ from ocr_worker.repository import (
     DeleteRetryState,
     OcrResultRecord,
     PendingDeletion,
+    ReuploadReason,
     build_masked_lines,
     clear_job_failure,
     fetch_claim_documents,
@@ -163,9 +164,12 @@ _REPORT_ID_NAMESPACE = uuid.NAMESPACE_URL
 # 놓치는 것 방지)와 정확히 같은 방향이라 의도한 결과다 — 다만 반대급부로 "화질은
 # 좋은데 완전히 엉뚱한 문서가 hint 하나로 POLICY/DIAGNOSIS 행세를 하는" 오탐은 여기서
 # 못 막는다(ocr_quality도 텍스트가 선명하면 안 잡는다). "화질 나쁜 진짜 문서"가
-# "화질 좋은 엉뚱한 문서"보다 훨씬 흔할 거라 보고 지금은 감수한다. 신뢰도를 반영해
-# hint-only 승격을 여기서 걸러내려면 fetch_claim_documents가 doc_type_confidence도
-# 읽어와야 한다(현재 미저장) — 필요해지면 별도 작업으로.
+# "화질 좋은 엉뚱한 문서"보다 훨씬 흔할 거라 보고 지금은 감수한다.
+# 2026-11-14: fetch_claim_documents가 doc_type_confidence도 읽는다(재업로드 사유 판정용,
+# _blocked_reason). 그래도 막는 판정은 그대로 둔다 — 본문 근거를 막는 조건에 넣어 보니
+# 보험사 앱 화면 캡처·영문 진단서·의무기록사본처럼 본문 근거 없이 판정되는 정상 청구가
+# 막혔다(QA 실측). 대신 본문 근거 문서 없이 발행되는 청구를
+# claim_published_without_body_evidence로 남겨 규모를 잰다.
 _REQUIRED_DOC_TYPES: frozenset[DocType] = frozenset({DocType.POLICY, DocType.DIAGNOSIS})
 # 비식별 이미지 사본 키 공간 — 원본 키와 분리(원본은 별도 보존정책).
 _MASKED_IMAGE_CONTENT_TYPE = "image/png"
@@ -276,6 +280,35 @@ def _log_verify_shadow(
         text_only_labels=sorted(text_labels - reocr_labels),
         low_coverage_lines=len(reocr.low_coverage_lines),
     )
+
+
+def _blocked_reason(docs: Sequence[ClaimDocument], *, incomplete: bool) -> ReuploadReason:
+    """정상 리포트를 낼 수 없는 청구(필수 유형 누락·인식 불완전)를 사용자에게 안내할 대표 사유.
+
+    ``_judge_claim``이 막기로 한 청구에만 부른다(``missing or incomplete``). 순서가 곧 우선순위다.
+
+    1. 처리에 실패한 문서가 있다(``incomplete``) → ``unreadable``. 실패한 문서가 빠진 필수 서류였을
+       수 있다.
+    2. 저품질 문서(``ocr_quality=needs_reupload``)가 있다 → ``unreadable``. 흐린 실제 서류와 글자가
+       거의 없는 무관한 사진은 둘 다 저품질로 잡혀 구분할 수 없다. 훨씬 흔한 흐린 실제 서류에 맞춰
+       "더 선명하게"로 안내한다.
+    3. 본문 단서로 보험·의료 문서 유형을 판정한 문서가 하나도 없다 → ``off_domain``(도메인 부적합).
+       읽을 수 있는데 보험 문서 단서가 없다는 뜻이다(``classify.is_body_evidenced``).
+    4. 그 외 → ``missing_required``. 보험 문서는 인식했지만 필수 유형이 빠졌다(1번이 아니면
+       ``missing``이 참이다).
+
+    Args:
+        docs: 처리에 성공한 청구 문서들(``fetch_claim_documents``).
+        incomplete: 성공한 문서 수가 청구 문서 수보다 적은가.
+
+    Returns:
+        재업로드 사유.
+    """
+    if incomplete or any(doc.ocr_quality == "needs_reupload" for doc in docs):
+        return "unreadable"
+    if not any(is_body_evidenced(doc.doc_type, doc.doc_type_confidence) for doc in docs):
+        return "off_domain"
+    return "missing_required"
 
 
 def _derive_report_id(ocr_result_id: str) -> str:
@@ -1379,7 +1412,7 @@ class OcrPipeline:
         막히는 조건은 둘이다(합집합):
         - ``missing``: 필수 유형(보험증권·진단서)이 성공한 문서들 중에 없다. 오분류일
           수도, 그 유형의 문서가 아래 ``incomplete``로 실패한 것일 수도 있다 — 여기선
-          구분하지 않는다(``fetch_claim_documents``는 doc_type만 보고, 실패 원인은
+          구분하지 않는다(``fetch_claim_documents``는 유형·신뢰도·품질만 보고, 실패 원인은
           ``ai.ocr_job_failures``가 별도로 갖고 있다).
         - ``incomplete``(``len(docs) < doc_total``): 업로드된 문서 수보다 성공한 문서
           수가 적다 — 필수·비필수 안 가리고, 하나라도 결정적 실패(또는 재시도 소진)로
@@ -1391,6 +1424,13 @@ class OcrPipeline:
         발행한다(``_publish_needs_reupload``) — report_worker의 기존 스킵·통지 로직
         (``reports.status='NEEDS_REUPLOAD'``)을 그대로 태운다. ``claim_readiness``에
         ``blocked``로 남기는 건 운영 조회용 기록이지 더 이상 "발행 안 함"을 뜻하지 않는다.
+        사용자에게 안내할 대표 사유는 ``reupload_reason``에 남긴다(``_blocked_reason``, Backend가
+        읽는다). 저품질 문서가 섞여 대표 ``ReportJob``이 ``needs_reupload``로 나가는 published
+        경로도 사유(``unreadable``)를 남긴다.
+
+        본문 단서로 유형을 판정한 문서 없이(업로드 칸 유형으로만 필수 유형이 채워져) 발행되는
+        청구는 막지 않고 ``claim_published_without_body_evidence``로만 남긴다(위
+        ``_REQUIRED_DOC_TYPES`` 주석 참고).
 
         멱등하다: 재개로 두 번 불려도 ``blocked``/``published``는 같은 값으로 다시
         찍히고, 발행은 같은 ``report_id``라 다운스트림이 중복을 흡수한다.
@@ -1403,9 +1443,13 @@ class OcrPipeline:
         incomplete = len(docs) < claim.doc_total
         if missing or incomplete:
             missing_types = sorted(doc_type.value for doc_type in missing)
+            reason = _blocked_reason(docs, incomplete=incomplete)
             # 발행 **전에** 도장을 찍는다 — published 경로와 같은 이유(아래 참고).
             await mark_claim_blocked(
-                self._pool, claim_id=claim.claim_id, missing_doc_types=missing_types
+                self._pool,
+                claim_id=claim.claim_id,
+                missing_doc_types=missing_types,
+                reupload_reason=reason,
             )
             # 운영·사용자 안내 신호: 필수 문서를 "안 올린" 게 아니라 **못 읽은** 상태거나
             # (missing), 업로드된 문서 중 일부가 결정적 실패로 사라진 상태다(incomplete).
@@ -1415,18 +1459,32 @@ class OcrPipeline:
                 claim_id=claim.claim_id,
                 missing=missing_types,
                 incomplete=incomplete,
+                reupload_reason=reason,
                 recognized_docs=len(docs),
                 doc_total=claim.doc_total,
             )
             await self._publish_needs_reupload(job, claim, docs)
             return
 
+        if not any(is_body_evidenced(doc.doc_type, doc.doc_type_confidence) for doc in docs):
+            # 필수 유형이 업로드 칸 유형으로만 채워졌다 — 막지 않고 규모만 잰다
+            # (_REQUIRED_DOC_TYPES 주석의 트레이드오프). 유형 값만 남긴다(PII 없음).
+            logger.warning(
+                "claim_published_without_body_evidence",
+                claim_id=claim.claim_id,
+                doc_types=[doc.doc_type.value for doc in docs],
+                doc_total=claim.doc_total,
+            )
         # 발행 **전에** 도장을 찍는다 — 발행 후 crash로 ack를 못 하면 재전달되는데,
         # 그때 멱등 단락이 이 상태를 보고 같은 report_id로 안전망 재발행을 한다.
         # 순서가 뒤집히면(발행 후 기록) 발행 직후~기록 전에 죽었을 때 상태가 pending으로
         # 남아 재개 경로가 **한 번 더 발행**하게 되고, 기록이 끝내 실패하면 그 청구는
-        # 재전달마다 리포트를 다시 낸다.
-        await mark_claim_published(self._pool, claim.claim_id)
+        # 재전달마다 리포트를 다시 낸다. 저품질 문서가 섞이면 대표 ReportJob이
+        # needs_reupload로 나가므로(_publish_claim_report) 그 사유를 함께 남긴다.
+        low_quality = any(doc.ocr_quality == "needs_reupload" for doc in docs)
+        await mark_claim_published(
+            self._pool, claim.claim_id, reupload_reason="unreadable" if low_quality else None
+        )
         await self._publish_claim_report(job, docs)
 
     async def _publish_needs_reupload(

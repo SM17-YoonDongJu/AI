@@ -4,12 +4,18 @@ DocType별 대표 샘플로 정확도, OTHER 폴백, hint 타이브레이커를 
 AAA 구조이며 테스트 본문에 분기·반복을 두지 않는다.
 """
 
+import struct
+
+import pytest
+
 from core.contracts import DocType
 from ocr_worker.classify import (
     CONFIDENCE_THRESHOLD,
     HINT_ONLY_CONFIDENCE,
+    TIEBREAK_CONFIDENCE,
     ClassifyResult,
     classify,
+    is_body_evidenced,
 )
 
 # ── 유형별 정확도 ────────────────────────────────────────────────
@@ -190,3 +196,42 @@ def test_returns_classify_result_dataclass() -> None:
     # Assert
     assert isinstance(result, ClassifyResult)
     assert 0.0 <= result.confidence <= 1.0
+
+
+# ── 본문 근거 판정(is_body_evidenced) ────────────────────────────
+def _as_real(value: float) -> float:
+    """``ai.ocr_results.doc_type_confidence``(real)에 저장했다 읽은 값(float32 반올림)."""
+    return struct.unpack("f", struct.pack("f", value))[0]
+
+
+@pytest.mark.parametrize(
+    ("doc_type", "confidence", "expected"),
+    [
+        (DocType.DIAGNOSIS, 0.833, True),  # 본문 단서로 확신
+        (DocType.POLICY, TIEBREAK_CONFIDENCE, True),  # hint가 본문 후보와 맞아 동률을 깸
+        (DocType.DIAGNOSIS, HINT_ONLY_CONFIDENCE, False),  # 본문 근거 없이 hint만 채택
+        # real에서 읽으면 0.3이 0.30000001이 된다 — 동등 비교였다면 본문 근거로 잘못 셌다
+        (DocType.DIAGNOSIS, _as_real(HINT_ONLY_CONFIDENCE), False),
+        (DocType.OTHER, 0.9, False),  # OTHER는 신뢰도와 무관하게 근거가 아니다
+    ],
+)
+def test_is_body_evidenced_separates_hint_only_types(
+    doc_type: DocType, confidence: float, expected: bool
+) -> None:
+    assert is_body_evidenced(doc_type, confidence) is expected
+
+
+def test_off_domain_text_in_a_typed_upload_slot_is_not_body_evidenced() -> None:
+    # Arrange: 보험과 무관한 글을 "진단서" 칸에 올렸다 — 분류는 칸의 유형을 그대로 채택한다
+    result = classify("오늘 점심 메뉴는 김치찌개와 제육볶음입니다", hint="diagnosis")
+
+    # Act / Assert: 유형은 진단서로 잡히지만 본문 근거는 없다
+    assert result.doc_type is DocType.DIAGNOSIS
+    assert is_body_evidenced(result.doc_type, _as_real(result.confidence)) is False
+
+
+def test_real_diagnosis_text_is_body_evidenced() -> None:
+    result = classify("진단서 병명 요추 염좌 질병분류기호 S33.5 발병일", hint="policy")
+
+    assert result.doc_type is DocType.DIAGNOSIS
+    assert is_body_evidenced(result.doc_type, _as_real(result.confidence)) is True

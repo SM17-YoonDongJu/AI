@@ -155,6 +155,8 @@ aws --endpoint-url http://localhost:4566 sqs send-message \
 | 필수 유형 충족 | `pending` → `published` | `ReportJob(ocr_quality=ok)` | 리포트 생성 |
 | 필수 유형 누락·인식 불완전 | `pending` → `blocked` | `ReportJob(ocr_quality=needs_reupload)` | `reports.status = NEEDS_REUPLOAD` |
 
+재업로드로 보낼 때는 사유(`unreadable`·`off_domain`·`missing_required`)를 `claim_readiness.reupload_reason`에 남긴다. Spring이 읽어 사유별 안내 문구를 고른다([contracts.md §4-2](.claude/docs/contracts.md)).
+
 **실패 처리**: DLQ는 쓰지 않는다. 결정적 실패(`NonRetryableError`: 마스킹 잔류, 디코드 실패)는 첫 시도에서 바로 ack하고 종결한다. 일시 실패는 재전달되며, 수신 횟수 상한을 넘기면 poison으로 스킵한다. 모든 실패는 `ai.ocr_job_failures` 저널에 기록되므로 실패가 조용히 사라지지 않는다.
 
 상세: [.claude/docs/contracts.md](.claude/docs/contracts.md) · [docs/architecture/lifecycle.md](docs/architecture/lifecycle.md)

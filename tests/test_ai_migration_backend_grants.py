@@ -23,6 +23,7 @@ _BACKEND_GRANTS = {
     "008_ocr_job_failures.sql": "ai.ocr_job_failures",
     "011_ocr_results_app_owner_readonly.sql": "ai.ocr_results",
     "012_report_job_failures.sql": "ai.report_job_failures",
+    "013_claim_readiness_reupload_reason.sql": "ai.claim_readiness",
 }
 
 
