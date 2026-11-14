@@ -565,6 +565,20 @@ AI 트래픽이 거의 없고(2026-11-12 기준 `ocr_results` 4건), 샘플을 d
 - 권장 순서: dev에서 먼저 켠다 → `verify`의 `engine` 분포와 `ocr.verify.shadow`를 본다 → prod에 켠다
 - OCR 시간 SLO는 여전히 미달이다. `fast` 문서도 비VLM 60~76초이고, 남은 대부분은 OCR 엔진 자체(30~50초)다
 
+**dev 적용 — 2026-11-14 (K8s-manifests #84)**
+
+- `envs/dev/ocr-worker.values.yaml`에 `OCR_VERIFY_DET_MODEL: PP-OCRv5_mobile_det`를 넣었다. Argo CD가 반영했고 파드도 다시 떴다
+- 확인 방법: 시연용 서류 2장(가입 내역 확인서·진단서)을 Backend(`brbosang.com/api`, dev-login 테스트 계정)로 올렸다
+
+| 문서 | 신뢰도 | 재판독 | 엔진 | `verify` | 섀도 | 문서 시간 |
+|---|---|---|---|---|---|---|
+| 가입 내역 확인서 | 0.992 | 대상 아님 | fast | 8.1초(모바일 엔진 첫 로드 포함) | 일치, 잔류 0 | 64.8초(재시작 직후 첫 작업) |
+| 진단서 | 0.878 | 28/28 | fast | 6.4초 | 일치, 잔류 0 | 41.8초 |
+
+- 끝에서 끝까지(리포트 완료)는 4분 12초다. 같은 서류로 적용 전에 돌렸을 때는 4분 30초였다
+- OCR 2장은 132초에서 110초로 줄었다. 리포트 생성(약 2분 20초)은 Claude 시간이라 변화가 없다
+- 다음: dev 트래픽에서 `engine` 분포와 섀도 판정을 며칠 본 뒤 prod에 적용할지 정한다
+
 ## 7. 로컬 벤치 환경 메모
 
 - **리포트**: `run_experiments.py`의 4시나리오를 쓴다. 다만 `tempVectorDB/init/02_app_tables.sql`이
