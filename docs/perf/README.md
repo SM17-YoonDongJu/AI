@@ -243,7 +243,8 @@ AI 트래픽이 거의 없고(2026-11-12 기준 `ocr_results` 4건), 샘플을 d
 **갱신(2026-11-13, O3c — §6)**
 - O3b 단독은 기각했다. 조건부 O3c는 VLM 켬에서 `fast` 문서의 `verify`를 −69%, 비VLM 문서 시간을 −25% 줄였다. 판정은 10/10 같다
 - 그래도 비VLM 60~76초라 SLO에는 못 미친다. 남은 대부분은 OCR 엔진 자체다
-- VLM을 켜고 연속 처리하면 OOMKilled되는 위험이 새로 확인됐다(M2)
+- ~~VLM을 켜고 연속 처리하면 OOMKilled되는 위험이 새로 확인됐다(M2)~~
+- 11-14 정정: 원인은 dev 노드 과할당에 따른 노드 OOM이었다. 컨테이너 상한 초과는 관측되지 않았다(§6 O3c)
 
 ### 리포트 — 확정 (2026-11-12) · **달성**
 
@@ -291,7 +292,7 @@ AI 트래픽이 거의 없고(2026-11-12 기준 `ocr_results` 4건), 샘플을 d
 | **O1** | NER이 같은 줄을 문서당 4번 돌고 배치도 안 된다(**B0: 14%, 빽빽한 문서 25%**) | 줄 단위 결과 재사용 + `batch_size` | `analyze`·`quality_check`·`redact`·`vlm_pages` + 지문 동일 | 없음 |
 | O2 | `quality_check` NER이 이벤트 루프를 막는다 | O1에 포함(결과 재사용) | `quality_check` | 없음 |
 | **M1** | 메모리 최고치가 상한의 98%다(B0) — 재OCR·NER 모델이 OCR 최고점 위에 얹힌다 | O3·O1 이후 재측정, 필요하면 검출 상한·모델 적재 조정 | `memory.peak` | 없음 |
-| **M2** | VLM 켬 연속 처리에서 OOMKilled(24개 실행 2회 모두). 단독 문서는 3.6GB로 통과 — 빽빽한 문서 뒤 최고점 + RSS 밖 메모리가 겹친다고 추정. 검출 입력 상한도 남은 손잡이 | cgroup `memory.current`·`memory.stat` 추적으로 원인 확인 → O3c 켬(검증 최고점 −200~430MiB)·검출 상한(정확도 평가 필요) | 컨테이너 최고 메모리, 연속 24개 완주 | 없음 |
+| **M2** | ~~VLM 켬 연속 처리 OOM~~ → **11-14 정정: dev 노드 과할당에 따른 노드 OOM(`SystemOOM`)**. 컨테이너는 상한(4608Mi)에 닿지 않았다. 문서 하나의 최고점은 VLM 끔 4,100MiB·VLM 켬 3,846MiB(SLO 3,900 초과 문서가 있다) | O3c 켬(검증 최고점 −200~430MiB) · dev 노드 용량·배치 조정(인프라) · 검출 상한(정확도 평가 필요) | 문서별 최고 RSS, 노드 `availableBytes`, `SystemOOM` 이벤트 | 없음 |
 | G1 | 오타보정이 trigram 인덱스를 못 타고 토큰마다 DB를 순차 왕복한다 | `%` 연산자 + `unnest` 일괄 조회 | RAG 노드 ms | 없음 |
 | G2 | prod HNSW(4.4GB)가 RDS 메모리(2GB)보다 커 벡터 검색이 디스크를 읽는다(파라미터 그룹은 11-12 `default.postgres16`으로 해소) | 인스턴스 클래스·인덱스 크기(halfvec·부분 인덱스) 검토(인프라) | RAG 노드 ms·`EXPLAIN (ANALYZE, BUFFERS)` | 없음 |
 
@@ -534,6 +535,23 @@ AI 트래픽이 거의 없고(2026-11-12 기준 `ocr_results` 4건), 샘플을 d
 - 문서마다 반납 뒤 RSS는 1.4~1.5GB로 일정했다. 누수라기보다는 빽빽한 문서를 처리한 뒤의 최고점과 RSS 밖 메모리가 겹친 것으로 추정한다
 - 운영 워커는 오래 실행되고, VLM을 켜고, 상한이 같은 4608Mi다. 같은 일이 생길 수 있다
 
+**정정(2026-11-14): 컨테이너 상한이 아니라 노드 전체의 OOM(`SystemOOM`)이었다**
+
+- 원인을 보려고 cgroup `memory.stat`·`memory.events`를 0.5초 간격으로 남기며 다시 돌렸다. 그러자 VLM 없이 문서 한 장
+  (`무료진료비계산서` PDF)만 돌려도 48초 만에 OOMKilled됐다. 이미지 `cf59a73`·`a7dc4d1` 모두 같았다
+- 죽기 직전 컨테이너 사용량은 2,898~2,905MiB였다. `memory.events`의 `max=0`·`oom_kill=0`이라 **컨테이너 상한(4608Mi)에 닿은 적이 없다**
+- 노드 이벤트는 `SystemOOM encountered, victim process: python`(7분 동안 3회)였다
+- 벤치 노드 `ip-10-0-137-77`(8GB)에는 dev backend·ocr-worker·report·corpus-worker·argocd·모니터링이 함께 있다. 메모리 limit
+  합은 184%로 과할당돼 있고, 남은 메모리는 2.86GB였다. 벤치는 정확히 그 지점에서 죽었다
+- 11-13의 두 번도 같은 원인으로 본다. 컨테이너 최고는 3.1~3.8GB로 상한보다 낮았는데 죽었다. 그날 노드 여유가 지금보다 조금 컸을 뿐이다
+- 결론
+  - "VLM 켬 연속 처리가 4.6GB를 넘는다"는 근거는 없다
+  - 문서 하나의 최고점은 VLM 끔 4,100MiB(B1), VLM 켬 3,846MiB까지 관측됐고, 모두 상한 안이다
+- **실제 위험은 dev 노드 용량이다**
+  - dev ocr-worker는 request 2Gi·limit 4608Mi다. 그런데 노드에 실제로 남은 메모리는 자기 사용분 1.6GB를 합쳐도 약 4.4GB다
+  - 빽빽한 문서를 처리하면 노드 OOM이 나서 ocr-worker나 backend가 죽을 수 있다. `brbosang.com`이 dev backend를 쓴다
+  - prod OCR은 전용 EC2(`mem_limit 4608m`)라 해당하지 않는다
+
 **남은 위험**
 
 - 평균 신뢰도가 높은 문서는 재판독 대상이 아니다. 그래서 1차 보강 없이 가벼운 검증만 받는다. 평균은 높은데 한 줄만
@@ -557,8 +575,15 @@ AI 트래픽이 거의 없고(2026-11-12 기준 `ocr_results` 4건), 샘플을 d
   파드 안에서 `nohup python -u scripts/perf/ocr_bench.py ... &`로 실행한다(SSM 터널이 끊겨도 측정은
   계속된다). macOS `tar`는 기본으로 `._*` AppleDouble 파일을 넣으니 반드시 `COPYFILE_DISABLE=1`.
   끝나면 결과를 `kubectl cp`로 가져오고 파드를 지운다.
+- **벤치 노드 여유 메모리(2026-11-14 교훈)**
+  - `ip-10-0-137-77`은 과할당 노드다. 벤치가 쓸 수 있는 메모리는 컨테이너 limit(4608Mi)이 아니라 **노드에 남은 메모리**다
+    (11-14 기준 약 2.9GB)
+  - 넘으면 `SystemOOM`이 나고, 커널이 고르는 희생자는 벤치가 아닐 수도 있다(dev backend·ocr-worker)
+  - 벤치 전에 `kubectl get --raw /api/v1/nodes/<노드>/proxy/stats/summary`로 `availableBytes`를 확인한다
+  - 끝난 뒤에는 `kubectl get events -A | grep SystemOOM`로 노드 OOM이 없었는지 확인한다
+  - 메모리 최고치 측정은 여유가 있는 노드에서 한다
 - **VLM 켬 벤치(2026-11-13 교훈)**
-  - 24개를 한 프로세스로 돌리면 OOMKilled된다. 문서마다 새 프로세스로 돌린다
+  - 24개를 한 프로세스로 돌리면 OOMKilled된다. 문서마다 새 프로세스로 돌린다. (11-14 정정: 원인은 노드 OOM이다. 위 항목 참고)
   - 결과는 파드 밖으로 계속 받아 둔다. 파드가 OOM이나 `activeDeadlineSeconds`로 끝나면 `/tmp`도 함께 사라진다
   - 받아 둘 때 `cat > file`처럼 덮어쓰지 않는다. 파드가 죽는 순간 빈 파일로 덮인다. 추가 쓰기로 스트리밍하거나 임시 파일에 쓴 뒤 옮긴다
   - SSM 터널·SSO 수명(약 2시간)보다 긴 측정은 중간에 결과를 회수한다
