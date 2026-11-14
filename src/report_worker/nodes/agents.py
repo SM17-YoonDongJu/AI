@@ -568,7 +568,22 @@ async def load_context(state: ReportState) -> dict[str, Any]:
 # ── 입력 가드레일 ──────────────────────────────────────────────
 @safe_node
 async def input_guardrail(state: ReportState) -> dict[str, Any]:
-    g = await guardrail.guard_input(state.get("masked_text", ""))
+    """문서 본문(`masked_text`)은 마스킹하고, 도메인 검사는 사용자가 쓴 글에만 건다.
+
+    보험증권에는 거의 항상 "○○보험 주식회사"가 찍혀 있다. 청구 문서를 이은 본문에 도메인
+    검사를 걸면 실사용 리포트 대부분이 "보험·법률 외 질문(주식)"으로 막힌다(#103). 질문에는 키워드
+    검사를, 사고 경위·추가 정보에는 서술용 검사를 건다. 서술에는 "요리하다가 데었다"처럼 키워드가
+    정상적으로 들어가서 키워드만으로는 막지 않는다(`guardrail.guard_input` 참고).
+
+    세 값은 load_context가 mask_pii를 거친 값이다. 마스킹에 실패해 None으로 비운 필드는 검사도
+    건너뛴다. 그 필드는 LLM으로도 나가지 않는다.
+    """
+    case_info = state.get("case_info") or {}
+    g = await guardrail.guard_input(
+        state.get("masked_text", ""),
+        question=case_info.get("question"),
+        narratives=(case_info.get("description"), case_info.get("additional_information")),
+    )
     out: dict[str, Any] = {"masked_text": g.masked_text}
     if g.blocked:
         out["errors"] = _err(state, f"input_blocked:{g.reason}")

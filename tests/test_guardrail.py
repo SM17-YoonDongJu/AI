@@ -55,17 +55,133 @@ def test_mask_pii_preserves_rrn_front6_and_masks_rest() -> None:
     assert "110-234-567890" not in masked  # 계좌 마스킹
 
 
-async def test_guard_input_blocks_off_domain() -> None:
-    result = await guard_input("비트코인 시세랑 부동산 투자 문의입니다.")
+async def test_guard_input_blocks_off_domain_question() -> None:
+    result = await guard_input(
+        "", question="비트코인 시세랑 부동산 투자 문의입니다.", narratives=()
+    )
     assert isinstance(result, InputGuardResult)
     assert result.blocked is True
-    assert result.reason is not None
+    assert result.reason == "보험·법률 외 질문(부동산)"
 
 
 async def test_guard_input_allows_domain_and_masks() -> None:
-    result = await guard_input("진단명 경추 염좌, 환자 860312-1948571")
+    result = await guard_input(
+        "진단명 경추 염좌, 환자 860312-1948571", question=None, narratives=()
+    )
     assert result.blocked is False
     assert "860312-*******" in result.masked_text
+
+
+# ── guard_input: 도메인 검사 대상 (#103) ─────────────────────────
+# 실제 증권·진단서처럼 키워드가 정상적으로 들어간 문서 본문(가상 보험사).
+_DOCUMENT_WITH_KEYWORDS = (
+    "--- 문서 1: 보험증권 ---\n누리손해보험 주식회사 누리화재보험 담보: 부동산 화재손해\n\n"
+    "--- 문서 2: 진단서 ---\n병명: 손목 2도 화상 발병 경위: 요리 중 끓는 물에 데임"
+)
+
+
+async def test_guard_input_skips_domain_check_on_document_text() -> None:
+    result = await guard_input(_DOCUMENT_WITH_KEYWORDS, question=None, narratives=())
+    assert result.blocked is False
+    assert result.reason is None
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "누리손해보험 주식회사에서 보험금을 덜 받았어요",
+        "누리손해보험 주식 회사에 청구했습니다",
+        # 회사 표기를 공백 대신 빈 문자열로 지우면 "에코인천"이 되어 "코인"이 생긴다.
+        "에코주식회사인천지점 직원인데 출장 중에 다쳤어요",
+    ],
+)
+async def test_guard_input_ignores_company_designation_in_question(question: str) -> None:
+    result = await guard_input("", question=question, narratives=())
+    assert result.blocked is False
+
+
+async def test_guard_input_blocks_stock_question_next_to_company_name() -> None:
+    result = await guard_input(
+        "", question="누리손해보험 주식회사 주식을 사도 될까요?", narratives=()
+    )
+    assert result.blocked is True
+    assert result.reason == "보험·법률 외 질문(주식)"
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"narratives": ()}, {"question": None}],
+    ids=["question-missing", "narratives-missing"],
+)
+async def test_guard_input_requires_both_check_targets(kwargs: dict) -> None:
+    # 검사 대상을 빠뜨린 호출이 그 검사를 조용히 잃지 않고 드러나야 한다.
+    with pytest.raises(TypeError):
+        await guard_input("문서 본문", **kwargs)
+
+
+# ── guard_input: 사실 서술(사고 경위·추가 정보) 검사 ─────────────────
+# 서술은 세 조건이 다 맞을 때만 막는다: 도메인 밖 용건 표현, 묻거나 부탁하는 말, 사안 표시 없음.
+@pytest.mark.parametrize(
+    ("narrative", "reason"),
+    [
+        ("주식 투자 어떻게 하나요?", "보험·법률 외 내용(주식 투자)"),
+        ("비트코인 시세 전망 알려주세요", "보험·법률 외 내용(비트코인 시세)"),
+        ("맛있는 요리 레시피 추천해 주세요", "보험·법률 외 내용(요리 레시피)"),
+        ("게임 공략 좀 알려주세요", "보험·법률 외 내용(게임 공략)"),
+        ("연애 상담 받고 싶어요", "보험·법률 외 내용(연애 상담)"),
+    ],
+)
+async def test_guard_input_blocks_off_domain_request_in_narrative(
+    narrative: str, reason: str
+) -> None:
+    result = await guard_input("", question=None, narratives=(None, narrative))
+    assert result.blocked is True
+    assert result.reason == reason
+
+
+@pytest.mark.parametrize(
+    "narrative",
+    [
+        "취미는 요리와 게임인데 이것도 적어야 하나요?",
+        "코인노래방에서 친구들과 노래를 불렀는데 이것도 알려드려야 하나요?",
+        "연애 6년 만에 결혼했는데 배우자 정보도 필요한가요?",
+        # 회사 표기를 빼지 않으면 "주식 회사 투자"가 용건 표현이 된다.
+        "누리캐피탈 주식회사 투자팀 소속인데 이것도 적어야 하나요?",
+    ],
+)
+async def test_guard_input_allows_keyword_alone_in_narrative(narrative: str) -> None:
+    # 묻는 말이 있어도 키워드가 활동·장소·소속으로만 쓰였으면 통과한다
+    result = await guard_input("", question=None, narratives=(narrative,))
+    assert result.blocked is False
+
+
+@pytest.mark.parametrize(
+    "narrative",
+    [
+        "연애 상담사로 일하고 있습니다.",
+        "평소 코인 시세를 자주 확인하는 편입니다.",
+        "게임 공략 방송을 하는 스트리머입니다.",
+        "주식 투자를 부업으로 하고 있습니다.",
+    ],
+)
+async def test_guard_input_allows_off_domain_phrase_in_plain_statement(narrative: str) -> None:
+    # 용건 표현이 있어도 사실만 적은 문장(직업·습관)은 요청이 아니라서 통과한다
+    result = await guard_input("", question=None, narratives=(narrative,))
+    assert result.blocked is False
+
+
+@pytest.mark.parametrize(
+    "narrative",
+    [
+        "주식 시세를 확인하며 운전하다가 앞차를 추돌했는데 어떻게 하나요?",
+        "코인 투자 손실로 스트레스성 위궤양 진단을 받았는데 궁금한 게 있어요.",
+        "부동산 시세 3억 원짜리 건물이 화재로 탔는데 어떻게 해야 하나요?",
+    ],
+)
+async def test_guard_input_allows_off_domain_request_with_insurance_context(narrative: str) -> None:
+    # 용건 표현과 묻는 말이 있어도 사고·진단·화재 얘기가 있으면 보험 사안이라 통과한다
+    result = await guard_input("", question=None, narratives=(narrative,))
+    assert result.blocked is False
 
 
 def test_guard_generation_softens_absolute_amount() -> None:

@@ -132,7 +132,7 @@ load_context → input_guardrail →⟨차단?⟩→ persist_blocked → END
 이걸 합쳐 `case_info`·`masked_text`·`entities`·`subscribed_coverages`를 만든다. `enrolled_at`(가입일)은 나중에 "김씨 계약 시점에 유효했던 장해분류표 판(version)"을 고르는 열쇠가 된다.
 > OCR 결과가 비면 `errors`에 `ocr_result_missing`을 남긴다 — 이건 뒤에서 "재시도해야 할 하드 실패"로 취급된다.
 
-**② `input_guardrail` — 입구 검문.** 마스킹 텍스트를 한 번 더 가리고(재마스킹), 보험·법률과 무관한 내용이면 차단한다(`agents.py:123-129`). 김씨 진단서는 통과.
+**② `input_guardrail` — 입구 검문.** 마스킹 텍스트를 한 번 더 가리고(재마스킹), 사용자가 직접 쓴 글이 보험·법률과 무관하면 차단한다. 질문은 도메인 밖 키워드가 있으면, 사고 경위·추가 정보는 사고 얘기 없이 "코인 시세 알려주세요"처럼 도메인 밖 용건을 묻거나 부탁하면 막는다. 서류 본문은 차단 기준으로 쓰지 않는다. 증권의 "○○보험 주식회사" 같은 회사 이름이나 "요리하다가 데었다" 같은 사고 경위에 키워드가 정상적으로 섞여 있어서다(2026-11-14, #103). 김씨 진단서는 통과.
 - 만약 차단되면 갈림길 `route_after_input`이 `blocked`을 반환해 **뒤의 LLM 단계를 전부 건너뛰고** `persist_blocked`로 직행한다. 비용·오출력을 막고, 상태가 "처리중"에 영원히 갇히는 것을 막기 위함이다.
 
 **③ `diagnosis` — 진단 분석(LLM).** 마스킹 텍스트를 LLM에 주고 진단명·ICD·사고유형(7종 중 하나)·**후유장해 검토 필요 여부**(`requires_disability_review`)를 JSON으로 뽑는다(`agents.py:136-167`). 김씨는 `accident_type=traffic`, `requires_disability_review=true`로 판정된다. 이 true 값이 나중 갈림길을 가른다.
@@ -215,7 +215,7 @@ UPDATE reports SET status = 'BLOCKED', updated_at = now() WHERE id = $1
 | 노드 | 읽는 키 | 추가/갱신하는 키 | 부수효과 |
 |------|---------|------------------|----------|
 | `load_context` | `ocr_result_id`, `report_id` | `case_info`, `masked_text`, `entities`, `subscribed_coverages`, `errors` | DB 4쿼리. errors: `ocr_result_missing` |
-| `input_guardrail` | `masked_text` | `masked_text`, (차단시)`errors` | 가드레일 `guard_input`. errors: `input_blocked:{reason}` |
+| `input_guardrail` | `masked_text`, `case_info`(질문·사고 경위·추가 정보) | `masked_text`, (차단시)`errors` | 가드레일 `guard_input`(마스킹=문서 본문, 도메인 검사=질문은 키워드·서술은 용건 요청). errors: `input_blocked:{reason}` |
 | `diagnosis` | `masked_text`, `case_info` | `diagnosis`, (실패시)`errors` | LLM. errors: `diagnosis_llm_failed` |
 | `coverage_analysis` | `case_info`, `diagnosis`, `subscribed_coverages` | `retrieved_clauses`, `applicable_coverages`, `missing_coverages`, `coverage_analysis` | RAG(`terms`) + LLM. errors: `rag_empty` |
 | `case_search` | `case_info`, `diagnosis` | `legal_references` | RAG(`case`). errors: `case_data_missing` |
