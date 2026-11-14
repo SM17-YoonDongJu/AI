@@ -138,6 +138,17 @@ class Settings(BaseSettings):
     ocr_det_model: str = "PP-OCRv5_server_det"
     # 인식 — 한국어 전용 인식 모델은 mobile 하나뿐이다(한국어+영어+숫자, 공식 정확도 88.0%).
     ocr_rec_model: str = "korean_PP-OCRv5_mobile_rec"
+    # 원본 삭제 게이트의 재OCR 검증(5.2)에만 쓸 검출 모델(성능 실험 O3b, docs/perf). 비우면 메인
+    # 엔진을 그대로 쓴다. 재OCR의 가치는 "다르게 한 번 더 읽기"라(섀도 비교에서 첫 OCR의 오독을
+    # 재OCR만 잡았다), 가벼운 모델로 다르게 읽으면 검증 시간(문서 시간의 약 50%)을 줄일 수 있다는
+    # 가설을 재는 손잡이다. 예: PP-OCRv5_mobile_det. 인식 모델·스레드·상한 등은 메인과 같다.
+    ocr_verify_det_model: str | None = None
+    # 가벼운 검증 모델(ocr_verify_det_model)을 쓰는 조건(성능 실험 O3c). True면 VLM 재판독이라는 1차
+    # 방어선이 제 몫을 한 문서에만 쓴다 — 재판독이 필요 없던 고신뢰 문서, 또는 저신뢰 라인을 모두
+    # 다시 읽은 문서. 재판독이 실패·예산 초과·빈 응답으로 비면 메인 엔진으로 검증한다(VLM이 꺼진
+    # 날엔 재OCR이 마지막 방어선이다 — 사진 문서 주민번호 누락을 메인 재OCR만 잡았다). False면 항상
+    # 가벼운 모델(O3b — 안전 기준 미달로 기각된 방식이라 실험용).
+    ocr_verify_fast_requires_reread: bool = True
     # 줄 방향 분류(뒤집힌 줄 crop을 바로 세워 인식). 줄 crop만 돌리므로 좌표엔 영향이 없다.
     # 쪽 방향 분류·왜곡 보정은 좌표를 원본 쪽과 어긋나게 해 엔진이 항상 끈다(설정으로 두지 않는다).
     ocr_textline_orientation: bool = True
