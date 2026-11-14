@@ -13,9 +13,11 @@
 """
 
 import json
+import re
 import uuid
 from datetime import UTC, datetime
-from typing import Any
+from pathlib import Path
+from typing import Any, get_args
 
 import pytest
 
@@ -27,6 +29,7 @@ from ocr_worker.repository import (
     ClaimReadiness,
     OcrResultRecord,
     PendingDeletion,
+    ReuploadReason,
     build_masked_lines,
     clear_job_failure,
     fetch_claim_documents,
@@ -695,8 +698,18 @@ async def test_fetch_claim_documents_maps_rows_in_doc_index_order() -> None:
     pool = FakePool(
         None,
         rows=[
-            {"id": policy_id, "doc_type": "policy", "ocr_quality": "ok"},
-            {"id": diagnosis_id, "doc_type": "diagnosis", "ocr_quality": "needs_reupload"},
+            {
+                "id": policy_id,
+                "doc_type": "policy",
+                "doc_type_confidence": 0.857,
+                "ocr_quality": "ok",
+            },
+            {
+                "id": diagnosis_id,
+                "doc_type": "diagnosis",
+                "doc_type_confidence": 0.30000001192092896,  # real 컬럼에서 읽은 0.3
+                "ocr_quality": "needs_reupload",
+            },
         ],
     )
 
@@ -705,19 +718,46 @@ async def test_fetch_claim_documents_maps_rows_in_doc_index_order() -> None:
 
     # Assert
     assert docs == [
-        ClaimDocument(ocr_result_id=str(policy_id), doc_type=DocType.POLICY, ocr_quality="ok"),
+        ClaimDocument(
+            ocr_result_id=str(policy_id),
+            doc_type=DocType.POLICY,
+            doc_type_confidence=0.857,
+            ocr_quality="ok",
+        ),
         ClaimDocument(
             ocr_result_id=str(diagnosis_id),
             doc_type=DocType.DIAGNOSIS,
+            doc_type_confidence=0.30000001192092896,
             ocr_quality="needs_reupload",
         ),
     ]
     sql, args = pool.calls[0]
     assert args == (_CLAIM_ID,)
     assert "FROM ai.ocr_results" in sql
+    # 페이크 행은 키를 다 갖고 있어 SELECT에서 빠져도 통과한다 — 운영에서는 판정마다 KeyError다
+    assert "doc_type_confidence" in sql
     # doc_index는 nullable(단독 문서 호환)이라 NULL이 앞으로 튀어나오면 대표 문서 선택이
     # 뒤집힌다 — 뒤로 밀고 그 안에서는 저장 순서로 안정 정렬한다.
     assert "ORDER BY doc_index NULLS LAST, created_at" in sql
+
+
+async def test_fetch_claim_documents_reads_null_confidence_as_no_evidence() -> None:
+    # prod ai.ocr_results는 Backend V1 테이블을 옮겨 온 것이라 NOT NULL이 보장되지 않는다
+    pool = FakePool(
+        None,
+        rows=[
+            {
+                "id": uuid.uuid4(),
+                "doc_type": "policy",
+                "doc_type_confidence": None,
+                "ocr_quality": "ok",
+            }
+        ],
+    )
+
+    docs = await fetch_claim_documents(pool, _CLAIM_ID)  # type: ignore[arg-type]
+
+    assert docs[0].doc_type_confidence == 0.0
 
 
 async def test_fetch_claim_documents_returns_empty_when_all_documents_failed() -> None:
@@ -737,6 +777,7 @@ async def test_mark_claim_blocked_records_missing_types_and_judged_at() -> None:
         pool,  # type: ignore[arg-type]
         claim_id=_CLAIM_ID,
         missing_doc_types=["diagnosis", "policy"],
+        reupload_reason="off_domain",
     )
 
     # Assert: 빠진 유형은 사용자 안내("그 문서를 다시 촬영") 근거라 반드시 남아야 한다.
@@ -744,7 +785,8 @@ async def test_mark_claim_blocked_records_missing_types_and_judged_at() -> None:
     assert "UPDATE ai.claim_readiness" in sql
     assert "status = 'blocked'" in sql
     assert "judged_at = now()" in sql  # 시각은 DB 기준(앱-DB 시계 스큐 회피)
-    assert args == (_CLAIM_ID, ["diagnosis", "policy"])
+    assert "reupload_reason = $3" in sql
+    assert args == (_CLAIM_ID, ["diagnosis", "policy"], "off_domain")
 
 
 async def test_mark_claim_published_stamps_status() -> None:
@@ -752,13 +794,15 @@ async def test_mark_claim_published_stamps_status() -> None:
     pool = FakePool(None)
 
     # Act
-    await mark_claim_published(pool, _CLAIM_ID)  # type: ignore[arg-type]
+    await mark_claim_published(pool, _CLAIM_ID, reupload_reason=None)  # type: ignore[arg-type]
 
     # Assert
     sql, args = pool.calls[0]
     assert "UPDATE ai.claim_readiness" in sql
     assert "status = 'published'" in sql
-    assert args == (_CLAIM_ID,)
+    # 정상 리포트로 발행할 때도 사유 컬럼을 덮어써야 재판정 결과가 남는다(NULL).
+    assert "reupload_reason = $2" in sql
+    assert args == (_CLAIM_ID, None)
 
 
 async def test_fetch_claim_readiness_returns_status_and_progress() -> None:
@@ -788,3 +832,46 @@ async def test_fetch_claim_readiness_reports_documents_still_pending() -> None:
 async def test_fetch_claim_readiness_returns_none_when_no_document_terminal_yet() -> None:
     # 아직 이 청구의 문서가 하나도 종결되지 않았으면 행 자체가 없다.
     assert await fetch_claim_readiness(FakePool(None), _CLAIM_ID) is None  # type: ignore[arg-type]
+
+
+# ── 재업로드 사유: Backend가 읽는 DB 교차 계약 ─────────────────────
+def test_reupload_reason_values_match_migration_check() -> None:
+    # Arrange: 워커가 쓰는 값 집합과 DB CHECK가 어긋나면 쓰기가 CHECK 위반으로 실패한다
+    sql = (
+        Path(__file__).resolve().parents[1]
+        / "migrations"
+        / "ai"
+        / "013_claim_readiness_reupload_reason.sql"
+    ).read_text(encoding="utf-8")
+
+    # Act
+    check = re.search(r"CHECK \(reupload_reason IN \(([^)]*)\)\)", sql)
+
+    # Assert
+    assert check is not None
+    assert set(re.findall(r"'([a-z_]+)'", check.group(1))) == set(
+        get_args(ReuploadReason.__value__)
+    )
+
+
+def test_reupload_reason_grant_opens_only_backend_columns() -> None:
+    # Arrange: Backend가 매핑하는 컬럼이 곧 계약이다 — 빠지면 Backend 조회가 권한 오류로 깨지고,
+    # 더 열면 내부 진행 상태(terminal_job_ids 등)가 새어 나간다(§14 최소 권한)
+    sql = (
+        Path(__file__).resolve().parents[1]
+        / "migrations"
+        / "ai"
+        / "013_claim_readiness_reupload_reason.sql"
+    ).read_text(encoding="utf-8")
+
+    # Act
+    grant = re.search(r"GRANT SELECT \(([^)]*)\)\s+ON ai\.claim_readiness", sql)
+
+    # Assert
+    assert grant is not None
+    assert [column.strip() for column in grant.group(1).split(",")] == [
+        "claim_id",
+        "report_id",
+        "missing_doc_types",
+        "reupload_reason",
+    ]

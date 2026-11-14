@@ -215,6 +215,31 @@
 
 ---
 
+## 4-2. `claim_readiness.reupload_reason` (DB 교차 계약 — 재업로드 사유)
+**ocr_worker → `ai.claim_readiness`(010, 사유 컬럼 013) → Spring 읽기 전용(`app_owner` 컬럼 한정 SELECT).** `reports.status='NEEDS_REUPLOAD'`는 "다시 올려야 한다"까지만 알린다. 사유별 안내(판독 불가·도메인 부적합·필수 서류 누락)의 근거가 이 컬럼이다. 판정은 청구 fan-in(`pipeline._judge_claim`)이 한다.
+
+| 컬럼(app_owner에 열린 것만) | 의미 |
+|---|---|
+| `claim_id` (text PK) | `USER_CLAIMS.id`. `@Subselect` 엔티티의 `@Id`용 |
+| `report_id` (uuid) | 조인 키 = `core.reports.id` |
+| `missing_doc_types` (text[]) | 인식하지 못한 필수 유형(`policy`·`diagnosis`). 빈 배열일 수 있다 |
+| `reupload_reason` (text, NULL 가능) | 아래 값 중 하나. NULL = 재업로드 아님(또는 013 이전에 판정된 청구) |
+
+`reupload_reason` 값(CHECK 제약, `ocr_worker.repository.ReuploadReason`과 같은 집합). 위에서부터 먼저 맞는 것이 대표 사유다.
+
+| 값 | 판정 | 사용자 안내(Backend) |
+|---|---|---|
+| `unreadable` | 처리에 실패한 문서나 저품질 문서(`ocr_quality='needs_reupload'`)가 있다. 흐린 실제 서류와 글자가 거의 없는 무관한 사진은 둘 다 저품질로 잡혀 구분할 수 없어, 훨씬 흔한 쪽(흐린 실제 서류)에 맞춘다 | 더 선명하게 다시 올려 달라 |
+| `off_domain` | 읽을 수 있지만 본문 단서로 보험·의료 문서 유형을 판정한 문서가 하나도 없다(도메인 부적합). 업로드 칸이 정한 유형(hint)만으로 채택된 문서는 본문 단서로 세지 않는다 | 보험증권·진단서 같은 청구 서류를 올려 달라 |
+| `missing_required` | 보험 문서는 인식했지만 필수 유형(보험증권·진단서) 중 빠진 게 있다 | 빠진 서류(`missing_doc_types`)를 함께 올려 달라 |
+
+- `status='blocked'`면 언제나 채워진다. `status='published'`여도 저품질 문서가 섞여 대표 `ReportJob`이 `ocr_quality='needs_reupload'`로 나가면 `unreadable`이 채워진다(그 리포트도 `NEEDS_REUPLOAD`가 된다).
+- 막는 조건(필수 유형 누락·인식 불완전)은 그대로다. 무관한 파일을 증권·진단서 칸에 올려 칸 유형으로 필수 유형이 채워지면 여전히 정상 리포트로 발행된다. 같은 모양의 정상 청구(보험사 앱 화면 캡처·영문 진단서·의무기록사본)가 있어서다. 그런 발행은 `claim_published_without_body_evidence` 경고로 남겨 규모를 잰다.
+- 단독 문서(`claim_id` 없음) 리포트에는 이 행이 없다. 행이 없거나 값이 NULL이면 Spring은 기존 안내를 유지한다. 모르는 값도 같다(값이 늘어도 Spring이 500을 내지 않게).
+- 문구는 Spring이 소유한다. 사용자 과실을 단정하지 않는다("잘못 올렸다" 금지).
+
+---
+
 ## 5. RAG 모듈 함수 인터페이스
 `src/rag` — `report_worker`가 **함수 호출**. 순수 함수형(부수효과 없음).
 

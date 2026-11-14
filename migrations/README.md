@@ -49,6 +49,7 @@ report_worker는 자기 소유 파일만 기동 시 적용한다 — 이미지�
 | 010 | `010_claim_readiness.sql` | `ai.claim_readiness`(청구 fan-in 판정) |
 | 011 | `011_ocr_results_app_owner_readonly.sql` | `ai.ocr_results` 문서 단위 상세(`attachment_id`·`doc_type`·`ocr_quality` 등)를 `app_owner`에 컬럼 한정 공개 |
 | 012 | `012_report_job_failures.sql` | `ai.report_job_failures`(리포트 실패 저널 — 재전달 한도 소진 시 terminal, Spring FAILED 판정 근거) + `app_owner` SELECT. report·OCR 둘 다 적용 |
+| 013 | `013_claim_readiness_reupload_reason.sql` | `ai.claim_readiness.reupload_reason`(재업로드 사유 — 판독 불가·도메인 부적합·필수 서류 누락) + `app_owner` 컬럼 한정 SELECT |
 
 ## `corpus/` 적용 순서 (corpus_owner)
 

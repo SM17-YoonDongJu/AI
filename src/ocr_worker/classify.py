@@ -179,3 +179,23 @@ def classify(text: str, hint: str | None = None) -> ClassifyResult:
         return ClassifyResult(DocType.OTHER, confidence)
 
     return ClassifyResult(best_type, confidence)
+
+
+def is_body_evidenced(doc_type: DocType, confidence: float) -> bool:
+    """본문 단서로 판정한 문서 유형인가(``classify`` 결과를 저장했다 읽은 값에 쓴다).
+
+    ``OTHER`` 폴백과 hint만으로 채택한 유형(``HINT_ONLY_CONFIDENCE``)은 본문 근거가 아니다.
+    hint 채택은 업로드 칸이 정한 유형이라, 보험과 무관한 파일을 "진단서" 칸에 올려도 진단서로
+    잡힌다. 타이브레이커(``TIEBREAK_CONFIDENCE``) 이상이면 본문에도 그 유형의 단서가 있었다.
+
+    경계는 ``HINT_ONLY_CONFIDENCE``와의 동등 비교가 아니라 타이브레이커 하한으로 가른다.
+    ``ai.ocr_results.doc_type_confidence``(real)에서 읽은 0.3은 0.30000001처럼 늘어나 있다.
+
+    Args:
+        doc_type: 판정된 문서 유형.
+        confidence: 판정 신뢰도(0.0~1.0).
+
+    Returns:
+        본문 단서로 판정했으면 True.
+    """
+    return doc_type is not DocType.OTHER and confidence >= TIEBREAK_CONFIDENCE
