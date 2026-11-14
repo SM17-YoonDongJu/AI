@@ -1,37 +1,98 @@
 # guardrail — 가드레일 (06)
 
-`report_worker`가 **함수 호출**로 쓰는 공용 모듈이다. 개인정보보호와 법적 안전성이 이 도메인의 핵심 제약이라 **필수 경로**다. 단계별 함수로 나뉘어 있어 호출자가 필요한 단계만 조립한다. 공개 진입점은 `guard_input`·`guard_generation`·`guard_output`과, 외부 API로 보내기 전 자유입력을 가리는 `mask_pii`다. 결과 모델은 `core.contracts`(`InputGuardResult`·`OutputGuardResult`)가 단일 출처다.
+`report_worker`가 **함수 호출**로 쓰는 공용 모듈이다. 개인정보보호와 법적 안전성이 이 도메인의 핵심 제약이라 **필수 경로**다. 단계별 함수로 나뉘어 있어 호출자가 필요한 단계만 조립한다. 공개 진입점은 `guard_input`·`guard_generation`·`guard_output`과, 외부 API로 보내기 전 자유입력을 가리는 `mask_pii`, 마스킹 토큰 건수를 세는 `count_masked_pii`다. 결과 모델은 `core.contracts`(`InputGuardResult`·`OutputGuardResult`)가 단일 출처다.
 
 ## 사용
 
 ```python
 import guardrail
 
-inp = await guardrail.guard_input(user_text)        # → InputGuardResult(masked_text, blocked, reason)
+# 마스킹은 문서 본문에, 도메인 검사는 사용자가 쓴 글에만 건다(#103). 두 키워드 인자 모두 필수
+inp = await guardrail.guard_input(
+    document_text,
+    question=user_question,                              # 키워드 검사(None 가능)
+    narratives=(accident_description, additional_info),  # 서술용 검사(항목별, None 가능)
+)                                                       # → InputGuardResult
 if inp.blocked:
     ...                                             # 리포트: persist_blocked → reports.status=BLOCKED
 
 draft = guardrail.guard_generation(llm_text)        # → str (동기 함수)
-out = await guardrail.guard_output(draft, run_judge=True, chunks=rag_chunks)
-out.final_text       # 고지문이 삽입된 최종 텍스트
-out.judge_failures   # LLM Judge가 근거 없다고 판정한 문장 목록
+out = await guardrail.guard_output(draft, run_judge=True, chunks=evidence)  # 근거: 약관·장해분류표·판례
+out.final_text             # 고지문이 삽입된 최종 텍스트
+out.judge_failures         # LLM Judge가 근거 없다고 판정한 문장 목록(판정 불가면 [JUDGE_UNAVAILABLE])
+out.judge_checked_chars    # Judge가 실제로 본 리포트 글자 수(판정 못 받았으면 0)
+out.judge_total_chars      # final_text 전체 글자 수(항상) → 검증 범위 = checked / total
+out.judge_evidence_chunks  # Judge가 본 근거 청크 수(판정 못 받았으면 0)
 
 # 외부 LLM·임베딩 API(Claude·Voyage)로 보내기 전, 복호화한 자유입력 원문을 가린다(§13)
 try:
     question = guardrail.mask_pii(raw_question)      # → str (동기 함수). None은 받지 않는다
 except guardrail.MaskingError:
     ...                                             # 고민감 PII가 남았다 — 이 텍스트는 보내지 않는다
+
+guardrail.count_masked_pii(masked_text)             # → {"이름": 2, "주민등록번호": 1} (동기·순수)
 ```
 
 ## 3단계 (현재 구현 기준)
 
 | 단계 | 함수 | 하는 일 |
 |---|---|---|
-| **입력** | `guard_input` (async) | 정규식 PII 마스킹(주민번호 **앞 6자리만 보존**, 전화, 계좌). 키워드 기반으로 보험·법률 외 질문 차단(부동산·주식·코인 등) |
+| **입력** | `guard_input` (async) | 문서 본문(`text`)에 정규식 PII 마스킹(주민번호 **앞 6자리만 보존**, 전화, 계좌). 보험·법률 외 주제 차단은 사용자가 쓴 글에만 건다(회사 표기 `주식회사`는 제외). 질문(`question`)은 키워드(부동산·주식·코인 등)가 있으면 막는다. 사고 경위·추가 정보(`narratives`)는 "요리하다가 데었다"처럼 키워드가 정상적으로 들어가는 사실 서술이라, 사안 표시(부상·질병·손해·보험·직업 등) 없이 도메인 밖 용건을 묻거나 부탁할 때만("코인 시세 알려주세요") 막는다. 문서 본문에는 걸지 않는다(증권의 "○○보험 주식회사") |
 | **생성** | `guard_generation` (sync) | "OO원을 받습니다/지급됩니다" 같은 단정적 금액 표현을 "참고 추정 범위(약 OO원 내외, 약관·근거 기준)"로 치환 |
-| **출력** | `guard_output` (async) | 법적 고지문(`DISCLAIMER`) 삽입. `run_judge=True`이고 `chunks`가 있으면 **LLM Judge**(`core.ai_client.chat_json`)로 리포트 주장이 약관 원문과 맞는지 검증 |
+| **출력** | `guard_output` (async) | 법적 고지문(`DISCLAIMER`) 삽입. `run_judge=True`이고 `chunks`가 있으면 **LLM Judge**(`core.ai_client.chat_json`)로 리포트 주장이 근거 원문(약관·장해분류표·판례)과 맞는지 검증하고, Judge가 본 범위를 함께 돌려준다 |
 
-LLM Judge는 **리포트 전용**이다. 결과는 `judge_failures`로 돌려줄 뿐 본문을 고치지 않는다. 실패 문장을 어떻게 처리할지는 호출자가 정한다. Judge 호출 자체가 실패하면(거절·429·잘림 등 `AiClientError`) 예외를 올리지 않고 고지문 붙은 본문과 `judge_failures=[JUDGE_UNAVAILABLE]`을 돌려준다 — 예외가 올라가면 report의 `safe_node`가 삼켜 고지문 없는 원본이 저장되기 때문이다.
+### LLM Judge (`guard_output`)
+
+LLM Judge는 **리포트 전용**이다. 결과는 `judge_failures`로 돌려줄 뿐 본문을 고치지 않는다. 실패 문장을 어떻게 처리할지는 호출자가 정한다.
+
+```python
+async def guard_output(
+    text: str,
+    *,
+    run_judge: bool = True,
+    chunks: list[Any] | None = None,                  # 근거. dict면 "text" 값, 아니면 str()
+    max_report_chars: int = JUDGE_MAX_REPORT_CHARS,   # 1 미만이면 ValueError(호출자 버그)
+) -> OutputGuardResult
+```
+
+**Judge가 보는 범위.** 프롬프트에 넣는 양을 명명 상수로 정한다(`guardrail`에서 바로 import된다).
+
+| 상수 | 값 | 뜻 |
+|---|---|---|
+| `JUDGE_MAX_REPORT_CHARS` | 12,000 | 리포트 앞부분 글자 수. 고지문이 붙은 `final_text` 기준이다. `max_report_chars`로 바꿀 수 있다 |
+| `JUDGE_MAX_EVIDENCE_CHUNKS` | 20 | 근거 청크 수. 약관 8 + 장해분류표 최대 8 + 판례 4가 다 들어가는 크기다 |
+| `JUDGE_EVIDENCE_CHARS` | 800 | 청크당 글자 수. 장해 추출 ctx와 같다(지급률 숫자가 잘리지 않게) |
+
+- 예전에는 리포트 앞 2,000자와 근거 6건(각 500자)만 봤다. 그래서 본문 뒷부분, 약관이 6건을 넘으면 밀려나는 장해분류표, 판례가 검증 밖이었다.
+- 근거는 **앞에서부터** 20건만 들어간다. 중요한 근거를 앞에 둔다. report는 약관 → 장해분류표 → 판례 순으로 넘긴다.
+- 빈 `judge_failures`만으로는 "전부 검증해 통과"인지 "일부만 봤다"인지 알 수 없다. 그래서 Judge가 실제로 본 양을 함께 돌려준다. 검증 범위는 `judge_checked_chars / judge_total_chars`다. 리포트가 12,000자 이하면 1.0이다. 근거가 잘렸는지는 넘긴 건수와 `judge_evidence_chunks`를 비교해 안다.
+
+**판정 결과별 반환값.** 어떤 경우에도 고지문은 붙어 있고 예외를 올리지 않는다(`max_report_chars` 오류만 예외). 예외가 올라가면 report의 `safe_node`가 삼켜 고지문 없는 원본이 저장되기 때문이다.
+
+| 경우 | `judge_failures` | `judge_checked_chars` | `judge_evidence_chunks` | 로그 |
+|---|---|---|---|---|
+| `run_judge=False`, 또는 `chunks`가 비었거나 None (Judge 호출 없음) | `[]` | 0 | 0 | 없음 |
+| 판정 받음 (`{"failures": [문장, ...]}`) | 판정 그대로 | `min(len(final_text), max_report_chars)` | `min(len(chunks), 20)` | 없음 |
+| 호출 실패 (`AiClientError` — 거절·429·5xx·타임아웃·출력 상한 잘림) | `[JUDGE_UNAVAILABLE]` | 0 | 0 | `guardrail.judge.failed` (`error_type`) |
+| 판정 불가 응답 (아래) | `[JUDGE_UNAVAILABLE]` | 0 | 0 | `guardrail.judge.unusable_verdict` (`reason`) |
+
+`judge_total_chars`는 모든 경우에 `len(final_text)`다.
+
+**판정 불가 응답.** `chat_json`은 JSON 파싱에 실패하면 `{}`를 돌려준다. 이것을 예전처럼 "failures 없음 = 통과"로 읽으면 검증하지 못한 리포트가 통과로 남는다. 그래서 프롬프트가 요구한 `{"failures": [문장, ...]}` 형식이 아니면 전부 호출 실패와 똑같이 처리한다. 로그 `reason`은 분류값만 담는다. 응답 본문은 남기지 않는다.
+
+| `reason` | 응답 예 |
+|---|---|
+| `failures_missing` | `{}` (파싱 실패), `failures` 키 없음 |
+| `failures_not_list` | `{"failures": null}`, `{"failures": "없음"}` |
+| `verdict_not_object` | `[...]`, `"..."`, `null` |
+| `failure_item_not_str` | `{"failures": [{"문장": ...}]}`. 그대로 넣으면 `judge_failures: list[str]` 검증에서 예외가 나 고지문 없는 원본이 저장됐다 |
+
+`JUDGE_UNAVAILABLE` 문구("LLM Judge 호출 실패")는 저장된 초안에 그대로 남는 값이라 바꾸지 않았다. 판정 불가 응답도 이 표식을 쓴다.
+
+**한계.**
+- 프롬프트가 커졌다. 상한 기준 약 5,000자(리포트 2,000 + 근거 3,000)에서 약 28,000자(리포트 12,000 + 근거 16,000)다. 호출 1회의 입력 토큰과 지연이 그만큼 는다.
+- `LLM_PROVIDER=openai_compat`(Ollama·vLLM 등)로 돌리면 프롬프트가 모델 컨텍스트를 넘을 수 있다. 로컬 `.env.example`이 이 설정이다. vLLM은 `max_model_len`을 넘으면 400으로 거절한다. 그러면 `AiClientError`가 나고 결과는 `JUDGE_UNAVAILABLE`이다. Ollama는 `num_ctx`를 넘는 입력을 오류 없이 잘라 처리할 수 있다. 그러면 Judge가 실제로 읽은 양보다 `judge_checked_chars`가 크게 나온다. `AI_TIMEOUT_SECONDS`(기본 60초) 안에 못 끝내도 `JUDGE_UNAVAILABLE`이 된다. 운영 기본은 Claude(`anthropic`, 코드 기본값)라 해당하지 않는다.
+- 판정 품질(Judge가 환각을 실제로 잡는지)은 테스트하지 않는다. `tests/test_guardrail.py`는 페이크 `chat_json`으로 범위와 응답 처리만 고정한다.
 
 ## 외부 전송 전 마스킹 — `mask_pii`
 
@@ -52,7 +113,7 @@ LLM Judge는 **리포트 전용**이다. 결과는 `judge_failures`로 돌려줄
 | 규칙 | OCR 입력단과 같음(정규식 + 설정 시 NER + 잔류 게이트) | 노션 06 명세 3종(주민번호·휴대폰·하이픈 계좌) |
 | 주민번호 | `[주민등록번호]`로 통째 치환(생년월일도 안 나감) | 앞 6자리 보존(`860312-*******`) |
 | 결과 형식 | `[분류]` 토큰(`[이름]`·`[주소]`·`[이메일]`…) | `***` 부분 가림 |
-| 실패 | 잔류 고민감 PII → `MaskingError` | 없음(도메인 외 질문이면 `blocked=True`) |
+| 실패 | 잔류 고민감 PII → `MaskingError` | 없음(`question`·`narratives`가 도메인 외 주제면 `blocked=True`) |
 
 `core.logging.mask_pii`는 이름만 같다. 그쪽은 로그 렌더링 직전의 부분 마스킹 방어선이라 외부 전송용으로 쓰지 않는다.
 
@@ -97,6 +158,15 @@ LLM Judge는 **리포트 전용**이다. 결과는 `judge_failures`로 돌려줄
 - `mask_pii`는 import 시점에 `ocr_worker.masking` 패키지 전체(`image_masker`→`ocr_worker.ocr`→`ocr_worker.storage`, `image_verify`, `verify` 등)를 불러온다. 지금 이 체인은 최상위에서 표준 라이브러리와 `core`만 import한다. OCR 엔진(paddleocr)·PIL·pymupdf·numpy·transformers·boto3는 함수 안에서 lazy import한다. 그래서 report 이미지에서 동작한다. report extra만 설치한 venv에서 import·호출·`report_worker.graph`/`worker` import를 확인했다. `test_mask_pii_imports_and_runs_without_report_absent_packages`는 하위 프로세스에서 PIL·torch·transformers·paddle·paddleocr·paddlex·fitz·cv2·sentence_transformers(옛 엔진 surya 포함) import를 막고 같은 호출을 돌린다. 체인에 이 중 하나가 최상위 import로 들어오면 이 테스트가 깨진다.
 - report Dockerfile은 `COPY src ./src`로 `src/ocr_worker/`까지 이미지에 넣는다. 복사 범위를 report 관련 패키지로 좁히면 `import guardrail`부터 실패한다.
 - CI 배포 필터(`.github/workflows/deploy.yml`)의 `report`는 `src/report_worker/**`·`src/rag/**`·`src/guardrail/**`만 본다. `src/ocr_worker/masking/**`만 바뀌면 OCR만 재배포된다. 그러면 운영의 두 워커가 다른 규칙으로 돈다. report 필터에 `src/ocr_worker/masking/**`(그리고 import 체인의 `src/ocr_worker/{__init__,ocr,storage}.py`)를 넣는 후속 작업이 필요하다.
+
+## 마스킹 건수 — `count_masked_pii`
+
+`count_masked_pii(text: str | None) -> dict[str, int]`는 OCR 마스커가 남긴 `[분류]` 토큰(`[이름]`·`[주민등록번호]` 등)을 분류별로 센다. 리포트 수치(가린 PII 건수)용 순수 함수다. 동기 함수이고 아무것도 로깅하지 않는다.
+
+- 반환은 `{라벨값: 개수}`다. 키는 한국어 라벨값(`"이름"`)이고, 개수가 1 이상인 라벨만 담는다. None이나 빈 문자열이면 `{}`다.
+- 토큰 정의를 복제하지 않는다. `ocr_worker.masking.PiiLabel`을 순회해 `label.token`을 센다. OCR에 라벨이 늘면 여기도 자동으로 따라간다. `[면허번호]`와 `[운전면허번호]`처럼 이름이 겹쳐도 대괄호 덕분에 섞이지 않는다.
+- OCR 규칙으로 가린 텍스트에 쓴다(OCR `masked_text`, `mask_pii` 결과). `guard_input`의 `***` 부분 가림은 토큰이 아니라 세지 않는다.
+- 탐지 건수가 아니라 **가린 자리 수**다. 겹친 탐지는 마스커가 토큰 하나로 합친다. 토큰 문자열을 세므로 원문에 처음부터 `[이름]` 같은 글자가 있었으면 그것도 센다.
 
 ## 설계 대비 미구현 항목
 

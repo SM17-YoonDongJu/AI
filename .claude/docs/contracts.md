@@ -191,6 +191,8 @@
 }
 ```
 - 금액은 **단정 금지** → 항상 `estimated_range`(범위)로만 표현(가드레일 강제).
+- `draft.metrics`(2026-11-11 추가, 선택 키): 리포트 생성 과정의 기술 수치(입력 품질·검색 근거·검증·처리 경로·신뢰도 등급과 사유). 구조는 `src/report_worker/README.md`의 "리포트 수치" 절이 단일 출처다. 계산에 실패하면 키가 없을 수 있다 — 읽는 쪽은 없음을 허용해야 한다. PII 없음: 건수·분류값·조항 번호·노드명과 소요 ms만 담는다. 예외 하나는 `verification.disability.reclassified[].injury`(LLM이 붙인 손상명 — 같은 값이 이미 `draft.disability`에 있다, 건강정보이며 식별자 아님).
+- `core.reports.confidence_level`(backend 소유 컬럼, varchar(10))에 `HIGH`·`MEDIUM`·`LOW` 중 하나를 쓴다(`draft.metrics.confidence.level`과 같은 값). backend가 고객 상세·검수 화면에 내려주고 프론트가 추정 보상 범위의 신뢰도 게이지로 보여준다. 쓰려면 `ai_owner`(prod는 `ai_owner_prod`)에 이 컬럼 UPDATE 권한이 있어야 한다(`deploy/schema_split*.sql`). 권한이 없으면 이 값만 건너뛰고 리포트는 저장된다.
 
 ---
 
@@ -210,6 +212,31 @@
 - terminal 행은 사라질 수 있다(같은 report_id의 다른 메시지가 성공하면 워커가 지움 = 회복). FAILED를 상태로 저장·캐시하지 말고 조회 시점에 파생한다.
 - `terminal=false`(재전달 중) 행과 `report_id IS NULL` 행은 무시한다. 거절은 저널에 남지 않는다(BLOCKED로 보인다).
 - 상세·조회 SQL 예: `_workspace/16_agent_report_failure_journal.md` §4.
+
+---
+
+## 4-2. `claim_readiness.reupload_reason` (DB 교차 계약 — 재업로드 사유)
+**ocr_worker → `ai.claim_readiness`(010, 사유 컬럼 013) → Spring 읽기 전용(`app_owner` 컬럼 한정 SELECT).** `reports.status='NEEDS_REUPLOAD'`는 "다시 올려야 한다"까지만 알린다. 사유별 안내(판독 불가·도메인 부적합·필수 서류 누락)의 근거가 이 컬럼이다. 판정은 청구 fan-in(`pipeline._judge_claim`)이 한다.
+
+| 컬럼(app_owner에 열린 것만) | 의미 |
+|---|---|
+| `claim_id` (text PK) | `USER_CLAIMS.id`. `@Subselect` 엔티티의 `@Id`용 |
+| `report_id` (uuid) | 조인 키 = `core.reports.id` |
+| `missing_doc_types` (text[]) | 인식하지 못한 필수 유형(`policy`·`diagnosis`). 빈 배열일 수 있다 |
+| `reupload_reason` (text, NULL 가능) | 아래 값 중 하나. NULL = 재업로드 아님(또는 013 이전에 판정된 청구) |
+
+`reupload_reason` 값(CHECK 제약, `ocr_worker.repository.ReuploadReason`과 같은 집합). 위에서부터 먼저 맞는 것이 대표 사유다.
+
+| 값 | 판정 | 사용자 안내(Backend) |
+|---|---|---|
+| `unreadable` | 처리에 실패한 문서나 저품질 문서(`ocr_quality='needs_reupload'`)가 있다. 흐린 실제 서류와 글자가 거의 없는 무관한 사진은 둘 다 저품질로 잡혀 구분할 수 없어, 훨씬 흔한 쪽(흐린 실제 서류)에 맞춘다 | 더 선명하게 다시 올려 달라 |
+| `off_domain` | 읽을 수 있지만 본문 단서로 보험·의료 문서 유형을 판정한 문서가 하나도 없다(도메인 부적합). 업로드 칸이 정한 유형(hint)만으로 채택된 문서는 본문 단서로 세지 않는다 | 보험증권·진단서 같은 청구 서류를 올려 달라 |
+| `missing_required` | 보험 문서는 인식했지만 필수 유형(보험증권·진단서) 중 빠진 게 있다 | 빠진 서류(`missing_doc_types`)를 함께 올려 달라 |
+
+- `status='blocked'`면 언제나 채워진다. `status='published'`여도 저품질 문서가 섞여 대표 `ReportJob`이 `ocr_quality='needs_reupload'`로 나가면 `unreadable`이 채워진다(그 리포트도 `NEEDS_REUPLOAD`가 된다).
+- 막는 조건(필수 유형 누락·인식 불완전)은 그대로다. 무관한 파일을 증권·진단서 칸에 올려 칸 유형으로 필수 유형이 채워지면 여전히 정상 리포트로 발행된다. 같은 모양의 정상 청구(보험사 앱 화면 캡처·영문 진단서·의무기록사본)가 있어서다. 그런 발행은 `claim_published_without_body_evidence` 경고로 남겨 규모를 잰다.
+- 단독 문서(`claim_id` 없음) 리포트에는 이 행이 없다. 행이 없거나 값이 NULL이면 Spring은 기존 안내를 유지한다. 모르는 값도 같다(값이 늘어도 Spring이 500을 내지 않게).
+- 문구는 Spring이 소유한다. 사용자 과실을 단정하지 않는다("잘못 올렸다" 금지).
 
 ---
 
@@ -249,10 +276,19 @@ class RagResult(BaseModel):
 `src/guardrail` — 단계별 함수로 분리(호출자가 필요한 것만 조립). 리포트=3단계 전부.
 
 ```python
-async def guard_input(text: str) -> InputGuardResult: ...
+async def guard_input(
+    text: str,                          # 마스킹 대상(리포트: OCR 문서 본문)
+    *,
+    question: str | None,               # 질문(reports.question) — 키워드 검사
+    narratives: Sequence[str | None],   # 사실 서술(사고 경위·추가 정보) — 서술용 검사
+) -> InputGuardResult: ...              # question·narratives는 기본값 없는 필수 키워드 인자
 def guard_generation(text: str) -> str: ...                       # 단정표현 치환·인용 강제 검사
 async def guard_output(
-    text: str, *, run_judge: bool, chunks: list[Chunk] | None = None
+    text: str,
+    *,
+    run_judge: bool = True,
+    chunks: list[Chunk] | None = None,      # Judge 근거(약관·장해분류표·판례). 호출자가 고른다
+    max_report_chars: int = JUDGE_MAX_REPORT_CHARS,  # Judge에 넣을 리포트 앞부분 글자 수
 ) -> OutputGuardResult: ...
 
 class InputGuardResult(BaseModel):
@@ -263,8 +299,18 @@ class InputGuardResult(BaseModel):
 class OutputGuardResult(BaseModel):
     final_text: str          # 고지문 삽입됨
     judge_failures: list[str]  # 인용 검증 실패 섹션(리포트만, run_judge=True)
+    judge_checked_chars: int = 0    # Judge가 실제로 본 리포트 글자 수(미수행·호출 실패면 0)
+    judge_total_chars: int = 0      # final_text 전체 글자 수 → 검증 범위 = checked / total
+    judge_evidence_chunks: int = 0  # Judge가 본 근거 청크 수(미수행·호출 실패면 0)
 ```
-- `run_judge`: 리포트=True(EXAONE/LLM Judge로 인용↔원문 검증).
+- `guard_input`은 마스킹을 `text`에, 보험·법률 외 주제 검사를 사용자가 쓴 글에만 건다. 둘 다 회사 표기(`주식회사`)는 빼고 찾는다.
+  - `question`(질문): 키워드(`_OFF_DOMAIN`)가 있으면 막는다. 사유 `보험·법률 외 질문({키워드})`(형식 그대로).
+  - `narratives`(사고 경위 `user_claims.description`·추가 정보 `additional_information`): 사실 서술이라 "요리하다가 데었다", "주식 매매 업무를 담당합니다"처럼 키워드가 정상적으로 들어간다. 그래서 키워드만으로는 막지 않는다. 세 조건이 다 맞을 때만 막는다: 도메인 밖 용건 표현("코인 시세", "주식 투자", "요리 레시피" 등)이 있다, 묻거나 부탁하는 말("알려주세요", "궁금", "?" 등)이 있다, 부상·질병·재물 손해·보험·법률·직업 같은 사안 표시가 하나도 없다. 사유 `보험·법률 외 내용({키워드} {용건})`. 항목마다 따로 검사한다.
+- 2026-11-14 변경(#103): 전에는 `text`(청구 문서를 이은 OCR 본문)에 키워드 검사를 걸었다. 그래서 증권에 찍힌 "○○보험 주식회사"의 "주식" 때문에 리포트가 BLOCKED로 끝났고, 정작 사용자가 쓴 글은 검사하지 않았다. `question`·`narratives`는 기본값 없는 키워드 인자다. 옛 한 인자 호출(`guard_input(text)`)은 검사를 조용히 잃지 않고 `TypeError`로 드러난다.
+- `judge_*` 세 필드는 2026-11-11 추가(backward-compatible, 기본값 0). 빈 `judge_failures`가 "전부 검증해 통과"인지 "일부만 봤다"인지 구분하려고 둔다 — 리포트 `draft.metrics.verification.judge`의 근거.
+- Judge 범위: 리포트(고지문 포함) 앞 `max_report_chars`자(기본 `JUDGE_MAX_REPORT_CHARS` 12,000)와 `chunks` 앞 `JUDGE_MAX_EVIDENCE_CHUNKS`(20)건 × `JUDGE_EVIDENCE_CHARS`(800)자. 근거 순서는 호출자가 정한다(리포트는 약관 → 장해분류표 → 판례). `max_report_chars < 1`이면 `ValueError`(호출자 버그).
+- `judge_failures`에 `JUDGE_UNAVAILABLE` 표식 하나만 들어 있으면 Judge가 판정하지 못한 것이다 — 호출 실패(`AiClientError`, 거절 포함) **또는 판정 불가 응답**(2026-11-11부터: 파싱 실패 `{}`, `failures`가 없거나 문자열 리스트가 아님). 이때 `judge_checked_chars`·`judge_evidence_chunks`는 0이다. 예외를 올리지 않는다(고지문 붙은 본문이 저장돼야 하므로).
+- `run_judge`: 리포트=True(LLM Judge로 인용↔원문 검증). 코드 기본값도 True다.
 - PII 마스킹 규칙은 `ocr_worker` 입력단과 **동일 정의** 공유.
 
 ---

@@ -73,13 +73,23 @@ class Masker:
         """
         return apply_mask(text, self.detect(text))
 
+    def clear_cache(self) -> None:
+        """디텍터가 문서 단위로 들고 있는 결과 캐시를 비운다(NER 라인 캐시). 없으면 no-op."""
+        clear = getattr(self._ner, "clear_cache", None)
+        if callable(clear):
+            clear()
+
     def _ner_detector(self) -> Detector:
         """NER 디텍터를 lazy 생성한다(transformers/torch는 이때 import)."""
         if self._ner is None:
             from ocr_worker.masking.ner_detector import NerDetector
 
             settings = get_settings()
-            self._ner = NerDetector(settings.ner_model, settings.ner_score_threshold)
+            self._ner = NerDetector(
+                settings.ner_model,
+                settings.ner_score_threshold,
+                batch_size=settings.ner_batch_size,
+            )
         return self._ner
 
 

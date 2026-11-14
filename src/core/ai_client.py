@@ -12,13 +12,15 @@ base_url·모델명·인증키는 config에서 주입한다(하드코딩 금지)
 
 from __future__ import annotations
 
+import asyncio
 import json
+from time import perf_counter
 from typing import TYPE_CHECKING, Any, Literal
 
 import httpx
 
 from core.config import settings
-from core.logging import cap_sdk_body_loggers, get_logger
+from core.logging import cap_sdk_body_loggers, elapsed_ms, get_logger, log_event
 
 if TYPE_CHECKING:
     from anthropic import AsyncAnthropic
@@ -212,15 +214,30 @@ async def _openai_compat_chat(messages: list[dict[str, str]], opts: dict[str, An
         **opts,
     }
     client = _get_chat_client()
+    started = perf_counter()
     try:
-        resp = await client.post("/chat/completions", json=payload)
+        async with asyncio.timeout(settings.llm_call_deadline_seconds):
+            resp = await client.post("/chat/completions", json=payload)
         resp.raise_for_status()
         data = resp.json()
         content: str = data["choices"][0]["message"]["content"]
+    except TimeoutError as exc:
+        raise _deadline_exceeded("openai_compat", model, started) from exc
     except httpx.HTTPError as exc:
         raise AiClientError("chat 호출 실패") from exc
     except (KeyError, IndexError, TypeError) as exc:
         raise AiClientError("chat 응답 형식이 올바르지 않음") from exc
+    # usage는 OpenAI 호환 서버마다 있을 수도 없을 수도 있다 — 없으면 토큰 칸만 비운다.
+    usage = data.get("usage") if isinstance(data, dict) else None
+    usage = usage if isinstance(usage, dict) else {}
+    _log_chat_finished(
+        provider="openai_compat",
+        model=str(data.get("model") or model),
+        started=started,
+        stop_reason=data["choices"][0].get("finish_reason"),
+        input_tokens=usage.get("prompt_tokens"),
+        output_tokens=usage.get("completion_tokens"),
+    )
     return content
 
 
@@ -240,19 +257,26 @@ async def _anthropic_chat(messages: list[dict[str, str]], opts: dict[str, Any]) 
     import anthropic  # _get_anthropic_client가 이미 불러온 모듈(SDK 예외·omit 참조)
     import httpx2  # anthropic의 HTTP 계층 — 스트림 도중 끊김은 SDK가 감싸지 않고 그대로 올린다
 
+    started = perf_counter()
     try:
         # 긴 입력·출력(thinking 포함)은 비스트리밍이면 HTTP 타임아웃에 걸려 스트림으로 받고 최종
         # 메시지만 쓴다. thinking은 보내지 않는다 — Opus 5.5는 항상 adaptive이고 disabled는 400.
-        async with client.beta.messages.stream(
-            model=model,
-            max_tokens=settings.llm_max_tokens,
-            system=system or anthropic.omit,
-            messages=turns,
-            output_config={"effort": settings.llm_effort},
-            betas=[_SERVER_SIDE_FALLBACK_BETA],
-            fallbacks="default",
-        ) as stream:
+        # 호출 전체에 상한을 건다 — 넘기면 스트림 컨텍스트가 닫히며 연결도 끊긴다.
+        async with (
+            asyncio.timeout(settings.llm_call_deadline_seconds),
+            client.beta.messages.stream(
+                model=model,
+                max_tokens=settings.llm_max_tokens,
+                system=system or anthropic.omit,
+                messages=turns,
+                output_config={"effort": settings.llm_effort},
+                betas=[_SERVER_SIDE_FALLBACK_BETA],
+                fallbacks="default",
+            ) as stream,
+        ):
             message = await stream.get_final_message()
+    except TimeoutError as exc:
+        raise _deadline_exceeded("anthropic", model, started) from exc
     except (anthropic.APIError, httpx2.HTTPError) as exc:
         # 예외 메시지엔 응답 본문이 섞일 수 있어 남기지 않는다(§9) — 분류값만.
         logger.warning(
@@ -261,9 +285,56 @@ async def _anthropic_chat(messages: list[dict[str, str]], opts: dict[str, Any]) 
             error_type=type(exc).__name__,
             status_code=getattr(exc, "status_code", None),
             request_id=getattr(exc, "request_id", None),
+            duration_ms=elapsed_ms(started),
         )
         raise AiClientError("chat 호출 실패") from exc
+    # 거절·잘림도 시간과 토큰을 쓴 호출이라 _final_text가 예외로 올리기 **전에** 남긴다.
+    usage = message.usage
+    _log_chat_finished(
+        provider="anthropic",
+        model=message.model,
+        started=started,
+        stop_reason=message.stop_reason,
+        input_tokens=usage.input_tokens,
+        output_tokens=usage.output_tokens,
+        cache_read_input_tokens=usage.cache_read_input_tokens,
+        cache_creation_input_tokens=usage.cache_creation_input_tokens,
+        effort=settings.llm_effort,
+    )
     return _final_text(message, requested_model=model)
+
+
+def _deadline_exceeded(provider: str, model: str, started: float) -> AiClientError:
+    """호출 전체 상한(`llm_call_deadline_seconds`)을 넘긴 호출을 남기고 올릴 예외를 만든다.
+
+    SDK·httpx 타임아웃은 청크 사이 간격이라, 200 OK 뒤 스트림이 멈추거나 조금씩만 흘러 끝나지 않는
+    호출을 끊지 못한다. `AiClientError`라 리포트 그래프는 `llm_system_failure`로 멈추고 재전달된다.
+    """
+    logger.warning(
+        "ai_client.chat.deadline_exceeded",
+        provider=provider,
+        model=model,
+        deadline_s=settings.llm_call_deadline_seconds,
+        duration_ms=elapsed_ms(started),
+    )
+    deadline = settings.llm_call_deadline_seconds
+    return AiClientError(f"chat 호출이 전체 상한({deadline:g}초)을 넘었다")
+
+
+def _log_chat_finished(*, provider: str, model: str, started: float, **fields: Any) -> None:
+    """챗 호출 1회의 소요 시간·토큰 사용량을 남긴다(성능 SLI·비용 집계용).
+
+    값은 모델명·토큰 수·stop_reason뿐이다 — 프롬프트·응답 본문은 싣지 않는다(§9). 리포트
+    그래프 안에서 불리면 `graph_node` 컨텍스트가 붙어 노드별로 나눠 볼 수 있다.
+    """
+    log_event(
+        logger,
+        "ai_client.chat.finished",
+        provider=provider,
+        model=model,
+        duration_ms=elapsed_ms(started),
+        **fields,
+    )
 
 
 async def chat(messages: list[dict[str, str]], **opts: Any) -> str:
@@ -357,10 +428,20 @@ def _parse_embeddings(data: Any) -> list[list[float]]:
 async def _embed_request(texts: list[str], input_type: EmbedInputType) -> list[list[float]]:
     """`POST /embeddings` 1회. 응답을 입력 순서로 맞추고 개수·차원을 검사한다."""
     client = _get_embed_client()
+    started = perf_counter()
     try:
         resp = await client.post("/embeddings", json=_embed_payload(texts, input_type))
         resp.raise_for_status()
         vectors = _parse_embeddings(resp.json())
+        log_event(
+            logger,
+            "ai_client.embed.finished",
+            provider=settings.embedding_provider,
+            model=settings.embedding_model,
+            input_type=input_type,
+            texts=len(texts),
+            duration_ms=elapsed_ms(started),
+        )
     except httpx.HTTPError as exc:
         raise AiClientError("embed 호출 실패") from exc
     except (KeyError, IndexError, TypeError, ValueError) as exc:

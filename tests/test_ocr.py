@@ -18,6 +18,7 @@ from typing import Any
 import numpy as np
 import pytest
 from PIL import Image
+from structlog.testing import capture_logs
 
 from core.config import Settings
 from core.exceptions import OcrError
@@ -151,6 +152,25 @@ async def test_process_raises_on_page_count_mismatch() -> None:
         await processor.process("uploads/x.pdf", "application/pdf")
 
 
+async def test_process_emits_stage_timing_for_fetch_render_and_engine() -> None:
+    # Arrange: 2쪽 문서
+    images = [_FakeImage(800, 600), _FakeImage(800, 600)]
+    pages = [[_line("p0", 1.0)], [_line("p1a", 0.9), _line("p1b", 0.7)]]
+    processor, _ = _make_processor(images=images, pages=pages)
+
+    # Act
+    with capture_logs() as logs:
+        await processor.process("uploads/x.pdf", "application/pdf")
+
+    # Assert: 문서 처리 시간 분해의 앞 세 단계 — 크기·쪽·라인 수만 싣는다(원문 없음)
+    stages = {e["stage"]: e for e in logs if e["event"] == "ocr.stage.finished"}
+    assert list(stages) == ["s3_fetch", "render", "ocr_engine"]
+    assert stages["s3_fetch"]["bytes"] == len(b"rawbytes")
+    assert stages["render"]["pages"] == 2
+    assert (stages["ocr_engine"]["pages"], stages["ocr_engine"]["lines"]) == (2, 3)
+    assert all(isinstance(e["duration_ms"], int) for e in stages.values())
+
+
 # ── content_type 라우팅 가드 ─────────────────────────────────────
 def test_render_rejects_unsupported_content_type() -> None:
     # 가드는 PIL/pymupdf import 이전에 동작 → 로컬에서 검증 가능.
@@ -263,6 +283,8 @@ def test_paddle_engine_from_settings_uses_ocr_settings() -> None:
     assert options["enable_mkldnn"] is False
     assert options["text_det_limit_type"] == "max"
     assert options["text_det_limit_side_len"] == 1800
+    # M1: oneDNN 캐시 기본값 2(PaddleOCR 기본 10보다 작게 — 문서별 최고 RSS 5% 감소)
+    assert options["mkldnn_cache_capacity"] == 2
 
 
 def test_paddle_engine_caps_detection_input_long_side() -> None:
@@ -535,3 +557,33 @@ def test_paddle_engine_rejects_malformed_result() -> None:
     # Act / Assert
     with pytest.raises(OcrError, match="결과 형식 이상"):
         engine.recognize([_page_image()])
+
+
+def test_paddle_engine_passes_mkldnn_cache_capacity_only_when_set() -> None:
+    # Arrange: M1 손잡이 — 설정하면 생성 인자로 넘기고, 비우면 PaddleOCR 기본값(10)에 맡긴다
+    engine, factory = _engine(_FakePaddleOcr(), mkldnn_cache_capacity=2)
+    default_engine, default_factory = _engine(_FakePaddleOcr())
+
+    # Act
+    engine.recognize([_page_image()])
+    default_engine.recognize([_page_image()])
+
+    # Assert
+    assert factory.calls[0]["mkldnn_cache_capacity"] == 2
+    assert "mkldnn_cache_capacity" not in default_factory.calls[0]
+
+
+def test_paddle_engine_from_settings_can_override_det_model() -> None:
+    # Arrange: 재OCR 검증 전용 엔진(O3b)은 검출 모델만 바꾸고 나머지 설정은 메인과 같다
+    settings = Settings(_env_file=None, ocr_det_model="PP-OCRv5_server_det", ocr_cpu_threads=3)
+    factory = _RecordingFactory(_FakePaddleOcr())
+
+    # Act
+    engine = PaddleOcrEngine.from_settings(settings, det_model="PP-OCRv5_mobile_det")
+    engine._factory = factory
+    engine.load()
+
+    # Assert
+    options = factory.calls[0]
+    assert options["text_detection_model_name"] == "PP-OCRv5_mobile_det"
+    assert options["cpu_threads"] == 3

@@ -28,15 +28,17 @@
 
 import asyncio
 import signal
+import time
 from collections.abc import Awaitable, Callable
 from enum import StrEnum
+from time import perf_counter
 from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
 from core.config import Settings, get_settings
 from core.exceptions import NonRetryableError
-from core.logging import get_logger
+from core.logging import elapsed_ms, get_logger, log_event
 from core.sqs.client import get_sqs_client, queue_name
 
 logger = get_logger(__name__)
@@ -149,7 +151,8 @@ class SqsConsumer[T: BaseModel]:
     async def _receive(self) -> list[dict[str, Any]]:
         """롱폴링으로 메시지를 최대 ``sqs_max_messages``건 받는다(블로킹 SDK를 스레드 격리).
 
-        ``ApproximateReceiveCount``를 함께 받아 poison 가드가 재전달 횟수를 판정한다.
+        ``ApproximateReceiveCount``를 함께 받아 poison 가드가 재전달 횟수를 판정하고,
+        ``SentTimestamp``로 발행~수신 사이 큐 대기 시간을 잰다(성능 SLI).
         """
         settings = self._settings
         response = await asyncio.to_thread(
@@ -158,7 +161,7 @@ class SqsConsumer[T: BaseModel]:
             MaxNumberOfMessages=settings.sqs_max_messages,
             WaitTimeSeconds=settings.sqs_wait_time_seconds,
             VisibilityTimeout=settings.sqs_visibility_timeout,
-            AttributeNames=["ApproximateReceiveCount"],
+            AttributeNames=["ApproximateReceiveCount", "SentTimestamp"],
         )
         messages: list[dict[str, Any]] = response.get("Messages", [])
         return messages
@@ -190,7 +193,23 @@ class SqsConsumer[T: BaseModel]:
                 errors=exc.error_count(),
             )
             return
-        if await self._handle(model) is HandleOutcome.RETRY:
+        queue_wait_ms = self._queue_wait_ms(message)
+        started = perf_counter()
+        outcome = await self._handle(model)
+        # 처리 시간이 sqs_visibility_timeout에 다가가면 처리 중 재전달(중복 처리)이 난다 —
+        # 워커 단위 SLI(큐 대기 + 처리)를 메시지마다 남긴다. 식별자·수치만 싣는다(§9).
+        log_event(
+            logger,
+            "sqs.message.finished",
+            queue=queue_name(self._queue_url),
+            message_id=message.get("MessageId"),
+            outcome=outcome.value,
+            receive_count=self._receive_count(message),
+            queue_wait_ms=queue_wait_ms,
+            handle_ms=elapsed_ms(started),
+            visibility_timeout_ms=self._settings.sqs_visibility_timeout * 1000,
+        )
+        if outcome is HandleOutcome.RETRY:
             return  # 핸들러 실패 — 삭제하지 않아 재전달된다(멱등 재처리)
         await self._delete(message)  # ack — 성공 또는 결정적 실패(종결)
 
@@ -278,6 +297,20 @@ class SqsConsumer[T: BaseModel]:
 
     def _is_poison(self, message: dict[str, Any]) -> bool:
         return self._receive_count(message) > self._settings.sqs_max_receive_count
+
+    @staticmethod
+    def _queue_wait_ms(message: dict[str, Any]) -> int | None:
+        """발행(``SentTimestamp``, epoch ms)부터 지금까지의 큐 대기 시간(ms).
+
+        재전달 메시지면 첫 발행부터 센다(이전 시도 처리 시간 포함). 속성이 없거나 형식이
+        이상하면 ``None`` — 계측값이 없다고 메시지 처리를 막지 않는다. 음수(시계 오차)는 0으로 둔다.
+        """
+        raw = message.get("Attributes", {}).get("SentTimestamp")
+        try:
+            sent_ms = int(raw)
+        except (TypeError, ValueError):
+            return None
+        return max(0, round(time.time() * 1000) - sent_ms)
 
     @staticmethod
     def _receive_count(message: dict[str, Any]) -> int:

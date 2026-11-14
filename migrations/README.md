@@ -49,6 +49,7 @@ report_worker는 자기 소유 파일만 기동 시 적용한다 — 이미지�
 | 010 | `010_claim_readiness.sql` | `ai.claim_readiness`(청구 fan-in 판정) |
 | 011 | `011_ocr_results_app_owner_readonly.sql` | `ai.ocr_results` 문서 단위 상세(`attachment_id`·`doc_type`·`ocr_quality` 등)를 `app_owner`에 컬럼 한정 공개 |
 | 012 | `012_report_job_failures.sql` | `ai.report_job_failures`(리포트 실패 저널 — 재전달 한도 소진 시 terminal, Spring FAILED 판정 근거) + `app_owner` SELECT. report·OCR 둘 다 적용 |
+| 013 | `013_claim_readiness_reupload_reason.sql` | `ai.claim_readiness.reupload_reason`(재업로드 사유 — 판독 불가·도메인 부적합·필수 서류 누락) + `app_owner` 컬럼 한정 SELECT |
 
 ## `corpus/` 적용 순서 (corpus_owner)
 
@@ -59,6 +60,7 @@ report_worker는 자기 소유 파일만 기동 시 적용한다 — 이미지�
 | 002 | `002_case_chunks.sql` | `corpus.case_chunks`(판례·금감원 분쟁조정례, namespace=case) + HNSW·tsvector·메타·태그 인덱스. `ai_owner`에 SELECT 자동 부여 |
 | 003 | `003_search_terms.sql` | `corpus.search_terms`(정규 용어 사전) + trigram GIN. `ai_owner`에 SELECT 자동 부여 |
 | 004 | `004_schedule_chunks.sql` | `corpus.schedule_chunks`(후유장해분류표, namespace=level) + HNSW·tsvector·버전·body_part 인덱스. `ai_owner`에 SELECT 자동 부여 |
+| 005 | `005_policy_insurer_product_index.sql` | `corpus.policy_chunks (insurer, product_name)` 인덱스(`CONCURRENTLY`, 문장 1개). 가입 약관 존재 조회·RAG terms 필터용(성능 실험 G3). **264만 행이라 운영 시간을 피해 corpus_owner로 먼저 수동 실행** — 배포 시 자동 적용은 IF NOT EXISTS로 건너뛴다 |
 
 `namespace`는 물리 컬럼이 아니라 검색한 소스 테이블로 부여하는 파생값이다
 (`policy_chunks` -> `terms`, `case_chunks` -> `case`, `schedule_chunks` -> `level`).

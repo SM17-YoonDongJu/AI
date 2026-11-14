@@ -89,7 +89,7 @@ PII 규약(§13): OCR 원문(평문)은 이 핸들러 메모리에만 존재하�
 import asyncio
 import re
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -98,21 +98,37 @@ import asyncpg
 from core.config import Settings, get_settings
 from core.contracts import DocType, OcrJob, ReportJob
 from core.exceptions import NonRetryableError, OcrError, UnreadableFileError
-from core.logging import bind_context, clear_context, get_logger
+from core.logging import bind_context, clear_context, get_logger, log_event, timed
 from core.sqs.producer import SqsProducer
-from ocr_worker.classify import classify
+from ocr_worker.classify import classify, is_body_evidenced
 from ocr_worker.extract import extract
 from ocr_worker.masking.image_masker import ImageMasker, RedactedPage, image_to_png_bytes
-from ocr_worker.masking.image_verify import CoverageFn, VerificationResult, verify_redacted_page
+from ocr_worker.masking.image_verify import (
+    CoverageFn,
+    VerificationResult,
+    decide,
+    measure_coverage,
+    reocr_residual_pii,
+    text_residual_pii,
+)
 from ocr_worker.masking.masker import Masker, get_masker
 from ocr_worker.masking.spans import PiiLabel
 from ocr_worker.masking.verify import MaskingError, assert_no_residual
-from ocr_worker.ocr import OcrPage, OcrProcessor, OcrResult, PageImage, get_processor
+from ocr_worker.ocr import (
+    OcrEngine,
+    OcrPage,
+    OcrProcessor,
+    OcrResult,
+    PaddleOcrEngine,
+    PageImage,
+    get_processor,
+)
 from ocr_worker.repository import (
     ClaimDocument,
     DeleteRetryState,
     OcrResultRecord,
     PendingDeletion,
+    ReuploadReason,
     build_masked_lines,
     clear_job_failure,
     fetch_claim_documents,
@@ -131,6 +147,11 @@ from ocr_worker.storage import delete_object, put_object
 from ocr_worker.vlm_client import VlmClientError, reread_lines, transcribe_table
 
 logger = get_logger(__name__)
+
+# 성능 SLI 이벤트. 단계 이름은 ocr.py(s3_fetch·render·ocr_engine)와 같은 이벤트로 남겨, 한
+# 쿼리(stage별 p50/p95)로 문서 처리 시간 전체를 분해한다. 문서 단위 총합은 _JOB_EVENT.
+_STAGE_EVENT = "ocr.stage.finished"
+_JOB_EVENT = "ocr.job.finished"
 
 # 결정적 report_id 파생용 네임스페이스(같은 ocr_result_id → 같은 report_id → 완전 멱등).
 # 청구에 묶이지 않은 **단독 문서**(claim_id 없음) 경로에서만 쓴다 — 청구 경로는 Spring이
@@ -151,9 +172,12 @@ _REPORT_ID_NAMESPACE = uuid.NAMESPACE_URL
 # 놓치는 것 방지)와 정확히 같은 방향이라 의도한 결과다 — 다만 반대급부로 "화질은
 # 좋은데 완전히 엉뚱한 문서가 hint 하나로 POLICY/DIAGNOSIS 행세를 하는" 오탐은 여기서
 # 못 막는다(ocr_quality도 텍스트가 선명하면 안 잡는다). "화질 나쁜 진짜 문서"가
-# "화질 좋은 엉뚱한 문서"보다 훨씬 흔할 거라 보고 지금은 감수한다. 신뢰도를 반영해
-# hint-only 승격을 여기서 걸러내려면 fetch_claim_documents가 doc_type_confidence도
-# 읽어와야 한다(현재 미저장) — 필요해지면 별도 작업으로.
+# "화질 좋은 엉뚱한 문서"보다 훨씬 흔할 거라 보고 지금은 감수한다.
+# 2026-11-14: fetch_claim_documents가 doc_type_confidence도 읽는다(재업로드 사유 판정용,
+# _blocked_reason). 그래도 막는 판정은 그대로 둔다 — 본문 근거를 막는 조건에 넣어 보니
+# 보험사 앱 화면 캡처·영문 진단서·의무기록사본처럼 본문 근거 없이 판정되는 정상 청구가
+# 막혔다(QA 실측). 대신 본문 근거 문서 없이 발행되는 청구를
+# claim_published_without_body_evidence로 남겨 규모를 잰다.
 _REQUIRED_DOC_TYPES: frozenset[DocType] = frozenset({DocType.POLICY, DocType.DIAGNOSIS})
 # 비식별 이미지 사본 키 공간 — 원본 키와 분리(원본은 별도 보존정책).
 _MASKED_IMAGE_CONTENT_TYPE = "image/png"
@@ -240,6 +264,59 @@ def _masked_image_key(job_id: str, page_index: int) -> str:
 def _encode_pngs(redacted_pages: list[RedactedPage]) -> list[bytes]:
     """비식별 사본을 PNG 바이트로 인코딩한다(동기 — PIL, ``to_thread``용)."""
     return [image_to_png_bytes(page.image) for page in redacted_pages]
+
+
+def _log_verify_shadow(
+    page_index: int, reocr: VerificationResult, text: VerificationResult
+) -> None:
+    """재OCR 판정(실제 게이트)과 텍스트 판정(섀도)을 나란히 남긴다(O3 전환 근거).
+
+    값은 남기지 않는다 — 판정·건수·라벨 분류만(§9). ``agree``가 원본 삭제 판정의 일치 여부다.
+    """
+    reocr_labels = {span.label.value for span in reocr.residual_pii}
+    text_labels = {span.label.value for span in text.residual_pii}
+    log_event(
+        logger,
+        "ocr.verify.shadow",
+        page=page_index,
+        agree=reocr.passed == text.passed,
+        reocr_passed=reocr.passed,
+        text_passed=text.passed,
+        reocr_residual=len(reocr.residual_pii),
+        text_residual=len(text.residual_pii),
+        reocr_only_labels=sorted(reocr_labels - text_labels),
+        text_only_labels=sorted(text_labels - reocr_labels),
+        low_coverage_lines=len(reocr.low_coverage_lines),
+    )
+
+
+def _blocked_reason(docs: Sequence[ClaimDocument], *, incomplete: bool) -> ReuploadReason:
+    """정상 리포트를 낼 수 없는 청구(필수 유형 누락·인식 불완전)를 사용자에게 안내할 대표 사유.
+
+    ``_judge_claim``이 막기로 한 청구에만 부른다(``missing or incomplete``). 순서가 곧 우선순위다.
+
+    1. 처리에 실패한 문서가 있다(``incomplete``) → ``unreadable``. 실패한 문서가 빠진 필수 서류였을
+       수 있다.
+    2. 저품질 문서(``ocr_quality=needs_reupload``)가 있다 → ``unreadable``. 흐린 실제 서류와 글자가
+       거의 없는 무관한 사진은 둘 다 저품질로 잡혀 구분할 수 없다. 훨씬 흔한 흐린 실제 서류에 맞춰
+       "더 선명하게"로 안내한다.
+    3. 본문 단서로 보험·의료 문서 유형을 판정한 문서가 하나도 없다 → ``off_domain``(도메인 부적합).
+       읽을 수 있는데 보험 문서 단서가 없다는 뜻이다(``classify.is_body_evidenced``).
+    4. 그 외 → ``missing_required``. 보험 문서는 인식했지만 필수 유형이 빠졌다(1번이 아니면
+       ``missing``이 참이다).
+
+    Args:
+        docs: 처리에 성공한 청구 문서들(``fetch_claim_documents``).
+        incomplete: 성공한 문서 수가 청구 문서 수보다 적은가.
+
+    Returns:
+        재업로드 사유.
+    """
+    if incomplete or any(doc.ocr_quality == "needs_reupload" for doc in docs):
+        return "unreadable"
+    if not any(is_body_evidenced(doc.doc_type, doc.doc_type_confidence) for doc in docs):
+        return "off_domain"
+    return "missing_required"
 
 
 def _derive_report_id(ocr_result_id: str) -> str:
@@ -379,6 +456,7 @@ class OcrPipeline:
         coverage: CoverageFn | None = None,
         upload: UploadFn | None = None,
         delete: DeleteFn | None = None,
+        verify_engine: OcrEngine | None = None,
     ) -> None:
         """파이프라인을 구성한다.
 
@@ -398,6 +476,9 @@ class OcrPipeline:
                 (``image_verify.measure_coverage``) — 주입점을 둬 numpy 없이 게이트를 테스트한다.
             upload: 비식별 사본 S3 업로드 함수. ``None``이면 ``storage.put_object``.
             delete: 원본 S3 삭제 함수. ``None``이면 ``storage.delete_object``.
+            verify_engine: 재OCR 검증(5.2) 전용 엔진(주입 — 테스트는 페이크). ``None``이면
+                ``ocr_verify_det_model``이 있을 때 그 검출 모델로 첫 검증 때 만들고, 없으면 메인
+                엔진(``processor.engine``)을 쓴다.
         """
         self._pool = pool
         self._producer = producer
@@ -414,6 +495,7 @@ class OcrPipeline:
         self._upload: UploadFn = upload or put_object
         self._delete: DeleteFn = delete or delete_object
         self._image_pipeline: ImagePipeline = image_pipeline or self._default_image_pipeline
+        self._verify_engine_override = verify_engine
         # 진행 중인 원본 삭제 task의 강한 참조(fire-and-forget · GC 방지).
         # 자세한 이유는 ``_schedule_original_delete`` 참고.
         self._pending_deletes: set[asyncio.Task[None]] = set()
@@ -471,6 +553,10 @@ class OcrPipeline:
             await self._journal_transient(job, exc)
             raise
         finally:
+            # NER 라인 캐시엔 이 문서의 라인(이름 포함 가능)이 남는다 — 문서마다 비운다.
+            clear_cache = getattr(self._masker, "clear_cache", None)
+            if callable(clear_cache):
+                clear_cache()
             clear_context()
 
     async def _replay_processed(self, job: OcrJob, existing: tuple[str, DocType, str]) -> None:
@@ -627,13 +713,25 @@ class OcrPipeline:
             logger.warning("ocr_job_failure_clear_failed", error_type=type(exc).__name__)
 
     async def _process(self, job: OcrJob) -> None:
-        """신규 작업의 전체 처리 흐름(OCR→분석→하이브리드 VLM→품질 판정→저장→발행)."""
+        """신규 작업의 전체 처리 흐름(OCR→분석→하이브리드 VLM→품질 판정→저장→발행).
+
+        문서 1건의 총 소요 시간을 ``ocr.job.finished``로, 단계별 시간을 ``ocr.stage.finished``로
+        남긴다(성능 SLI — 단계 합이 가시성 안에 드는지 본다). 계측은 동작을 바꾸지 않는다.
+        """
+        with timed(logger, _JOB_EVENT) as summary:
+            await self._process_stages(job, summary)
+
+    async def _process_stages(self, job: OcrJob, summary: dict[str, object]) -> None:
+        """``_process`` 본문. ``summary``에 문서 단위 요약(쪽 수·VLM 여부 등)을 채운다."""
         result, images = await self._processor.process_with_images(job.s3_key, job.content_type)
+        summary["pages"] = len(result.pages)
+        summary["lines"] = sum(len(page.lines) for page in result.pages)
 
         # 분류·추출·텍스트 마스킹은 CPU 바운드(정규식·NER) → 한 스레드 호출로 격리한다.
         # OCR 엔진 기반 masked_text는 자체 게이트(assert_no_residual)를 통과한 안전한
         # 값이라, 아래 VLM 경로가 실패해도 항상 되돌아갈 수 있는 폴백으로 유지한다.
-        analysis = await asyncio.to_thread(self._analyze, result, job.doc_type_hint)
+        with timed(logger, _STAGE_EVENT, stage="analyze"):
+            analysis = await asyncio.to_thread(self._analyze, result, job.doc_type_hint)
 
         # 표 문서 유형(다중 항목) 또는 OCR 신뢰도가 낮으면(문서 유형 무관) VLM으로
         # 보완한다. 페이지마다 독립적으로 채택 여부가 갈린다 — 한 페이지가 실패해도
@@ -652,8 +750,14 @@ class OcrPipeline:
         # 0.861-, 표본 3건)으로 정한 0.90을 PP-OCRv5 신뢰도 분포에 맞춰 PoC로 재보정한다.
         low_confidence = result.mean_confidence < self._settings.ocr_low_confidence_threshold
         needs_vlm = analysis.doc_type in _TABLE_DOC_TYPES or low_confidence
+        summary.update(
+            doc_type=analysis.doc_type.value, low_confidence=low_confidence, needs_vlm=needs_vlm
+        )
+        vlm_outcome = None
         if needs_vlm and images:
-            vlm_outcome = await self._extract_pages(images, result)
+            with timed(logger, _STAGE_EVENT, stage="vlm_pages", pages=len(images)) as vlm_stage:
+                vlm_outcome = await self._extract_pages(images, result)
+                vlm_stage["adopted"] = vlm_outcome is not None
             if vlm_outcome is not None:
                 masked_text, quality_source_text, table_markdown = vlm_outcome
                 # extract()는 OCR 엔진 원문에만 돌았던 상태라, 엔진이 못 뽑았거나(None)
@@ -677,9 +781,10 @@ class OcrPipeline:
 
         # "재확인 필요" 판정: OCR 신뢰도가 낮은데(문서 자체가 저품질) 사람 이름조차
         # 못 찾았거나 도메인 정보가 하나도 없으면, 자동 처리로는 신뢰할 수 없다고 본다.
-        has_name = any(
-            span.label is PiiLabel.NAME for span in self._masker.detect(quality_source_text)
-        )
+        with timed(logger, _STAGE_EVENT, stage="quality_check"):
+            has_name = any(
+                span.label is PiiLabel.NAME for span in self._masker.detect(quality_source_text)
+            )
         ocr_quality = (
             "needs_reupload"
             if low_confidence
@@ -689,7 +794,9 @@ class OcrPipeline:
 
         # 이미지 마스킹은 렌더한 페이지 이미지를 재사용한다(재다운로드/재렌더 없음).
         # 트랙은 "원본을 지워도 되는가"를 **판정만** 하고 삭제는 하지 않는다(아래 참고).
-        track = await self._image_pipeline(job, result, images)
+        with timed(logger, _STAGE_EVENT, stage="image_pipeline", pages=len(images)):
+            track = await self._image_pipeline(job, result, images)
+        summary.update(vlm_adopted=vlm_outcome is not None, ocr_quality=ocr_quality)
 
         record = OcrResultRecord(
             job_id=job.job_id,
@@ -720,6 +827,33 @@ class OcrPipeline:
         # 남지 않아(재전달 시 _process 전체 재실행 — OCR 재수행 비용은 있지만 정확),
         # 저장이 성공하면 카운트도 반드시 함께 성공한다.
         claim = _claim_context(job)
+        with timed(logger, _STAGE_EVENT, stage="db_save"):
+            ocr_result_id, terminal_count = await self._save(job, record, claim)
+
+        # 아래는 전부 **커밋 이후**다. 원본 삭제(S3)·발행(SQS) 같은 외부 왕복을 트랜잭션
+        # 안에 담으면 잠금을 네트워크 지연만큼 붙들게 되고, 롤백돼도 되돌릴 수 없다.
+        # 원본 삭제는 저장 성공 이후에만 트리거한다 — 저장 전에 지우면 일시적 DB 오류로
+        # 인한 재전달 재처리가 "원본이 없어 OCR 실패"로 승격돼 복구 불가가 된다.
+        # 다만 완료는 기다리지 않는다 — 발행이 S3 왕복 뒤로 밀릴 이유가 없다.
+        if track.delete_original:
+            self._schedule_original_delete(job, ocr_result_id)
+        # 청구에 묶인 문서면 곧바로 발행하지 않는다 — 청구의 **모든** 문서가 종결되고
+        # 필수 유형이 다 인식됐을 때 청구당 1건만 나가야 한다(fan-in). 단독 문서는
+        # 기존대로 문서별 즉시 발행(하위 호환).
+        with timed(logger, _STAGE_EVENT, stage="publish"):
+            if claim is not None and terminal_count is not None:
+                await self._judge_claim(job, claim, terminal_count)
+            else:
+                await self._publish_report(job, ocr_result_id, analysis.doc_type, ocr_quality)
+
+    async def _save(
+        self, job: OcrJob, record: OcrResultRecord, claim: _ClaimContext | None
+    ) -> tuple[str, int | None]:
+        """결과 저장과 청구 종결 카운트를 한 트랜잭션으로 커밋한다(이유는 호출부 주석).
+
+        Returns:
+            ``(ocr_result_id, 청구 종결 수 — 청구에 묶이지 않은 문서면 None)``.
+        """
         async with self._pool.acquire() as conn, conn.transaction():
             ocr_result_id = await save_ocr_result(
                 conn,
@@ -739,21 +873,7 @@ class OcrPipeline:
                     doc_total=claim.doc_total,
                 )
             )
-
-        # 아래는 전부 **커밋 이후**다. 원본 삭제(S3)·발행(SQS) 같은 외부 왕복을 트랜잭션
-        # 안에 담으면 잠금을 네트워크 지연만큼 붙들게 되고, 롤백돼도 되돌릴 수 없다.
-        # 원본 삭제는 저장 성공 이후에만 트리거한다 — 저장 전에 지우면 일시적 DB 오류로
-        # 인한 재전달 재처리가 "원본이 없어 OCR 실패"로 승격돼 복구 불가가 된다.
-        # 다만 완료는 기다리지 않는다 — 발행이 S3 왕복 뒤로 밀릴 이유가 없다.
-        if track.delete_original:
-            self._schedule_original_delete(job, ocr_result_id)
-        # 청구에 묶인 문서면 곧바로 발행하지 않는다 — 청구의 **모든** 문서가 종결되고
-        # 필수 유형이 다 인식됐을 때 청구당 1건만 나가야 한다(fan-in). 단독 문서는
-        # 기존대로 문서별 즉시 발행(하위 호환).
-        if claim is not None and terminal_count is not None:
-            await self._judge_claim(job, claim, terminal_count)
-        else:
-            await self._publish_report(job, ocr_result_id, analysis.doc_type, ocr_quality)
+        return ocr_result_id, terminal_count
 
     async def _extract_pages(
         self, images: list[PageImage], result: OcrResult
@@ -917,10 +1037,13 @@ class OcrPipeline:
         # 라인 재판독은 VLM I/O라 async로 먼저 끝내고(저신뢰도 문서만), 검출(정규식·NER)·PIL
         # 렌더(CPU 바운드)는 to_thread로 격리한다 — redact_pages 자체는 동기 함수로 유지해
         # 블로킹 규약(§7)을 지킨다.
-        reread_texts = await self._image_masker.reread_pages(images, result)
-        redacted_pages = await asyncio.to_thread(
-            self._image_masker.redact_pages, images, result, reread_texts
-        )
+        with timed(logger, _STAGE_EVENT, stage="vlm_reread") as reread_stage:
+            reread_texts = await self._image_masker.reread_pages(images, result)
+            reread_stage["ran"] = reread_texts is not None
+        with timed(logger, _STAGE_EVENT, stage="redact", pages=len(images)):
+            redacted_pages = await asyncio.to_thread(
+                self._image_masker.redact_pages, images, result, reread_texts
+            )
         if reread_texts is not None:
             # 재판독이 OCR 엔진 판정에 실제로 보탠 PII 라인 수(관측용 — 텍스트는 남기지 않는다).
             # 재판독 자체의 성공·실패 분포는 vlm_client가 "vlm_line_reread"로 따로 남긴다.
@@ -928,20 +1051,35 @@ class OcrPipeline:
                 "vlm_reread_pii_lines_added",
                 lines=sum(len(page.reread_indices) for page in redacted_pages),
             )
-        pngs = await asyncio.to_thread(_encode_pngs, redacted_pages)
+        with timed(logger, _STAGE_EVENT, stage="encode_png", pages=len(redacted_pages)):
+            pngs = await asyncio.to_thread(_encode_pngs, redacted_pages)
         keys = [_masked_image_key(job.job_id, index) for index in range(len(pngs))]
-        await asyncio.gather(
-            *(
-                self._upload(key, png, _MASKED_IMAGE_CONTENT_TYPE)
-                for key, png in zip(keys, pngs, strict=True)
+        with timed(logger, _STAGE_EVENT, stage="upload", pages=len(pngs)) as uploaded:
+            uploaded["bytes"] = sum(len(png) for png in pngs)
+            await asyncio.gather(
+                *(
+                    self._upload(key, png, _MASKED_IMAGE_CONTENT_TYPE)
+                    for key, png in zip(keys, pngs, strict=True)
+                )
             )
-        )
         logger.info("masked_images_uploaded", pages=len(keys))
-        delete_original = await self._may_delete_original(result, redacted_pages)
+        # 삭제 게이트 검증(5.1 커버리지 + 5.2 재OCR) — 재OCR이 OCR 엔진을 한 번 더 도는 단계다.
+        fast_verify = self._use_fast_verify(result, reread_texts)
+        with timed(
+            logger,
+            _STAGE_EVENT,
+            stage="verify",
+            mode=self._settings.ocr_verify_mode,
+            engine="fast" if fast_verify else "main",
+        ) as verify_stage:
+            delete_original = await self._may_delete_original(
+                result, redacted_pages, fast_verify=fast_verify
+            )
+            verify_stage["delete_original"] = delete_original
         return ImageTrackResult(keys=keys, delete_original=delete_original)
 
     async def _may_delete_original(
-        self, result: OcrResult, redacted_pages: list[RedactedPage]
+        self, result: OcrResult, redacted_pages: list[RedactedPage], *, fast_verify: bool = False
     ) -> bool:
         """이미지 마스킹 검증(5.1+5.2)을 전 페이지가 통과했는지 판정한다(삭제는 안 한다).
 
@@ -964,7 +1102,9 @@ class OcrPipeline:
             logger.warning("original_delete_skipped", reason="page_without_ocr_text")
             return False
 
-        verified = await asyncio.to_thread(self._verify_pages, result, redacted_pages)
+        verified = await asyncio.to_thread(
+            self._verify_pages, result, redacted_pages, fast_verify=fast_verify
+        )
         failures = [(index, outcome) for index, outcome in verified if outcome.needs_review]
         if failures:
             for index, outcome in failures:
@@ -1177,8 +1317,55 @@ class OcrPipeline:
         logger.info("sweep_delete_succeeded", ocr_result_id=row.id, s3_key=row.original_s3_key)
         await self._mark_deleted(row.id)
 
+    def _fast_engine(self) -> OcrEngine | None:
+        """가벼운 검증 엔진(주입 또는 ``ocr_verify_det_model``). 없으면 ``None``. 한 번만 만든다."""
+        if self._verify_engine_override is None:
+            det_model = self._settings.ocr_verify_det_model
+            if det_model and det_model != self._settings.ocr_det_model:
+                self._verify_engine_override = PaddleOcrEngine.from_settings(
+                    self._settings, det_model=det_model
+                )
+        return self._verify_engine_override
+
+    def _verify_engine(self, *, fast: bool) -> OcrEngine:
+        """재OCR 검증(5.2)에 쓸 엔진. ``fast``이고 가벼운 엔진이 있으면 그것, 아니면 메인 엔진.
+
+        메인 엔진을 그대로 쓰면 같은 모델이 같은 픽셀을 다시 읽는다 — 검은블럭 때문에 글자 영역이
+        달리 잘릴 때만 다르게 읽힌다. 가벼운 검출 모델은 빠르지만, VLM이 꺼진 날엔 메인 재OCR이
+        잡던 누락을 놓쳤다(O3b) — 그래서 ``_use_fast_verify``가 고른 문서에만 쓴다(O3c).
+        """
+        fast_engine = self._fast_engine() if fast else None
+        return fast_engine if fast_engine is not None else self._processor.engine
+
+    def _use_fast_verify(
+        self, result: OcrResult, reread_texts: list[list[str | None]] | None
+    ) -> bool:
+        """이 문서를 가벼운 엔진으로 검증해도 되는가(O3c).
+
+        재OCR이 혼자 막아야 하는 건 "1차 방어선인 VLM 재판독이 필요했는데 못 돈" 문서다. 그래서:
+        고신뢰 문서(재판독 대상 아님)거나, 저신뢰 라인(``ocr_low_confidence_threshold`` 미만)을
+        **빠짐없이** 다시 읽었으면 가볍게 검증한다. 한 줄이라도 실패·예산 초과·빈 응답이면 메인
+        엔진으로 한다(빈 응답과 실패를 가를 수 없어 보수적으로 같이 본다).
+        """
+        settings = self._settings
+        if self._fast_engine() is None:
+            return False
+        if not settings.ocr_verify_fast_requires_reread:
+            return True
+        threshold = settings.ocr_low_confidence_threshold
+        if result.mean_confidence >= threshold:
+            return True  # 재판독 대상이 아닌 고신뢰 문서
+        if reread_texts is None:
+            return False  # 재판독이 필요했는데 돌지 않았다(재판독 함수 없음 등)
+        return all(
+            texts[index] is not None
+            for page, texts in zip(result.pages, reread_texts, strict=True)
+            for index, line in enumerate(page.lines)
+            if line.confidence < threshold
+        )
+
     def _verify_pages(
-        self, result: OcrResult, redacted_pages: list[RedactedPage]
+        self, result: OcrResult, redacted_pages: list[RedactedPage], *, fast_verify: bool = False
     ) -> list[tuple[int, VerificationResult]]:
         """페이지별 5.1 커버리지 + 5.2 재OCR 잔류 검사(동기 — ``to_thread``에서 호출).
 
@@ -1193,18 +1380,26 @@ class OcrPipeline:
         Returns:
             실제로 검증한 페이지의 ``(페이지 인덱스, 결과)`` 목록.
         """
-        engine = self._processor.engine
+        mode = self._settings.ocr_verify_mode
+        measure = self._coverage or measure_coverage
         verified: list[tuple[int, VerificationResult]] = []
         for page, redacted in zip(result.pages, redacted_pages, strict=True):
             if not redacted.redacted:
                 continue
-            outcome = verify_redacted_page(
-                redacted.image,
-                page,
-                redacted.line_indices,
-                engine=engine,
-                measure=self._coverage,
+            # 5.1 커버리지는 한 번만 재서 두 판정(재OCR·텍스트)이 같이 쓴다.
+            coverage = measure(redacted.image, page, redacted.line_indices)
+            text_outcome = (
+                decide(coverage, text_residual_pii(page, redacted.line_indices))
+                if mode in ("text", "shadow")
+                else None
             )
+            if mode == "text" and text_outcome is not None:
+                verified.append((page.index, text_outcome))
+                continue
+            engine = self._verify_engine(fast=fast_verify)
+            outcome = decide(coverage, reocr_residual_pii(redacted.image, engine))
+            if text_outcome is not None:
+                _log_verify_shadow(page.index, outcome, text_outcome)
             verified.append((page.index, outcome))
         return verified
 
@@ -1287,7 +1482,7 @@ class OcrPipeline:
         막히는 조건은 둘이다(합집합):
         - ``missing``: 필수 유형(보험증권·진단서)이 성공한 문서들 중에 없다. 오분류일
           수도, 그 유형의 문서가 아래 ``incomplete``로 실패한 것일 수도 있다 — 여기선
-          구분하지 않는다(``fetch_claim_documents``는 doc_type만 보고, 실패 원인은
+          구분하지 않는다(``fetch_claim_documents``는 유형·신뢰도·품질만 보고, 실패 원인은
           ``ai.ocr_job_failures``가 별도로 갖고 있다).
         - ``incomplete``(``len(docs) < doc_total``): 업로드된 문서 수보다 성공한 문서
           수가 적다 — 필수·비필수 안 가리고, 하나라도 결정적 실패(또는 재시도 소진)로
@@ -1299,6 +1494,13 @@ class OcrPipeline:
         발행한다(``_publish_needs_reupload``) — report_worker의 기존 스킵·통지 로직
         (``reports.status='NEEDS_REUPLOAD'``)을 그대로 태운다. ``claim_readiness``에
         ``blocked``로 남기는 건 운영 조회용 기록이지 더 이상 "발행 안 함"을 뜻하지 않는다.
+        사용자에게 안내할 대표 사유는 ``reupload_reason``에 남긴다(``_blocked_reason``, Backend가
+        읽는다). 저품질 문서가 섞여 대표 ``ReportJob``이 ``needs_reupload``로 나가는 published
+        경로도 사유(``unreadable``)를 남긴다.
+
+        본문 단서로 유형을 판정한 문서 없이(업로드 칸 유형으로만 필수 유형이 채워져) 발행되는
+        청구는 막지 않고 ``claim_published_without_body_evidence``로만 남긴다(위
+        ``_REQUIRED_DOC_TYPES`` 주석 참고).
 
         멱등하다: 재개로 두 번 불려도 ``blocked``/``published``는 같은 값으로 다시
         찍히고, 발행은 같은 ``report_id``라 다운스트림이 중복을 흡수한다.
@@ -1311,9 +1513,13 @@ class OcrPipeline:
         incomplete = len(docs) < claim.doc_total
         if missing or incomplete:
             missing_types = sorted(doc_type.value for doc_type in missing)
+            reason = _blocked_reason(docs, incomplete=incomplete)
             # 발행 **전에** 도장을 찍는다 — published 경로와 같은 이유(아래 참고).
             await mark_claim_blocked(
-                self._pool, claim_id=claim.claim_id, missing_doc_types=missing_types
+                self._pool,
+                claim_id=claim.claim_id,
+                missing_doc_types=missing_types,
+                reupload_reason=reason,
             )
             # 운영·사용자 안내 신호: 필수 문서를 "안 올린" 게 아니라 **못 읽은** 상태거나
             # (missing), 업로드된 문서 중 일부가 결정적 실패로 사라진 상태다(incomplete).
@@ -1323,18 +1529,32 @@ class OcrPipeline:
                 claim_id=claim.claim_id,
                 missing=missing_types,
                 incomplete=incomplete,
+                reupload_reason=reason,
                 recognized_docs=len(docs),
                 doc_total=claim.doc_total,
             )
             await self._publish_needs_reupload(job, claim, docs)
             return
 
+        if not any(is_body_evidenced(doc.doc_type, doc.doc_type_confidence) for doc in docs):
+            # 필수 유형이 업로드 칸 유형으로만 채워졌다 — 막지 않고 규모만 잰다
+            # (_REQUIRED_DOC_TYPES 주석의 트레이드오프). 유형 값만 남긴다(PII 없음).
+            logger.warning(
+                "claim_published_without_body_evidence",
+                claim_id=claim.claim_id,
+                doc_types=[doc.doc_type.value for doc in docs],
+                doc_total=claim.doc_total,
+            )
         # 발행 **전에** 도장을 찍는다 — 발행 후 crash로 ack를 못 하면 재전달되는데,
         # 그때 멱등 단락이 이 상태를 보고 같은 report_id로 안전망 재발행을 한다.
         # 순서가 뒤집히면(발행 후 기록) 발행 직후~기록 전에 죽었을 때 상태가 pending으로
         # 남아 재개 경로가 **한 번 더 발행**하게 되고, 기록이 끝내 실패하면 그 청구는
-        # 재전달마다 리포트를 다시 낸다.
-        await mark_claim_published(self._pool, claim.claim_id)
+        # 재전달마다 리포트를 다시 낸다. 저품질 문서가 섞이면 대표 ReportJob이
+        # needs_reupload로 나가므로(_publish_claim_report) 그 사유를 함께 남긴다.
+        low_quality = any(doc.ocr_quality == "needs_reupload" for doc in docs)
+        await mark_claim_published(
+            self._pool, claim.claim_id, reupload_reason="unreadable" if low_quality else None
+        )
         await self._publish_claim_report(job, docs)
 
     async def _publish_needs_reupload(

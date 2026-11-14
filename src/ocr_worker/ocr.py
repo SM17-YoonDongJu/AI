@@ -26,10 +26,13 @@ from typing import Any, Protocol, runtime_checkable
 
 from core.config import Settings, get_settings
 from core.exceptions import OcrError, UnreadableFileError
-from core.logging import get_logger
+from core.logging import get_logger, timed
 from ocr_worker.storage import get_object
 
 logger = get_logger(__name__)
+
+# OCR 단계 소요 시간 이벤트(pipeline.py와 같은 이름 — 한 쿼리로 단계 전체를 본다).
+_STAGE_EVENT = "ocr.stage.finished"
 
 # 외부 라이브러리(PIL.Image) 객체 — lazy 의존이라 경계에서 Any로 둔다(§3 최후수단).
 type PageImage = Any
@@ -145,6 +148,7 @@ class PaddleOcrEngine:
         cpu_threads: int,
         enable_mkldnn: bool = True,
         det_limit_side_len: int = 0,
+        mkldnn_cache_capacity: int | None = None,
         factory: Callable[..., Any] | None = None,
     ) -> None:
         """엔진을 구성한다(모델은 아직 로드하지 않는다).
@@ -155,6 +159,8 @@ class PaddleOcrEngine:
             textline_orientation: 줄 방향 분류(뒤집힌 줄 보정) 사용 여부.
             cpu_threads: paddle 추론 스레드 수.
             enable_mkldnn: x86 oneDNN 가속 사용 여부(``ocr_enable_mkldnn`` 설정 주석 참고).
+            mkldnn_cache_capacity: oneDNN이 모델마다 캐시하는 입력 모양 수
+                (``ocr_mkldnn_cache_capacity`` 설정 주석 참고). ``None``이면 PaddleOCR 기본값(10).
             det_limit_side_len: 검출 입력의 긴 변 상한(픽셀). 큰 사진의 검출 메모리를 묶는다
                 (``ocr_det_limit_side_len`` 설정 주석 참고). 0이면 PaddleOCR 기본값(긴 변
                 4000까지 그대로).
@@ -172,6 +178,11 @@ class PaddleOcrEngine:
             "use_textline_orientation": textline_orientation,
             "cpu_threads": cpu_threads,
             "enable_mkldnn": enable_mkldnn,
+            **(
+                {"mkldnn_cache_capacity": mkldnn_cache_capacity}
+                if mkldnn_cache_capacity is not None
+                else {}
+            ),
             **det_limit,
             **_FIXED_PADDLE_OPTIONS,
         }
@@ -181,15 +192,24 @@ class PaddleOcrEngine:
         self._lock = threading.Lock()
 
     @classmethod
-    def from_settings(cls, settings: Settings) -> "PaddleOcrEngine":
-        """설정(``ocr_*``)으로 엔진을 만든다."""
+    def from_settings(
+        cls, settings: Settings, *, det_model: str | None = None
+    ) -> "PaddleOcrEngine":
+        """설정(``ocr_*``)으로 엔진을 만든다.
+
+        Args:
+            settings: 환경설정.
+            det_model: 검출 모델을 바꿀 때(재OCR 검증 전용 엔진 — ``ocr_verify_det_model``).
+                ``None``이면 ``ocr_det_model``.
+        """
         return cls(
-            det_model=settings.ocr_det_model,
+            det_model=det_model or settings.ocr_det_model,
             rec_model=settings.ocr_rec_model,
             textline_orientation=settings.ocr_textline_orientation,
             cpu_threads=settings.ocr_cpu_threads,
             enable_mkldnn=settings.ocr_enable_mkldnn,
             det_limit_side_len=settings.ocr_det_limit_side_len,
+            mkldnn_cache_capacity=settings.ocr_mkldnn_cache_capacity,
         )
 
     def load(self) -> None:
@@ -440,9 +460,16 @@ class OcrProcessor:
         Raises:
             OcrError: 다운로드·렌더·OCR 중 실패.
         """
-        data = await self._fetch(s3_key)
-        images = await asyncio.to_thread(self._render, data, content_type)
-        lines_per_page = await asyncio.to_thread(self._engine.recognize, images)
+        # 단계별 소요 시간(ocr.stage.finished) — 문서 1건이 가시성 안에 끝나는지 보는 SLI의 분해.
+        with timed(logger, _STAGE_EVENT, stage="s3_fetch") as fetched:
+            data = await self._fetch(s3_key)
+            fetched["bytes"] = len(data)
+        with timed(logger, _STAGE_EVENT, stage="render") as rendered:
+            images = await asyncio.to_thread(self._render, data, content_type)
+            rendered["pages"] = len(images)
+        with timed(logger, _STAGE_EVENT, stage="ocr_engine", pages=len(images)) as recognized:
+            lines_per_page = await asyncio.to_thread(self._engine.recognize, images)
+            recognized["lines"] = sum(len(lines) for lines in lines_per_page)
         result = _build_result(images, lines_per_page)
         logger.info(
             "ocr_done",

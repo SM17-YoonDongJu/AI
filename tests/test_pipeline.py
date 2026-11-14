@@ -40,7 +40,12 @@ from ocr_worker.masking.masker import Masker
 from ocr_worker.masking.spans import PiiLabel, Span
 from ocr_worker.masking.verify import MaskingError
 from ocr_worker.ocr import OcrLine, OcrPage, OcrResult
-from ocr_worker.pipeline import ImageTrackResult, OcrPipeline, _derive_report_id
+from ocr_worker.pipeline import (
+    ImageTrackResult,
+    OcrPipeline,
+    _blocked_reason,
+    _derive_report_id,
+)
 from ocr_worker.repository import ClaimDocument, DeleteRetryState, PendingDeletion
 from ocr_worker.vlm_client import VlmClientError
 
@@ -2379,9 +2384,36 @@ _DIAGNOSIS_DOC_ID = uuid.UUID("bbbb0000-0000-0000-0000-00000000000b")
 _OTHER_DOC_ID = uuid.UUID("cccc0000-0000-0000-0000-00000000000c")
 
 
-def _doc_row(doc_id: uuid.UUID, doc_type: DocType, *, ocr_quality: str = "ok") -> dict[str, Any]:
-    """``ai.ocr_results`` 형제 문서 조회가 돌려주는 행."""
-    return {"id": doc_id, "doc_type": doc_type.value, "ocr_quality": ocr_quality}
+def _doc_row(
+    doc_id: uuid.UUID,
+    doc_type: DocType,
+    *,
+    ocr_quality: str = "ok",
+    doc_type_confidence: float = 0.9,
+) -> dict[str, Any]:
+    """``ai.ocr_results`` 형제 문서 조회가 돌려주는 행(기본: 본문 단서로 유형을 판정한 문서)."""
+    return {
+        "id": doc_id,
+        "doc_type": doc_type.value,
+        "doc_type_confidence": doc_type_confidence,
+        "ocr_quality": ocr_quality,
+    }
+
+
+def _claim_doc(
+    doc_id: uuid.UUID,
+    doc_type: DocType,
+    *,
+    ocr_quality: str = "ok",
+    doc_type_confidence: float = 0.9,
+) -> ClaimDocument:
+    """판정 함수에 바로 넘길 청구 문서(기본: 본문 단서로 유형을 판정한 문서)."""
+    return ClaimDocument(
+        ocr_result_id=str(doc_id),
+        doc_type=doc_type,
+        doc_type_confidence=doc_type_confidence,
+        ocr_quality=ocr_quality,
+    )
 
 
 class _ClaimPool(FakePool):
@@ -2414,6 +2446,8 @@ class _ClaimPool(FakePool):
         self._progress_error = progress_error  # 청구 카운트 쓰기만 실패시키는 주입점
         self.blocked: list[tuple[str, list[str]]] = []
         self.published_marks: list[str] = []
+        # mark_claim_*가 남긴 재업로드 사유(blocked·published 순서대로). 정상 발행이면 None.
+        self.reupload_reasons: list[str | None] = []
         self.events: list[str] = []
 
     @property
@@ -2470,10 +2504,12 @@ class _ClaimPool(FakePool):
         await super().execute(sql, *args)
         if "status = 'blocked'" in sql:
             self.blocked.append((args[0], list(args[1])))
+            self.reupload_reasons.append(args[2])
             self.claim_status = "blocked"
             self.events.append("mark_blocked")
         elif "status = 'published'" in sql:
             self.published_marks.append(args[0])
+            self.reupload_reasons.append(args[1])
             self.claim_status = "published"
             self.events.append("mark_published")
 
@@ -2631,16 +2667,15 @@ async def test_claim_report_published_once_when_all_documents_terminal() -> None
     assert report.doc_type is DocType.POLICY
     assert pool.published_marks == [_CLAIM_ID]
     assert pool.blocked == []
+    assert pool.reupload_reasons == [None]  # 정상 리포트 — 재업로드 사유 없음
 
 
 async def test_claim_report_falls_back_to_first_document_without_policy_type() -> None:
     # 증권이 아예 없는 청구는 blocked라 여기 오지 않지만, 대표 선택 규칙 자체(증권 우선,
     # 없으면 doc_index 순 첫 문서)는 고정해 둔다 — 필수 유형이 바뀌어도 규칙은 남는다.
     docs = [
-        ClaimDocument(
-            ocr_result_id=str(_DIAGNOSIS_DOC_ID), doc_type=DocType.DIAGNOSIS, ocr_quality="ok"
-        ),
-        ClaimDocument(ocr_result_id=str(_OTHER_DOC_ID), doc_type=DocType.OTHER, ocr_quality="ok"),
+        _claim_doc(_DIAGNOSIS_DOC_ID, DocType.DIAGNOSIS),
+        _claim_doc(_OTHER_DOC_ID, DocType.OTHER),
     ]
     producer = FakeProducer()
     pipeline = _claim_pipeline(_ClaimPool(), producer, "무시됨")
@@ -2654,12 +2689,8 @@ async def test_claim_ocr_quality_is_aggregated_across_documents() -> None:
     # report_worker의 needs_reupload 스킵 로직이 청구 단위에서도 작동해야 한다 —
     # 문서 하나만 저품질이어도 리포트 전체의 신뢰도가 깎인다.
     docs = [
-        ClaimDocument(ocr_result_id=str(_POLICY_DOC_ID), doc_type=DocType.POLICY, ocr_quality="ok"),
-        ClaimDocument(
-            ocr_result_id=str(_DIAGNOSIS_DOC_ID),
-            doc_type=DocType.DIAGNOSIS,
-            ocr_quality="needs_reupload",
-        ),
+        _claim_doc(_POLICY_DOC_ID, DocType.POLICY),
+        _claim_doc(_DIAGNOSIS_DOC_ID, DocType.DIAGNOSIS, ocr_quality="needs_reupload"),
     ]
     producer = FakeProducer()
     pipeline = _claim_pipeline(_ClaimPool(), producer, "무시됨")
@@ -2691,6 +2722,8 @@ async def test_claim_blocked_when_required_doc_type_was_not_recognized() -> None
     # reports.status='NEEDS_REUPLOAD'로 통지받는 유일한 경로다(report_worker가 소비).
     assert pool.published_marks == []
     assert pool.blocked == [(_CLAIM_ID, ["policy"])]
+    # 문서 하나가 통째로 실패했다(incomplete) — 그 문서가 증권이었을 수 있어 판독 불가로 안내한다
+    assert pool.reupload_reasons == ["unreadable"]
     assert len(producer.published) == 1
     assert producer.published[0][1].ocr_quality == "needs_reupload"
     assert producer.published[0][1].report_id == _CLAIM_REPORT_ID
@@ -2713,6 +2746,7 @@ async def test_claim_blocked_lists_every_missing_required_type() -> None:
         await pipeline.handle(_claim_job(doc_index))
 
     assert pool.blocked == [(_CLAIM_ID, ["diagnosis", "policy"])]
+    assert pool.reupload_reasons == ["unreadable"]  # 전부 실패 — 내용을 볼 문서가 없다
     assert len(producer.published) == 1
     assert producer.published[0][1].ocr_quality == "needs_reupload"
 
@@ -2739,6 +2773,7 @@ async def test_claim_blocked_when_non_required_document_is_missing() -> None:
     # 여전히 needs_reupload로 발행되고 정상 리포트(published)는 안 나간다.
     assert pool.published_marks == []
     assert pool.blocked == [(_CLAIM_ID, [])]
+    assert pool.reupload_reasons == ["unreadable"]
     assert len(producer.published) == 1
     assert producer.published[0][1].ocr_quality == "needs_reupload"
     # 대표 문서는 성공한 문서 중에서 정상 규칙(증권 우선)으로 고른다.
@@ -2747,6 +2782,183 @@ async def test_claim_blocked_when_non_required_document_is_missing() -> None:
     assert len(warned) == 1
     assert warned[0]["missing"] == []
     assert warned[0]["incomplete"] is True
+
+
+# 4c. 재업로드 사유 — Backend가 사유별 안내 문구를 고르는 근거(ai.claim_readiness.reupload_reason)
+_HINT_ONLY = (
+    0.30000001192092896  # real 컬럼에서 읽은 HINT_ONLY_CONFIDENCE(본문 근거 없이 칸 유형 채택)
+)
+
+
+@pytest.mark.parametrize(
+    ("docs", "incomplete", "expected"),
+    [
+        # 1. 실패한 문서가 있으면 내용과 무관하게 판독 불가(그 문서가 필수 서류였을 수 있다)
+        ([_claim_doc(_OTHER_DOC_ID, DocType.OTHER, doc_type_confidence=0.0)], True, "unreadable"),
+        # 2. 저품질이면 본문 근거가 없어도 판독 불가 — 흐린 실제 서류가 무관한 사진보다 훨씬 흔하다
+        (
+            [
+                _claim_doc(
+                    _DIAGNOSIS_DOC_ID,
+                    DocType.DIAGNOSIS,
+                    doc_type_confidence=_HINT_ONLY,
+                    ocr_quality="needs_reupload",
+                )
+            ],
+            False,
+            "unreadable",
+        ),
+        # 2가 4보다 앞선다 — 필수 유형이 빠졌어도 저품질 문서가 있으면 먼저 선명하게를 안내한다
+        (
+            [_claim_doc(_DIAGNOSIS_DOC_ID, DocType.DIAGNOSIS, ocr_quality="needs_reupload")],
+            False,
+            "unreadable",
+        ),
+        # 3. 읽을 수 있는데 본문으로 유형을 판정한 문서가 없다 — 도메인 부적합
+        ([_claim_doc(_OTHER_DOC_ID, DocType.OTHER, doc_type_confidence=0.0)], False, "off_domain"),
+        (
+            [_claim_doc(_DIAGNOSIS_DOC_ID, DocType.DIAGNOSIS, doc_type_confidence=_HINT_ONLY)],
+            False,
+            "off_domain",
+        ),
+        # 4. 보험 문서는 인식했지만 필수 유형이 빠졌다
+        ([_claim_doc(_DIAGNOSIS_DOC_ID, DocType.DIAGNOSIS)], False, "missing_required"),
+    ],
+    ids=[
+        "incomplete",
+        "low-quality-without-evidence",
+        "low-quality-before-missing",
+        "all-other",
+        "hint-only-type",
+        "missing-required",
+    ],
+)
+def test_blocked_reason_priority(
+    docs: list[ClaimDocument], incomplete: bool, expected: str
+) -> None:
+    assert _blocked_reason(docs, incomplete=incomplete) == expected
+
+
+async def test_unrelated_files_in_typed_slots_publish_with_shadow_log() -> None:
+    # Arrange: 보험과 무관한 파일 두 개를 "보험증권"·"진단서" 칸에 올렸다. 분류는 칸의 유형을
+    # 채택해(본문 근거 없음) 필수 유형이 다 찬다. 같은 모양의 정상 청구(보험사 앱 캡처·영문
+    # 진단서)가 있어 막지 않고, 규모를 재도록 경고만 남긴다(_REQUIRED_DOC_TYPES 주석).
+    pool = _ClaimPool(
+        docs=[
+            _doc_row(_POLICY_DOC_ID, DocType.POLICY, doc_type_confidence=_HINT_ONLY),
+            _doc_row(_DIAGNOSIS_DOC_ID, DocType.DIAGNOSIS, doc_type_confidence=_HINT_ONLY),
+        ]
+    )
+    producer = FakeProducer()
+    pipeline = _claim_pipeline(pool, producer, "오늘 점심 메뉴는 김치찌개")
+
+    # Act
+    with capture_logs() as logs:
+        for doc_index in (1, 2):
+            await pipeline.handle(_claim_job(doc_index, doc_total=2))
+
+    # Assert: 예전처럼 발행된다(막지 않음). 재업로드 사유는 없다
+    assert pool.published_marks == [_CLAIM_ID]
+    assert pool.blocked == []
+    assert pool.reupload_reasons == [None]
+    assert producer.published[0][1].ocr_quality == "ok"
+    shadow = [e for e in logs if e["event"] == "claim_published_without_body_evidence"]
+    assert len(shadow) == 1
+    assert shadow[0]["doc_types"] == ["policy", "diagnosis"]
+
+
+async def test_blurry_documents_in_typed_slots_record_unreadable() -> None:
+    # Arrange: 흐리게 찍은 실제 증권·진단서 — 본문 단서를 못 읽어 칸 유형으로만 판정됐고 둘 다
+    # 저품질이다. 도메인 부적합이 아니라 "더 선명하게"가 맞는 안내다(QA 시나리오).
+    pool = _ClaimPool(
+        docs=[
+            _doc_row(
+                _POLICY_DOC_ID,
+                DocType.POLICY,
+                doc_type_confidence=_HINT_ONLY,
+                ocr_quality="needs_reupload",
+            ),
+            _doc_row(
+                _DIAGNOSIS_DOC_ID,
+                DocType.DIAGNOSIS,
+                doc_type_confidence=_HINT_ONLY,
+                ocr_quality="needs_reupload",
+            ),
+        ]
+    )
+    producer = FakeProducer()
+    pipeline = _claim_pipeline(pool, producer, "흐린 증권")
+
+    # Act
+    for doc_index in (1, 2):
+        await pipeline.handle(_claim_job(doc_index, doc_total=2))
+
+    # Assert
+    assert pool.published_marks == [_CLAIM_ID]
+    assert pool.reupload_reasons == ["unreadable"]
+    assert producer.published[0][1].ocr_quality == "needs_reupload"
+
+
+async def test_claim_blocked_as_off_domain_when_no_document_is_recognized() -> None:
+    # Arrange: 칸 유형 없이 올린 무관한 문서 — 둘 다 OTHER, 필수 유형도 빠진다
+    pool = _ClaimPool(
+        docs=[
+            _doc_row(_OTHER_DOC_ID, DocType.OTHER, doc_type_confidence=0.0),
+            _doc_row(_DIAGNOSIS_DOC_ID, DocType.OTHER, doc_type_confidence=0.0),
+        ]
+    )
+    producer = FakeProducer()
+    pipeline = _claim_pipeline(pool, producer, "오늘 점심 메뉴는 김치찌개")
+
+    # Act
+    for doc_index in (1, 2):
+        await pipeline.handle(_claim_job(doc_index, doc_total=2))
+
+    # Assert
+    assert pool.blocked == [(_CLAIM_ID, ["diagnosis", "policy"])]
+    assert pool.reupload_reasons == ["off_domain"]
+
+
+async def test_claim_blocked_as_missing_required_when_insurance_documents_lack_policy() -> None:
+    # Arrange: 보험 문서(진단서·영수증)는 본문으로 인식했지만 보험증권이 없다
+    pool = _ClaimPool(
+        docs=[
+            _doc_row(_DIAGNOSIS_DOC_ID, DocType.DIAGNOSIS),
+            _doc_row(_OTHER_DOC_ID, DocType.MEDICAL_RECEIPT),
+        ]
+    )
+    producer = FakeProducer()
+    pipeline = _claim_pipeline(pool, producer, "진단서", "상병명 골절")
+
+    # Act
+    for doc_index in (1, 2):
+        await pipeline.handle(_claim_job(doc_index, doc_total=2))
+
+    # Assert
+    assert pool.blocked == [(_CLAIM_ID, ["policy"])]
+    assert pool.reupload_reasons == ["missing_required"]
+
+
+async def test_published_claim_with_low_quality_document_records_unreadable() -> None:
+    # Arrange: 필수 유형은 다 있지만 진단서 하나가 저품질이다 — 대표 ReportJob이 needs_reupload로
+    # 나가 리포트가 NEEDS_REUPLOAD가 되므로, published여도 사유를 남겨야 Backend가 안내할 수 있다
+    pool = _ClaimPool(
+        docs=[
+            _doc_row(_POLICY_DOC_ID, DocType.POLICY),
+            _doc_row(_DIAGNOSIS_DOC_ID, DocType.DIAGNOSIS, ocr_quality="needs_reupload"),
+        ]
+    )
+    producer = FakeProducer()
+    pipeline = _claim_pipeline(pool, producer, "보험증권", "증권번호 202301-042")
+
+    # Act
+    for doc_index in (1, 2):
+        await pipeline.handle(_claim_job(doc_index, doc_total=2))
+
+    # Assert
+    assert pool.published_marks == [_CLAIM_ID]
+    assert pool.reupload_reasons == ["unreadable"]
+    assert producer.published[0][1].ocr_quality == "needs_reupload"
 
 
 # 5. 마지막 문서가 **실패**여도 나머지가 필수 유형을 채우면 발행된다(설계의 핵심)
@@ -2945,6 +3157,7 @@ async def test_redelivered_document_resumes_into_blocked_when_required_type_miss
 
     assert pool.published_marks == []
     assert pool.blocked == [(_CLAIM_ID, ["policy"])]
+    assert pool.reupload_reasons == ["unreadable"]  # 재개한 판정도 사유를 남긴다
     assert pool.terminal_job_ids == counted
     assert len(producer.published) == 1
     assert producer.published[0][1].ocr_quality == "needs_reupload"
@@ -3087,3 +3300,293 @@ async def test_publish_mark_is_written_before_the_report_is_sent() -> None:
     # Assert: 타임라인에서 mark_published가 publish보다 **앞**이어야 한다.
     assert "mark_published" in pool.events and "publish" in pool.events
     assert pool.events.index("mark_published") < pool.events.index("publish")
+
+
+# ── 성능 계측(ocr.job.finished · ocr.stage.finished) ──────────────────
+# 문서 1건이 가시성 안에 끝나는지 보는 SLI다. 단계 이름은 대시보드·쿼리가 기대는 계약이라 고정한다.
+async def test_process_emits_stage_and_job_timing_events() -> None:
+    # Arrange: VLM 보완이 필요 없는 단독 진단서(고신뢰도)
+    pool = FakePool(existing=None)
+    producer = FakeProducer()
+    processor = FakeProcessor(_result("진단서", "상병명 골절"))
+    pipeline = _pipeline(pool, producer, processor)
+
+    # Act
+    with capture_logs() as logs:
+        await pipeline.handle(_job(doc_total=None))
+
+    # Assert: 단계는 실행 순서대로 1건씩, VLM 단계는 트리거되지 않아 없다
+    stages = [e for e in logs if e["event"] == "ocr.stage.finished"]
+    assert [e["stage"] for e in stages] == [
+        "analyze",
+        "quality_check",
+        "image_pipeline",
+        "db_save",
+        "publish",
+    ]
+    assert all(e["status"] == "ok" and isinstance(e["duration_ms"], int) for e in stages)
+    # 문서 단위 요약 — 분류값·건수·불리언만(원문 없음, §9)
+    [job] = [e for e in logs if e["event"] == "ocr.job.finished"]
+    assert job["status"] == "ok"
+    assert (job["pages"], job["doc_type"], job["needs_vlm"]) == (1, "diagnosis", False)
+    assert (job["vlm_adopted"], job["ocr_quality"]) == (False, "ok")
+    assert job["duration_ms"] >= max(e["duration_ms"] for e in stages)
+    assert "골절" not in str(job)
+
+
+async def test_failed_process_still_emits_job_timing_with_error_type() -> None:
+    # Arrange: OCR 단계 실패(일시 장애) — 실패한 문서의 시간도 SLI 모수에 들어가야 한다
+    pool = FakePool(existing=None)
+    pipeline = _pipeline(pool, FakeProducer(), _RaisingProcessor(OcrError("S3 다운로드 실패")))
+
+    # Act
+    with capture_logs() as logs, pytest.raises(OcrError):
+        await pipeline.handle(_job())
+
+    # Assert: 예외는 그대로 올라가고(처분 불변), 이벤트엔 타입만 남는다
+    [job] = [e for e in logs if e["event"] == "ocr.job.finished"]
+    assert (job["status"], job["error_type"]) == ("failed", "OcrError")
+    assert "다운로드" not in str(job)
+
+
+# ── 원본 삭제 게이트의 잔류 검사 방식(ocr_verify_mode, 성능 실험 O3) ──────────
+def _name_and_phone_page() -> OcrResult:
+    """이름 라인은 검은블럭으로 가려지고, 연락처 라인은 이미지 검출에서 빠져 그대로 남는 페이지.
+
+    텍스트 마스킹(정규식)은 연락처를 가리므로 저장 텍스트엔 문제가 없지만, 이미지 사본엔 연락처가
+    남는다 — 재OCR(5.2)과 텍스트 검사(5.2')가 서로 다르게 판정할 수 있는 경우다.
+    """
+    page = OcrPage(
+        index=0,
+        width=100,
+        height=50,
+        lines=(_line("보험증권 계약자 홍길동"), _line("연락처 010-1234-5678")),
+    )
+    return OcrResult(pages=(page,))
+
+
+async def _run_gate(mode: str, engine: _FakeReocrEngine) -> tuple[_RecordingS3, list[Any]]:
+    s3 = _RecordingS3()
+    pipeline = _gate_pipeline(
+        FakePool(existing=None),
+        FakeProducer(),
+        FakeProcessor(_name_and_phone_page(), engine=engine),
+        s3,
+        _RecordingCoverage(ratio=1.0),
+        settings=Settings(ocr_verify_mode=mode),
+    )
+    with capture_logs() as logs:
+        await pipeline.handle(_job())
+        await pipeline.wait_for_pending_deletes()
+    return s3, logs
+
+
+async def test_text_verify_mode_skips_reocr_and_keeps_original_on_residual() -> None:
+    # Arrange: 재OCR 대역은 아무것도 못 읽는다고 답한다 — text 모드면 불리지 않아야 한다
+    engine = _FakeReocrEngine("")
+
+    # Act
+    s3, logs = await _run_gate("text", engine)
+
+    # Assert: OCR 엔진을 다시 돌리지 않고, 가려지지 않은 연락처 라인 때문에 원본을 지우지 않는다
+    assert engine.seen_images == []
+    assert ("delete", "uploads/x.pdf") not in s3.events
+    assert [e for e in logs if e["event"] == "ocr.verify.shadow"] == []
+
+
+async def test_shadow_verify_mode_decides_by_reocr_and_logs_disagreement() -> None:
+    # Arrange: 재OCR은 잔류 없음(통과), 텍스트 검사는 연락처 잔류(실패) — 판정이 갈린다
+    engine = _FakeReocrEngine("")
+
+    # Act
+    s3, logs = await _run_gate("shadow", engine)
+
+    # Assert: 게이트는 재OCR 판정 그대로(원본 삭제), 텍스트 판정은 섀도 이벤트로만 남는다
+    assert engine.seen_images == ["redacted-0"]
+    assert ("delete", "uploads/x.pdf") in s3.events
+    [shadow] = [e for e in logs if e["event"] == "ocr.verify.shadow"]
+    assert (shadow["agree"], shadow["reocr_passed"], shadow["text_passed"]) == (False, True, False)
+    assert shadow["text_only_labels"] == [PiiLabel.PHONE.value]
+    assert "010-1234-5678" not in str(shadow)  # 값은 남기지 않는다(§9)
+
+
+async def test_reocr_verify_mode_keeps_previous_behavior_without_shadow() -> None:
+    # Arrange
+    engine = _FakeReocrEngine("")
+
+    # Act
+    s3, logs = await _run_gate("reocr", engine)
+
+    # Assert: 기존 동작(재OCR 판정)과 같고 섀도 계산·이벤트가 없다
+    assert engine.seen_images == ["redacted-0"]
+    assert ("delete", "uploads/x.pdf") in s3.events
+    assert [e for e in logs if e["event"] == "ocr.verify.shadow"] == []
+
+
+# ── 재OCR 검증 전용 엔진(ocr_verify_det_model, 성능 실험 O3b) ─────────────────
+async def test_reocr_uses_dedicated_verify_engine_not_main_engine() -> None:
+    # Arrange: 메인 엔진은 아무것도 못 읽고, 검증 전용 엔진은 사본에서 주민번호를 읽는다
+    main_engine = _FakeReocrEngine("")
+    verify_engine = _FakeReocrEngine("901010-1234567")
+    s3 = _RecordingS3()
+    pipeline = _gate_pipeline(
+        FakePool(existing=None),
+        FakeProducer(),
+        FakeProcessor(_multi_page_result("보험증권 계약자 홍길동"), engine=main_engine),
+        s3,
+        _RecordingCoverage(ratio=1.0),
+        verify_engine=verify_engine,
+        settings=Settings(ocr_verify_mode="reocr"),
+    )
+
+    # Act
+    await pipeline.handle(_job())
+    await pipeline.wait_for_pending_deletes()
+
+    # Assert: 재OCR은 검증 전용 엔진만 읽었고, 그 판정(잔류 PII)대로 원본을 지우지 않는다
+    assert verify_engine.seen_images == ["redacted-0"]
+    assert main_engine.seen_images == []
+    assert ("delete", "uploads/x.pdf") not in s3.events
+
+
+@pytest.mark.parametrize(
+    ("verify_det_model", "builds_separate"),
+    [(None, False), ("PP-OCRv5_server_det", False), ("PP-OCRv5_mobile_det", True)],
+)
+def test_verify_engine_selection_by_setting(
+    monkeypatch: pytest.MonkeyPatch, verify_det_model: str | None, builds_separate: bool
+) -> None:
+    # Arrange: 메인과 다른 검출 모델일 때만 가벼운 검증 엔진을 만든다(같으면 메인을 재사용)
+    built: list[str | None] = []
+    sentinel = object()
+
+    def fake_from_settings(settings: Settings, *, det_model: str | None = None) -> object:
+        built.append(det_model)
+        return sentinel
+
+    monkeypatch.setattr(pipeline_module.PaddleOcrEngine, "from_settings", fake_from_settings)
+    main_engine = _FakeReocrEngine("")
+    pipeline = _pipeline(
+        FakePool(existing=None),
+        FakeProducer(),
+        FakeProcessor(_multi_page_result("x"), engine=main_engine),
+        settings=Settings(
+            ocr_det_model="PP-OCRv5_server_det", ocr_verify_det_model=verify_det_model
+        ),
+    )
+
+    # Act: 두 번 불러도 한 번만 만든다. fast=False면 언제나 메인 엔진
+    first = pipeline._verify_engine(fast=True)
+    second = pipeline._verify_engine(fast=True)
+    main = pipeline._verify_engine(fast=False)
+
+    # Assert
+    assert first is second
+    assert main is main_engine
+    if builds_separate:
+        assert first is sentinel
+        assert built == ["PP-OCRv5_mobile_det"]
+    else:
+        assert first is main_engine
+        assert built == []
+
+
+# ── 조건부 가벼운 검증(O3c): VLM 재판독이 제 몫을 한 문서에만 ──────────────────
+def _conf_result(*confidences: float) -> OcrResult:
+    """라인 신뢰도만 지정한 1쪽 결과(텍스트는 무관)."""
+    lines = tuple(_line(f"줄{i}", confidence=c) for i, c in enumerate(confidences))
+    return OcrResult(pages=(OcrPage(index=0, width=100, height=50, lines=lines),))
+
+
+def _fast_pipeline(**settings: Any) -> OcrPipeline:
+    return _pipeline(
+        FakePool(existing=None),
+        FakeProducer(),
+        FakeProcessor(_multi_page_result("x"), engine=_FakeReocrEngine("")),
+        verify_engine=_FakeReocrEngine(""),
+        settings=Settings(ocr_low_confidence_threshold=0.9, **settings),
+    )
+
+
+@pytest.mark.parametrize(
+    ("confidences", "reread", "expected"),
+    [
+        pytest.param((0.99, 0.95), None, True, id="고신뢰-재판독-불필요"),
+        pytest.param((0.99, 0.42), None, False, id="저신뢰-재판독-안-돎"),
+        pytest.param((0.99, 0.42), [["a", "b"]], True, id="저신뢰-전부-재판독"),
+        pytest.param((0.99, 0.42), [["a", None]], False, id="저신뢰-라인-재판독-실패"),
+        pytest.param((0.42, 0.99), [["a", None]], True, id="고신뢰-라인만-빔은-무관"),
+    ],
+)
+def test_use_fast_verify_only_when_reread_covered_low_confidence_lines(
+    confidences: tuple[float, ...], reread: list[list[str | None]] | None, expected: bool
+) -> None:
+    # Arrange
+    pipeline = _fast_pipeline()
+    result = _conf_result(*confidences)
+
+    # Act / Assert: 재판독이라는 1차 방어선이 제 몫을 했을 때만 가볍게 검증한다
+    assert pipeline._use_fast_verify(result, reread) is expected
+
+
+def test_use_fast_verify_always_when_condition_disabled() -> None:
+    # Arrange: 조건을 끄면 O3b(항상 가벼운 엔진) — 실험용
+    pipeline = _fast_pipeline(ocr_verify_fast_requires_reread=False)
+
+    # Act / Assert
+    assert pipeline._use_fast_verify(_conf_result(0.42), None) is True
+
+
+def test_use_fast_verify_false_without_fast_engine() -> None:
+    # Arrange: 가벼운 엔진이 없으면(기본 설정) 늘 메인 엔진
+    pipeline = _pipeline(
+        FakePool(existing=None),
+        FakeProducer(),
+        FakeProcessor(_multi_page_result("x"), engine=_FakeReocrEngine("")),
+    )
+
+    # Act / Assert
+    assert pipeline._use_fast_verify(_conf_result(0.99), None) is False
+
+
+async def test_low_confidence_doc_with_failed_reread_is_verified_by_main_engine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Arrange: 저신뢰 문서인데 VLM 재판독이 전부 실패(VLM 서버 꺼짐) — 재OCR이 마지막 방어선이다
+    async def failed_reread(images: Any, pages: Any) -> list[list[str | None]]:
+        return [[None] * len(page.lines) for page in pages]
+
+    main_engine = _FakeReocrEngine("901010-1234567")  # 메인 재OCR은 잔류 주민번호를 읽는다
+    fast_engine = _FakeReocrEngine("")
+    s3 = _RecordingS3()
+    pipeline = OcrPipeline(
+        pool=FakePool(existing=None),
+        producer=FakeProducer(),  # type: ignore[arg-type]
+        processor=FakeProcessor(  # type: ignore[arg-type]
+            _multi_page_result("보험증권 계약자 홍길동", confidence=0.4), engine=main_engine
+        ),
+        image_masker=ImageMasker(
+            detect=_detect_name,
+            redactor=_fake_redactor,
+            reread=failed_reread,
+            reread_confidence_threshold=0.9,
+        ),
+        coverage=_RecordingCoverage(ratio=1.0),
+        upload=s3.upload,
+        delete=s3.delete,
+        verify_engine=fast_engine,
+        vlm_transcribe=_RecordingVlm(error=VlmClientError("연결 실패")),
+        settings=Settings(ocr_low_confidence_threshold=0.9),
+    )
+
+    # Act
+    with capture_logs() as logs:
+        await pipeline.handle(_job())
+        await pipeline.wait_for_pending_deletes()
+
+    # Assert: 가벼운 엔진이 아니라 메인 엔진이 검증했고, 잔류 PII로 원본을 지우지 않는다
+    assert main_engine.seen_images == ["redacted-0"]
+    assert fast_engine.seen_images == []
+    assert ("delete", "uploads/x.pdf") not in s3.events
+    [verify] = [e for e in logs if e["event"] == "ocr.stage.finished" and e["stage"] == "verify"]
+    assert verify["engine"] == "main"

@@ -5,6 +5,7 @@
 꽂아 SDK가 실제로 내보내는 요청(헤더·본문)과 스트리밍 응답 처리를 함께 확인한다.
 """
 
+import asyncio
 import json
 from collections.abc import Callable
 from typing import Any
@@ -47,6 +48,16 @@ def _local_providers(monkeypatch: pytest.MonkeyPatch) -> None:
     # Arrange: 개발자 셸의 LLM_PROVIDER 등이 새어 들지 않게 기본(로컬) provider로 고정한다.
     monkeypatch.setattr(settings, "llm_provider", "openai_compat")
     monkeypatch.setattr(settings, "embedding_provider", "openai_compat")
+
+
+_CHAT_FINISHED = "ai_client.chat.finished"
+
+
+def _without_usage(
+    records: list[tuple[str, str, dict[str, Any]]],
+) -> list[tuple[str, str, dict[str, Any]]]:
+    """계측 이벤트(호출별 시간·토큰)를 뺀 로그 — 동작 로그만 비교하는 테스트용."""
+    return [record for record in records if record[1] != _CHAT_FINISHED]
 
 
 class _RecordingLogger:
@@ -517,9 +528,9 @@ async def test_anthropic_chat_joins_text_across_fallback_and_logs_models_only(
     # Act
     reply = await ai_client.chat(_CHAT_MESSAGES)
 
-    # Assert: 텍스트는 이어 붙이고, 로그엔 모델명만(원문 없음)
+    # Assert: 텍스트는 이어 붙이고, 로그엔 모델명만(원문 없음). 계측 이벤트는 별도 테스트가 본다
     assert reply == "앞부분 뒷부분"
-    assert log.records == [
+    assert _without_usage(log.records) == [
         (
             "info",
             "ai_client.chat.fallback_served",
@@ -541,9 +552,52 @@ async def test_anthropic_refusal_raises_without_content(log: _RecordingLogger) -
 
     # Assert: 예외·로그에 프롬프트·설명 원문이 없고 카테고리만 남는다
     assert "질문 본문" not in str(caught.value)
-    assert log.records == [
+    assert _without_usage(log.records) == [
         ("warning", "ai_client.chat.refused", {"model": "claude-opus-5-5", "category": "bio"})
     ]
+
+
+@pytest.mark.usefixtures("claude")
+@pytest.mark.parametrize(
+    ("stop_reason", "raises"), [("end_turn", None), ("refusal", ai_client.LlmRefusalError)]
+)
+async def test_anthropic_chat_logs_duration_and_usage_without_content(
+    stop_reason: str, raises: type[Exception] | None, log: _RecordingLogger
+) -> None:
+    # Arrange: 정상 응답과 거절 — 거절도 시간·토큰을 쓴 호출이라 남아야 한다
+    body = _sse(blocks=[{"type": "text", "text": "응답 본문"}], stop_reason=stop_reason)
+    _install_anthropic(_stream_reply(body))
+
+    # Act
+    if raises is None:
+        await ai_client.chat(_CHAT_MESSAGES)
+    else:
+        with pytest.raises(raises):
+            await ai_client.chat(_CHAT_MESSAGES)
+
+    # Assert: 호출 1건당 이벤트 1건, 모델명·토큰 수·시간만 싣는다(프롬프트·응답 원문 없음)
+    finished = [fields for _, event, fields in log.records if event == _CHAT_FINISHED]
+    assert len(finished) == 1
+    fields = finished[0]
+    assert set(fields) == {
+        "event_type",
+        "provider",
+        "model",
+        "duration_ms",
+        "stop_reason",
+        "input_tokens",
+        "output_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+        "effort",
+    }
+    assert fields["provider"] == "anthropic"
+    assert fields["model"] == "claude-opus-5-5"
+    assert fields["stop_reason"] == stop_reason
+    assert (fields["input_tokens"], fields["output_tokens"]) == (12, 7)
+    assert isinstance(fields["duration_ms"], int)
+    assert fields["duration_ms"] >= 0
+    assert not any("본문" in str(value) for value in fields.values())
 
 
 @pytest.mark.usefixtures("claude")
@@ -742,3 +796,69 @@ def test_to_anthropic_messages_rejects_unknown_role() -> None:
     # Act / Assert
     with pytest.raises(ValueError, match="tool"):
         ai_client._to_anthropic_messages([{"role": "tool", "content": "x"}])
+
+
+# ── 호출 단위 전체 상한(성능 실험 R5) ─────────────────────────────────
+# SDK·httpx 타임아웃은 청크 사이 간격이라, 200 OK 뒤 스트림이 멈추면 끊지 못했다(dev 실측 30분+).
+_DEADLINE_S = 0.2
+_TEST_GUARD_S = 2.0  # 상한이 동작하지 않아도 테스트 자체는 멈추지 않게
+
+
+def _stalled_stream_reply() -> Callable[[httpx2.Request], httpx2.Response]:
+    """첫 SSE 이벤트(message_start)만 보내고 끝나지 않는 스트림으로 응답한다."""
+    first_event = _sse(blocks=[{"type": "text", "text": "x"}]).split(b"\n\n")[0] + b"\n\n"
+
+    async def stalled() -> Any:
+        yield first_event
+        await asyncio.Event().wait()  # 서버가 더 보내지 않는다
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(
+            200, headers={"content-type": "text/event-stream"}, content=stalled()
+        )
+
+    return handler
+
+
+@pytest.mark.usefixtures("claude")
+async def test_anthropic_stalled_stream_is_cut_at_call_deadline(
+    monkeypatch: pytest.MonkeyPatch, log: _RecordingLogger
+) -> None:
+    # Arrange
+    monkeypatch.setattr(settings, "llm_call_deadline_seconds", _DEADLINE_S)
+    _install_anthropic(_stalled_stream_reply())
+
+    # Act
+    async with asyncio.timeout(_TEST_GUARD_S):
+        with pytest.raises(ai_client.AiClientError, match="전체 상한"):
+            await ai_client.chat(_CHAT_MESSAGES)
+
+    # Assert: 리포트 그래프가 llm_system_failure로 멈추고 재전달되도록 AiClientError로 올린다.
+    # 로그엔 상한·시간·모델명만(본문 없음)
+    [(level, _, fields)] = [r for r in log.records if r[1] == "ai_client.chat.deadline_exceeded"]
+    assert level == "warning"
+    assert (fields["provider"], fields["deadline_s"]) == ("anthropic", _DEADLINE_S)
+    assert fields["duration_ms"] >= _DEADLINE_S * 1000 * 0.9
+    assert "질문 본문" not in str(fields)
+
+
+async def test_openai_compat_hanging_server_is_cut_at_call_deadline(
+    monkeypatch: pytest.MonkeyPatch, log: _RecordingLogger
+) -> None:
+    # Arrange: 응답을 끝내 주지 않는 서버
+    monkeypatch.setattr(settings, "llm_call_deadline_seconds", _DEADLINE_S)
+
+    async def never_responds(request: httpx.Request) -> httpx.Response:
+        await asyncio.Event().wait()
+        raise AssertionError("도달하지 않는다")
+
+    _install_mock(never_responds)
+
+    # Act
+    async with asyncio.timeout(_TEST_GUARD_S):
+        with pytest.raises(ai_client.AiClientError, match="전체 상한"):
+            await ai_client.chat(_CHAT_MESSAGES)
+
+    # Assert
+    [(_, _, fields)] = [r for r in log.records if r[1] == "ai_client.chat.deadline_exceeded"]
+    assert fields["provider"] == "openai_compat"

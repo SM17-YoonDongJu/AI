@@ -28,7 +28,8 @@
 --        `UPDATE reports SET applicable_guarantees=..., omitted_special_contract=...,
 --         basis_terms_precedents=..., claimed_min_amount=..., claimed_max_amount=...,
 --         status='AWAITING_ADOPTION', updated_at=now() WHERE id=$1`로 쓴다(가드레일 차단 시엔
---        status='BLOCKED'로만 쓰는 경로도 있음, 961행). 이 7개 컬럼 외에는 report_worker가 절대
+--        status='BLOCKED'로만 쓰는 경로도 있음, 961행). 2026-11-11부터 persist가 confidence_level도
+--        따로 쓴다(리포트 신뢰도 등급). 이 8개 컬럼 외에는 report_worker가 절대
 --        건드리면 안 되므로(user_id·adjuster_id·case_no 등) 컬럼 한정 GRANT로 막아둔다.
 --        처음엔 이 발견 전이라 이 GRANT가 빠져 있었다 — report_worker(#11)를 직접 안 열어보고
 --        contracts.md만 보고 설계했던 게 원인. dev에 이미 schema_split.sql을 돌렸다면 이 파일을
@@ -313,11 +314,14 @@ BEGIN
 
     -- report_worker(#11, 미머지)가 실제로 쓰는 core.reports 컬럼만 UPDATE 허용 — 나머지
     -- (user_id·adjuster_id·case_no 등)는 절대 안 건드려야 하므로 컬럼 한정으로 연다.
+    -- confidence_level(2026-11-11 추가): persist가 리포트 신뢰도 등급(HIGH|MEDIUM|LOW)을 쓴다.
+    -- backend가 고객 상세·검수 화면에 내려주는 컬럼이다. 이 권한이 없으면 report_worker는 이 값만
+    -- 건너뛰고(경고 로그) 나머지는 저장한다 — 배포 순서와 무관하게 리포트는 깨지지 않는다.
     IF to_regclass('core.reports') IS NOT NULL THEN
         EXECUTE 'GRANT SELECT ON core.reports TO ai_owner';
         EXECUTE 'GRANT UPDATE (
             applicable_guarantees, omitted_special_contract, basis_terms_precedents,
-            claimed_min_amount, claimed_max_amount, status, updated_at
+            claimed_min_amount, claimed_max_amount, status, updated_at, confidence_level
         ) ON core.reports TO ai_owner';
     END IF;
 
@@ -329,6 +333,10 @@ BEGIN
         EXECUTE 'GRANT INSERT, DELETE ON core.report_issues TO ai_owner';
         EXECUTE 'GRANT SELECT (report_id) ON core.report_issues TO ai_owner';
     END IF;
+
+    -- core.encryption_keys는 여기서 열지 않는다. report의 PII 복호화(core.crypto)는 dev·local에서 env 키
+    -- (PII_ENC_KEY)를 쓰고, KMS로 wrapped DEK를 푸는 건 prod뿐이다. prod 권한(4개 컬럼 SELECT)은
+    -- deploy/schema_split.prod.sql에 있다. dev를 KMS 경로로 바꾸면 같은 컬럼을 ai_owner에 열어야 한다.
 
     -- 기존 FK(user_insurances.ocr_result_id, report_attachments.ocr_result_id →
     -- ai.ocr_results(id))는 이동 후에도 유효하지만, backend가 앞으로 ai.ocr_results를

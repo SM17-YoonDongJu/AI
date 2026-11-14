@@ -40,6 +40,14 @@ uv run python -m ocr_worker
 | 필수 유형 누락 또는 인식 불완전 | `blocked` | `ReportJob(ocr_quality=needs_reupload)` |
 | 단독 문서(`claim_id`·`doc_total` 없음) | — | 문서별로 즉시 발행 |
 
+`blocked` 청구에는 사용자 안내 근거로 `reupload_reason`을 남긴다(`pipeline._blocked_reason`, Backend가 읽는다). 위에서부터 먼저 맞는 것이 사유다.
+
+1. 처리에 실패한 문서나 저품질 문서(`ocr_quality=needs_reupload`)가 있다 → `unreadable`. 흐린 실제 서류가 무관한 사진보다 훨씬 흔해서 먼저 본다.
+2. 읽을 수 있지만 본문 단서로 보험·의료 문서 유형을 판정한 문서가 하나도 없다 → `off_domain`. 업로드 칸이 정한 유형(hint)만으로 채택된 문서(`classify.is_body_evidenced`가 False)는 세지 않는다.
+3. 그 외(보험 문서는 인식했지만 필수 유형이 빠졌다) → `missing_required`
+
+`published`여도 저품질 문서가 섞여 대표 `ReportJob`이 `needs_reupload`로 나가면 `unreadable`을 남긴다. 칸 유형으로만 필수 유형이 채워진 청구(본문 근거 문서 0건)는 막지 않고 `claim_published_without_body_evidence` 경고만 남긴다(`_REQUIRED_DOC_TYPES` 주석).
+
 ## 실패 처리
 
 | 실패 종류 | 예 | 처리 |

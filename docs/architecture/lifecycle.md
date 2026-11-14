@@ -118,7 +118,7 @@ load_context → input_guardrail →⟨차단?⟩→ persist_blocked → END
                                      → coverage_analysis → case_search →⟨후유장해?⟩
                                         → disability_rag → disability_calc ─┐
                                         └──────────────(불필요)────────────→ payment_calc
-                                     → report_compose → output_guardrail → persist → END
+                                     → report_compose → output_guardrail → collect_metrics → persist → END
 ```
 
 김씨 사례(교통사고·후유장해)를 이 흐름에 태워 노드별로 따라가 보자.
@@ -132,7 +132,7 @@ load_context → input_guardrail →⟨차단?⟩→ persist_blocked → END
 이걸 합쳐 `case_info`·`masked_text`·`entities`·`subscribed_coverages`를 만든다. `enrolled_at`(가입일)은 나중에 "김씨 계약 시점에 유효했던 장해분류표 판(version)"을 고르는 열쇠가 된다.
 > OCR 결과가 비면 `errors`에 `ocr_result_missing`을 남긴다 — 이건 뒤에서 "재시도해야 할 하드 실패"로 취급된다.
 
-**② `input_guardrail` — 입구 검문.** 마스킹 텍스트를 한 번 더 가리고(재마스킹), 보험·법률과 무관한 내용이면 차단한다(`agents.py:123-129`). 김씨 진단서는 통과.
+**② `input_guardrail` — 입구 검문.** 마스킹 텍스트를 한 번 더 가리고(재마스킹), 사용자가 직접 쓴 글이 보험·법률과 무관하면 차단한다. 질문은 도메인 밖 키워드가 있으면, 사고 경위·추가 정보는 사고 얘기 없이 "코인 시세 알려주세요"처럼 도메인 밖 용건을 묻거나 부탁하면 막는다. 서류 본문은 차단 기준으로 쓰지 않는다. 증권의 "○○보험 주식회사" 같은 회사 이름이나 "요리하다가 데었다" 같은 사고 경위에 키워드가 정상적으로 섞여 있어서다(2026-11-14, #103). 김씨 진단서는 통과.
 - 만약 차단되면 갈림길 `route_after_input`이 `blocked`을 반환해 **뒤의 LLM 단계를 전부 건너뛰고** `persist_blocked`로 직행한다. 비용·오출력을 막고, 상태가 "처리중"에 영원히 갇히는 것을 막기 위함이다.
 
 **③ `diagnosis` — 진단 분석(LLM).** 마스킹 텍스트를 LLM에 주고 진단명·ICD·사고유형(7종 중 하나)·**후유장해 검토 필요 여부**(`requires_disability_review`)를 JSON으로 뽑는다(`agents.py:136-167`). 김씨는 `accident_type=traffic`, `requires_disability_review=true`로 판정된다. 이 true 값이 나중 갈림길을 가른다.
@@ -167,10 +167,12 @@ load_context → input_guardrail →⟨차단?⟩→ persist_blocked → END
 
 **⑪ `report_compose` — 리포트 본문 조립(LLM 2회 + 생성 가드레일).** 9개 섹션(사건요약·적용특약·누락가능특약·약관근거·판례근거·추정보상범위·장해지급률·본문·추가확인필요)과 쟁점(issues)을 Markdown으로 엮는다(`agents.py:486-557`). 이때 **생성 가드레일**이 "정확히 3,000만 원"처럼 단정하는 금액 표현을 "참고 추정 범위"로 바꾼다.
 
-**⑫ `output_guardrail` — 출구 검문(고지문 + LLM Judge).** 법적 고지문을 삽입하고, LLM Judge가 인용이 실제 근거와 맞는지 검증한다(`run_judge=True`, `agents.py:561-566`). 실패는 `judge_failures`로 따로 기록한다.
+**⑫ `output_guardrail` — 출구 검문(고지문 + LLM Judge).** 법적 고지문을 삽입하고, LLM Judge가 인용이 실제 근거와 맞는지 검증한다(`run_judge=True`, `agents.py:561-566`). 실패는 `judge_failures`로 따로 기록한다. 2026-11-11부터 근거는 약관 → 장해분류표 → 판례 순(중복 제거)이고, Judge가 실제로 본 범위(글자 수·근거 청크 수)를 `judge_stats`로 남긴다.
 > ⚠️ 정직 표기: LLM Judge는 현재 "탐지는 하되 조치는 안 하는" **관찰 전용**이다. 문서가 약속한 인용 강제·환각 섹션 자동삭제는 미구현이다.
 
-**⑬ `persist` — 저장(정상 종료).** 한 트랜잭션 안에서 세 테이블에 쓴다(`agents.py:570-630`).
+**⑫′ `collect_metrics` — 리포트 수치 정리(2026-11-11 추가, LLM·DB 없음).** 입력 문서 품질(OCR·분류 신뢰도, 가린 PII 건수)·검색 근거·검증 결과(조항 인용 실재율, Judge 범위)·노드별 소요 시간을 `report_metrics`로 묶고, 추정 보상 범위의 신뢰도 등급(`HIGH`·`MEDIUM`·`LOW`)과 사유를 정한다. 계산이 실패해도 저장은 계속한다(`collect_metrics_failed:*`, 소프트 실패). 스키마·등급 규칙은 [`src/report_worker/README.md`](../../src/report_worker/README.md) "리포트 수치".
+
+**⑬ `persist` — 저장(정상 종료).** 한 트랜잭션 안에서 세 테이블에 쓴다(`agents.py:570-630`). 초안에는 `metrics`(⑫′의 수치, 계산에 실패했으면 키 없음)도 들어간다.
 
 ```sql
 INSERT INTO report_drafts (report_id, draft, status)
@@ -185,6 +187,14 @@ UPDATE reports SET
    status = 'AWAITING_ADOPTION', updated_at = now()
  WHERE id = $1
 ```
+
+이어서 신뢰도 등급을 **세이브포인트**(같은 트랜잭션 안의 중첩 트랜잭션) 안에서 따로 쓴다(2026-11-11 추가).
+
+```sql
+UPDATE reports SET confidence_level = $2 WHERE id = $1   -- 'HIGH' | 'MEDIUM' | 'LOW'
+```
+
+`confidence_level`은 backend 소유 컬럼이라 워커 계정에 컬럼 UPDATE 권한(`deploy/schema_split*.sql`)이 따로 필요하다. 권한이 없으면 이 문장만 되돌리고 경고 로그를 남긴 채 나머지를 커밋한다 — 권한 적용 전에 배포해도 리포트는 저장된다. 그 밖의 DB 오류는 지금처럼 저장 실패(`persist_failed`)다.
 
 그리고 `report_issues`는 **먼저 지우고 다시 넣는다**(`DELETE ... WHERE report_id=$1` 후 INSERT).
 
@@ -205,7 +215,7 @@ UPDATE reports SET status = 'BLOCKED', updated_at = now() WHERE id = $1
 | 노드 | 읽는 키 | 추가/갱신하는 키 | 부수효과 |
 |------|---------|------------------|----------|
 | `load_context` | `ocr_result_id`, `report_id` | `case_info`, `masked_text`, `entities`, `subscribed_coverages`, `errors` | DB 4쿼리. errors: `ocr_result_missing` |
-| `input_guardrail` | `masked_text` | `masked_text`, (차단시)`errors` | 가드레일 `guard_input`. errors: `input_blocked:{reason}` |
+| `input_guardrail` | `masked_text`, `case_info`(질문·사고 경위·추가 정보) | `masked_text`, (차단시)`errors` | 가드레일 `guard_input`(마스킹=문서 본문, 도메인 검사=질문은 키워드·서술은 용건 요청). errors: `input_blocked:{reason}` |
 | `diagnosis` | `masked_text`, `case_info` | `diagnosis`, (실패시)`errors` | LLM. errors: `diagnosis_llm_failed` |
 | `coverage_analysis` | `case_info`, `diagnosis`, `subscribed_coverages` | `retrieved_clauses`, `applicable_coverages`, `missing_coverages`, `coverage_analysis` | RAG(`terms`) + LLM. errors: `rag_empty` |
 | `case_search` | `case_info`, `diagnosis` | `legal_references` | RAG(`case`). errors: `case_data_missing` |
@@ -213,8 +223,9 @@ UPDATE reports SET status = 'BLOCKED', updated_at = now() WHERE id = $1
 | `disability_calc` | `disability_analysis` | `disability_analysis`(+combined_rate 등) | 결정론 `combine_disability_rate` |
 | `payment_calc` | `case_info`, `disability_analysis` | `estimated_range` | — |
 | `report_compose` | 다수 | `sections`, `issues`, `report` | LLM 2회 + 생성 가드레일 |
-| `output_guardrail` | `report`, `retrieved_clauses` | `report`, `judge_failures` | 출력 가드레일(LLM Judge) |
-| `persist` | 다수 | `errors`(패스스루) | DB 트랜잭션(drafts UPSERT, reports UPDATE=`AWAITING_ADOPTION`, issues DELETE+INSERT) |
+| `output_guardrail` | `report`, `retrieved_clauses`, `legal_references` | `report`, `judge_failures`, `judge_stats` | 출력 가드레일(LLM Judge, 근거 = 약관·장해분류표·판례) |
+| `collect_metrics` | 수치 재료(`node_trace`·`input_documents`·`case_funnel`·`judge_stats` 등) | `report_metrics`, `confidence_level` | 없음(순수 계산 `metrics.py`). errors: (예외 시)`collect_metrics_failed:*` |
+| `persist` | 다수 | `errors`(패스스루) | DB 트랜잭션(drafts UPSERT — `draft.metrics` 포함, reports UPDATE=`AWAITING_ADOPTION`, `confidence_level` 세이브포인트 UPDATE, issues DELETE+INSERT) |
 | `persist_blocked` | `errors`, `report_id` | `errors`(패스스루) | DB `UPDATE reports SET status='BLOCKED'` |
 
 > 표 읽는 법: `case_info`는 `load_context`만 만들고 이후 노드는 읽기만 한다. 노드가 전부 순차 실행이라 동시 쓰기가 없어, 각 노드는 부분 dict만 반환하고 LangGraph가 합쳐 준다. `errors`만 모든 노드가 누적해서 덧붙인다.

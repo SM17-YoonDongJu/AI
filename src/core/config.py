@@ -138,6 +138,17 @@ class Settings(BaseSettings):
     ocr_det_model: str = "PP-OCRv5_server_det"
     # 인식 — 한국어 전용 인식 모델은 mobile 하나뿐이다(한국어+영어+숫자, 공식 정확도 88.0%).
     ocr_rec_model: str = "korean_PP-OCRv5_mobile_rec"
+    # 원본 삭제 게이트의 재OCR 검증(5.2)에만 쓸 검출 모델(성능 실험 O3b, docs/perf). 비우면 메인
+    # 엔진을 그대로 쓴다. 재OCR의 가치는 "다르게 한 번 더 읽기"라(섀도 비교에서 첫 OCR의 오독을
+    # 재OCR만 잡았다), 가벼운 모델로 다르게 읽으면 검증 시간(문서 시간의 약 50%)을 줄일 수 있다는
+    # 가설을 재는 손잡이다. 예: PP-OCRv5_mobile_det. 인식 모델·스레드·상한 등은 메인과 같다.
+    ocr_verify_det_model: str | None = None
+    # 가벼운 검증 모델(ocr_verify_det_model)을 쓰는 조건(성능 실험 O3c). True면 VLM 재판독이라는 1차
+    # 방어선이 제 몫을 한 문서에만 쓴다 — 재판독이 필요 없던 고신뢰 문서, 또는 저신뢰 라인을 모두
+    # 다시 읽은 문서. 재판독이 실패·예산 초과·빈 응답으로 비면 메인 엔진으로 검증한다(VLM이 꺼진
+    # 날엔 재OCR이 마지막 방어선이다 — 사진 문서 주민번호 누락을 메인 재OCR만 잡았다). False면 항상
+    # 가벼운 모델(O3b — 안전 기준 미달로 기각된 방식이라 실험용).
+    ocr_verify_fast_requires_reread: bool = True
     # 줄 방향 분류(뒤집힌 줄 crop을 바로 세워 인식). 줄 crop만 돌리므로 좌표엔 영향이 없다.
     # 쪽 방향 분류·왜곡 보정은 좌표를 원본 쪽과 어긋나게 해 엔진이 항상 끈다(설정으로 두지 않는다).
     ocr_textline_orientation: bool = True
@@ -149,6 +160,11 @@ class Settings(BaseSettings):
     # 커널로 돌아 A4 한 쪽(200DPI)에서 7.8GB VM이 OOM으로 죽었다(켜면 최대 RSS 3.7GB,
     # _workspace/20).
     ocr_enable_mkldnn: bool = True
+    # oneDNN이 모델마다 캐시하는 입력 모양 수(성능 실험 M1, docs/perf). PaddleOCR 기본값은 10인데
+    # 쪽 이미지 크기가 문서마다 달라 모양별 프리미티브·버퍼가 쌓인다. 2로 줄이면 dev t3.large에서
+    # 문서별 최고 RSS 중앙값 4,119→3,919MiB(5% 감소)·최대 4,334→4,145MiB였고 시간·결과 지문은
+    # 같았다. None이면 PaddleOCR 기본값(10).
+    ocr_mkldnn_cache_capacity: int | None = Field(2, ge=1)
     # 검출 입력의 긴 변 상한(픽셀, PaddleOCR text_det_limit_type="max"). 검출 메모리는 입력 화소
     # 수에 비례하는데 PaddleOCR 기본값은 긴 변 4000까지 줄이지 않는다 — 1200만 화소 폰 사진
     # (3024x4032)이 7GiB 제한에서 OOM으로 죽었다(합성 측정 2026-11-08, 운영도 4.5Gi에서 OOMKilled).
@@ -163,6 +179,12 @@ class Settings(BaseSettings):
     # 켜진다. 0.90은 surya 시절 분포(클린 PDF 0.951+ vs 폰카 사진 0.861-, 표본 3건)로 정한 값이라
     # PP-OCRv5 rec_score 분포에선 다시 맞춰야 한다 — PoC에서 env(OCR_LOW_CONFIDENCE_THRESHOLD)로.
     ocr_low_confidence_threshold: float = Field(0.90, ge=0.0, le=1.0)
+    # 원본 삭제 게이트의 잔류 PII 검사 방식(성능 실험 O3, docs/perf).
+    # - reocr: 마스킹 사본을 OCR 엔진으로 다시 읽는다(문서 시간의 약 41%)
+    # - text: 가려지지 않은 원본 라인 텍스트로 검사한다(OCR 없음)
+    # - shadow: reocr로 판정하고 text 판정을 나란히 계산해 일치 여부만 남긴다(ocr.verify.shadow)
+    # 기본 shadow는 판정을 바꾸지 않는다 — 일치가 확인되면 text로 전환한다.
+    ocr_verify_mode: Literal["reocr", "text", "shadow"] = "shadow"
 
     # --- PII 마스킹 ---
     use_ner: bool = False  # NER 디텍터 활성 여부(false면 정규식만)
@@ -170,6 +192,8 @@ class Settings(BaseSettings):
     ner_model: str = "Leo97/KoELECTRA-small-v3-modu-ner"
     # NER 확률 임계값. 마스킹은 recall 우선이라 낮게; 과잉 마스킹 시 상향(노션 §2).
     ner_score_threshold: float = 0.5
+    # NER 배치 크기(라인 수) — 파이프라인은 batch_size 없이 리스트를 받으면 1건씩 추론한다(O1).
+    ner_batch_size: int = Field(16, ge=1)
 
     # --- AI 서빙 — 챗·임베딩 provider 스위치(env), 모델·엔드포인트도 env 주입 ---
     # 챗 기본값은 Claude(anthropic — 공식 SDK, ai_base_url 미사용, 키는 ai_api_key)다. 로컬 Ollama
@@ -192,6 +216,11 @@ class Settings(BaseSettings):
     # anthropic 전용 — thinking과 응답을 합친 출력 상한. 스트리밍으로 받으므로 넉넉히 둔다.
     llm_max_tokens: int = 64000
     llm_timeout_seconds: float = 600.0  # anthropic 전용 SDK 요청 타임아웃(초)
+    # LLM 호출 1회의 전체 상한(초, 성능 실험 R5 — docs/perf). SDK 타임아웃은 청크 사이 간격이라
+    # 200 OK 뒤 스트림이 멈추면 끊지 못한다(dev 실측 30분+ 멈춤). 관측 최대 58.5초(307건)의
+    # 약 5배이고, 멈춘 호출이 하나 있어도 리포트 p95(142초) + 300초가 가시성(600초) 안에 든다.
+    # 넘기면 AiClientError → 재전달.
+    llm_call_deadline_seconds: float = Field(300.0, gt=0)
     # voyage: Voyage(MongoDB Atlas 모델 API) — 요청에 input_type·output_dimension을 싣는다.
     embedding_provider: Literal["openai_compat", "voyage"] = "voyage"
     embedding_base_url: str = "https://ai.mongodb.com/v1"  # 임베딩 엔드포인트(별도 노드/업체 가능)

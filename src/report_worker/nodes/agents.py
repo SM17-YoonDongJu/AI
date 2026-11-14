@@ -15,12 +15,16 @@ import json
 import re
 import uuid
 from collections.abc import Awaitable, Sequence
+from time import perf_counter
 from typing import Any, Protocol
+
+import asyncpg
 
 import guardrail
 from core import ai_client, crypto, db
 from core.exceptions import PiiCryptoError
-from core.logging import get_logger
+from core.logging import bound_context, get_logger
+from report_worker import metrics
 from report_worker.disability_rules import combine_disability_rate
 
 from ..rag import hybrid
@@ -71,24 +75,50 @@ def safe_node(fn: NodeFn) -> NodeFn:
     `llm_failure`에 남기면 graph.py가 다음 간선에서 그래프를 멈춘다. 이후 LLM 호출은
     나가지 않고 초안도 저장하지 않는다. 판정은 노드마다 똑같이 걸리므로 LLM을 부르는
     노드가 몇 개든 같다.
+
+    모든 반환(정상·예외)에 그 노드의 소요 시간을 `node_trace`로 덧붙인다(리포트 수치
+    `pipeline` 절). 예외로 끝났으면 `status="failed"`다.
     """
 
     @functools.wraps(fn)
     async def wrapper(state: ReportState) -> dict[str, Any]:
+        started = perf_counter()
         # 예외 메시지는 담지 않는다(타입명만) — errors는 report_compose의
         # "7_추가확인필요" 섹션에 그대로 join돼 최종 리포트에 노출된다.
         # 원문 파싱 실패 등의 예외 메시지엔 PII 조각이 섞일 수 있다(§9).
         try:
-            return await fn(state)
+            # 노드 안에서 나간 LLM·임베딩 호출 로그(ai_client.*.finished)에 노드 이름을 붙인다 —
+            # 리포트 지연을 노드 → LLM 호출 단위로 나눠 보기 위해서다.
+            with bound_context(graph_node=fn.__name__):
+                out = await fn(state)
         except ai_client.AiClientError as e:  # LlmRefusalError 포함
             return {
                 "errors": _err(state, f"{fn.__name__}_failed:{type(e).__name__}"),
                 "llm_failure": _llm_failure_kind(e),
+                "node_trace": _trace(state, fn.__name__, started, failed=True),
             }
         except Exception as e:
-            return {"errors": _err(state, f"{fn.__name__}_failed:{type(e).__name__}")}
+            return {
+                "errors": _err(state, f"{fn.__name__}_failed:{type(e).__name__}"),
+                "node_trace": _trace(state, fn.__name__, started, failed=True),
+            }
+        # `or {}`: try 밖이라 노드가 None을 돌려줘도 여기서 예외가 나면 안 된다(그래프가 죽는다).
+        return {**(out or {}), "node_trace": _trace(state, fn.__name__, started, failed=False)}
 
     return wrapper
+
+
+def _trace(state: ReportState, node: str, started: float, *, failed: bool) -> list[dict[str, Any]]:
+    """지금까지의 node_trace에 이 노드의 소요 시간(ms, 정수 반올림)을 덧붙인 새 목록.
+
+    safe_node의 except 안에서도 불리므로 여기서 예외가 나면 안 된다(노드 예외가 그래프를 죽인다).
+    """
+    entry = {
+        "node": node,
+        "ms": round((perf_counter() - started) * 1000),
+        "status": "failed" if failed else "ok",
+    }
+    return [*(state.get("node_trace") or []), entry]
 
 
 def failure_route(state: ReportState) -> str | None:
@@ -131,11 +161,15 @@ def _as_str_list(v: Any) -> list[str]:
 # `_SELECT_CLAIM_DOCUMENTS_SQL`과 맞춘다 — doc_index는 nullable(단독 문서 호환)이라
 # NULLS LAST로 뒤로 밀고, 그 안에서는 저장 순서(created_at)로 안정 정렬한다.
 # 스키마 미한정(`FROM ocr_results`)은 이 모듈의 기존 관례(search_path 의존)를 따른다.
+# ocr_confidence·doc_type_confidence는 리포트 수치(input_documents)용이다 — 프롬프트엔 안 들어간다.
 _SELECT_CLAIM_DOCUMENTS_SQL = (
-    "SELECT doc_type, masked_text, entities FROM ocr_results "
-    "WHERE claim_id = $1 ORDER BY doc_index NULLS LAST, created_at"
+    "SELECT doc_type, masked_text, entities, ocr_confidence, doc_type_confidence "
+    "FROM ocr_results WHERE claim_id = $1 ORDER BY doc_index NULLS LAST, created_at"
 )
-_SELECT_OCR_RESULT_SQL = "SELECT masked_text, entities FROM ocr_results WHERE id = $1"
+_SELECT_OCR_RESULT_SQL = (
+    "SELECT masked_text, entities, ocr_confidence, doc_type_confidence "
+    "FROM ocr_results WHERE id = $1"
+)
 
 # 문서 경계 표식 — 병합된 텍스트는 그대로 LLM 프롬프트로 들어간다(diagnosis·report_compose).
 # 어느 내용이 어느 문서에서 왔는지 표시해야 진단명을 증권에서 뽑거나 특약을 진단서에서
@@ -219,6 +253,26 @@ def _merge_claim_entities(docs: Sequence[Any]) -> dict[str, Any]:
                 continue  # 뒤 문서의 추출 실패가 앞 문서의 성공값을 지우지 않게
             merged[key] = value
     return merged
+
+
+def _input_document(row: Any, doc_type: Any) -> dict[str, Any]:
+    """리포트 수치용 문서 품질 한 건 — 유형과 OCR·분류 신뢰도(PII 없음).
+
+    이 값 때문에 load_context가 실패하면 안 된다(컨텍스트 하드 실패 = 리포트 없음). 그래서
+    `row.get`(asyncpg Record·dict 공통)으로 읽고, 컬럼이 없거나 숫자가 아니면 None으로 둔다.
+
+    Args:
+        row: `ocr_results` 행(청구 문서 또는 대표 문서).
+        doc_type: 문서 유형(청구 문서는 행의 값, 대표 문서는 ReportJob의 값).
+
+    Returns:
+        `{"doc_type", "ocr_confidence", "doc_type_confidence"}`. 신뢰도는 float 또는 None.
+    """
+    return {
+        "doc_type": str(doc_type or "other"),
+        "ocr_confidence": metrics.finite_number(row.get("ocr_confidence")),
+        "doc_type_confidence": metrics.finite_number(row.get("doc_type_confidence")),
+    }
 
 
 def _decrypt_pii_column(row: Any, table: str, column: str, dek: bytes) -> str | None:
@@ -438,9 +492,11 @@ async def load_context(state: ReportState) -> dict[str, Any]:
         )
 
     errors = list(state.get("errors", []))
+    input_documents: list[dict[str, Any]] = []
     if docs:
         masked_text = _merge_claim_texts(docs)
         entities = _merge_claim_entities(docs)
+        input_documents = [_input_document(doc, doc.get("doc_type")) for doc in docs]
         logger.info(
             "claim documents loaded",
             report_id=state.get("report_id"),
@@ -453,6 +509,7 @@ async def load_context(state: ReportState) -> dict[str, Any]:
         # 단건 경로는 기존 동작을 그대로 둔다 — 문서 헤더도 붙이지 않는다(프롬프트 무변경).
         masked_text = ocr["masked_text"] or ""
         entities = _parse_entities(ocr["entities"])
+        input_documents = [_input_document(ocr, state.get("doc_type"))]
     else:
         # 청구 문서 0건 + 대표 문서 행도 없음 = 컨텍스트 없음. 그래프는 이 노드 직후 멈추고
         # (failure_route), worker가 하드 실패로 재전달한다.
@@ -503,6 +560,7 @@ async def load_context(state: ReportState) -> dict[str, Any]:
         "masked_text": masked_text,
         "entities": entities,
         "subscribed_coverages": subscribed_coverages,
+        "input_documents": input_documents,
         "errors": errors,
     }
 
@@ -510,7 +568,22 @@ async def load_context(state: ReportState) -> dict[str, Any]:
 # ── 입력 가드레일 ──────────────────────────────────────────────
 @safe_node
 async def input_guardrail(state: ReportState) -> dict[str, Any]:
-    g = await guardrail.guard_input(state.get("masked_text", ""))
+    """문서 본문(`masked_text`)은 마스킹하고, 도메인 검사는 사용자가 쓴 글에만 건다.
+
+    보험증권에는 거의 항상 "○○보험 주식회사"가 찍혀 있다. 청구 문서를 이은 본문에 도메인
+    검사를 걸면 실사용 리포트 대부분이 "보험·법률 외 질문(주식)"으로 막힌다(#103). 질문에는 키워드
+    검사를, 사고 경위·추가 정보에는 서술용 검사를 건다. 서술에는 "요리하다가 데었다"처럼 키워드가
+    정상적으로 들어가서 키워드만으로는 막지 않는다(`guardrail.guard_input` 참고).
+
+    세 값은 load_context가 mask_pii를 거친 값이다. 마스킹에 실패해 None으로 비운 필드는 검사도
+    건너뛴다. 그 필드는 LLM으로도 나가지 않는다.
+    """
+    case_info = state.get("case_info") or {}
+    g = await guardrail.guard_input(
+        state.get("masked_text", ""),
+        question=case_info.get("question"),
+        narratives=(case_info.get("description"), case_info.get("additional_information")),
+    )
     out: dict[str, Any] = {"masked_text": g.masked_text}
     if g.blocked:
         out["errors"] = _err(state, f"input_blocked:{g.reason}")
@@ -556,27 +629,29 @@ async def diagnosis(state: ReportState) -> dict[str, Any]:
 
 
 # ── 분기: 사용자 약관이 우리 DB(policy_chunks)에 있나? ──────────
+_POLICY_EXISTS_BY_PRODUCT_SQL = (
+    "SELECT EXISTS (SELECT 1 FROM policy_chunks WHERE insurer = $1 AND product_name = $2)"
+)
+_POLICY_EXISTS_BY_INSURER_SQL = "SELECT EXISTS (SELECT 1 FROM policy_chunks WHERE insurer = $1)"
+
+
 async def policy_in_db(state: ReportState) -> str:
     insurer = state.get("case_info", {}).get("insurer")
     product = state.get("case_info", {}).get("product_name")
     if not insurer:
         return "terms_parse"
+    # 건수가 아니라 존재만 본다(EXISTS) — count(*)는 보험사 한 곳의 청크(수십만 행)를 전부
+    # 훑어 dev 실측 44초(콜드 캐시)가 걸렸다. 분기에 필요한 건 "한 건이라도 있나"뿐이다.
     try:
         pool = db.get_pool()
         async with pool.acquire() as c:
             if product:
-                n = await c.fetchval(
-                    "SELECT count(*) FROM policy_chunks WHERE insurer = $1 AND product_name = $2",
-                    insurer,
-                    product,
-                )
+                found = await c.fetchval(_POLICY_EXISTS_BY_PRODUCT_SQL, insurer, product)
             else:
-                n = await c.fetchval(
-                    "SELECT count(*) FROM policy_chunks WHERE insurer = $1", insurer
-                )
+                found = await c.fetchval(_POLICY_EXISTS_BY_INSURER_SQL, insurer)
     except Exception:  # DB 조회 실패 시 안전하게 런타임 파싱 경로로
         return "terms_parse"
-    return "coverage_parse" if (n or 0) > 0 else "terms_parse"
+    return "coverage_parse" if found else "terms_parse"
 
 
 # ── 분기: 입력 가드레일 차단 여부 → 차단 시 파이프라인 단락 ─────
@@ -715,7 +790,11 @@ async def case_search(state: ReportState) -> dict[str, Any]:
     res = await hybrid.search(dx_name, namespaces=["case"], top_k=_CASE_CANDIDATE_K)
     refs = res["ranked_chunks"]
     if not refs:
-        return {"legal_references": [], "errors": _err(state, "case_data_missing")}
+        return {
+            "legal_references": [],
+            "case_funnel": _case_funnel(0, 0, 0, 0),
+            "errors": _err(state, "case_data_missing"),
+        }
 
     # 1) 메타 역추적(사건명·법원·선고일)으로 각 청크를 보강한다.
     meta = await _enrich_cases([r.get("chunk_id") for r in refs if r.get("chunk_id")])
@@ -743,7 +822,20 @@ async def case_search(state: ReportState) -> dict[str, Any]:
     errors = state.get("errors", [])
     if len(deduped) > len(relevant):
         errors = _err(state, f"case_filtered:{len(deduped)}→{len(relevant)}")
-    return {"legal_references": kept, "errors": errors}
+    return {
+        "legal_references": kept,
+        "case_funnel": _case_funnel(len(refs), len(deduped), len(relevant), len(kept)),
+        "errors": errors,
+    }
+
+
+def _case_funnel(candidates: int, deduped: int, relevant: int, kept: int) -> dict[str, int]:
+    """판례 깔때기(리포트 수치) — 검색 후보 → 사건 단위 중복 제거 → 관련성 필터 → 최종 채택.
+
+    관련성 필터는 판정 실패·전부 탈락이면 입력을 그대로 통과시키므로(_filter_relevant_cases)
+    relevant가 deduped와 같으면 "걸러낸 게 없다"이지 "전부 관련 있다"는 뜻이 아니다.
+    """
+    return {"candidates": candidates, "deduped": deduped, "relevant": relevant, "kept": kept}
 
 
 # ── 분기: 후유장해 검토 필요 시 장해 서브그래프로 ──────────────
@@ -1175,6 +1267,23 @@ async def payment_calc(state: ReportState) -> dict[str, Any]:
 
 
 # ── 리포트 통합 (8섹션 + issues, 생성 가드레일) ────────────────
+async def _gather_or_cancel(*calls: Awaitable[Any]) -> list[Any]:
+    """서로 독립인 호출을 동시에 돌린다. 하나가 실패하면 나머지를 취소하고 **그 예외를 그대로** 올린다.
+
+    `asyncio.gather`는 첫 예외를 올려도 나머지 task를 취소하지 않는다 — 결과를 버릴 LLM 호출이 끝까지
+    돌며 과금된다. `TaskGroup`은 예외를 `ExceptionGroup`으로 감싸 safe_node의 `AiClientError` 분류
+    (`llm_failure` → 그래프 중단·재전달)를 깨뜨린다. 그래서 직접 취소하고 원래 예외를 올린다.
+    """
+    tasks = [asyncio.ensure_future(call) for call in calls]
+    try:
+        return list(await asyncio.gather(*tasks))
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+
 @safe_node
 async def report_compose(state: ReportState) -> dict[str, Any]:
     ci = state.get("case_info", {})
@@ -1193,7 +1302,9 @@ async def report_compose(state: ReportState) -> dict[str, Any]:
         disability_line = f"현재 확정 장해 없음 — 재평가 대상. ※ {da.get('caveat', '')}"
     else:
         disability_line = "해당 없음(후유장해 미검토)"
-    body = await ai_client.chat(
+    # 본문과 쟁점 추출은 서로의 결과를 쓰지 않는다 — 동시에 부른다(성능 실험 R1, docs/perf). 리포트
+    # 기준선에서 이 노드가 가장 길었고(p50 53.5초), 짧은 쪽 호출만큼(p50 16초) 줄어든다.
+    body_call = ai_client.chat(
         [
             {
                 "role": "system",
@@ -1216,9 +1327,7 @@ async def report_compose(state: ReportState) -> dict[str, Any]:
             },
         ]
     )
-    body = guardrail.guard_generation(body)
-
-    issues = await ai_client.chat_json(
+    issues_call = ai_client.chat_json(
         [
             {
                 "role": "system",
@@ -1234,6 +1343,8 @@ async def report_compose(state: ReportState) -> dict[str, Any]:
             },
         ]
     )
+    body_raw, issues = await _gather_or_cancel(body_call, issues_call)
+    body = guardrail.guard_generation(body_raw)
     issue_list = issues.get("issues", []) if isinstance(issues, dict) else []
 
     sections = {
@@ -1269,10 +1380,40 @@ async def report_compose(state: ReportState) -> dict[str, Any]:
 # ── 출력 가드레일 (고지문 + LLM Judge) ─────────────────────────
 @safe_node
 async def output_guardrail(state: ReportState) -> dict[str, Any]:
+    """고지문을 붙이고 LLM Judge로 본문 주장을 근거 원문과 대조한다.
+
+    근거는 약관 → 장해분류표 → 판례 순으로 중복 없이 넘긴다(`metrics.judge_evidence`). 예전엔
+    약관 병합본만 넘겨 판례가 검증 밖이었다. guard_output은 앞에서부터 상한(20건)까지만 넣으므로
+    넘치면 판례부터 빠진다 — `judge_stats.evidence_chunks`가 근거 수보다 작으면 그런 경우다.
+    Judge가 실제로 본 범위(`judge_stats`)는 리포트 수치의 검증 범위·신뢰도 등급에 쓴다.
+    """
     g = await guardrail.guard_output(
-        state.get("report", ""), run_judge=True, chunks=state.get("retrieved_clauses", [])
+        state.get("report", ""), run_judge=True, chunks=metrics.judge_evidence(state)
     )
-    return {"report": g.final_text, "judge_failures": g.judge_failures}
+    return {
+        "report": g.final_text,
+        "judge_failures": g.judge_failures,
+        "judge_stats": {
+            "checked_chars": g.judge_checked_chars,
+            "total_chars": g.judge_total_chars,
+            "evidence_chunks": g.judge_evidence_chunks,
+        },
+    }
+
+
+# ── 리포트 수치 + 신뢰도 등급 (LLM·DB 없음) ────────────────────
+@safe_node
+async def collect_metrics(state: ReportState) -> dict[str, Any]:
+    """리포트 수치(draft.metrics)와 신뢰도 등급을 계산한다(순수 계산 — metrics.py).
+
+    수치는 부가 정보다. 여기서 예외가 나도 safe_node가 `collect_metrics_failed:*` 소프트 실패로
+    삼켜 persist까지 간다 — 초안은 metrics 없이 저장되고 confidence_level은 쓰지 않는다.
+    """
+    report_metrics = metrics.build_report_metrics(state)
+    return {
+        "report_metrics": report_metrics,
+        "confidence_level": report_metrics["confidence"]["level"],
+    }
 
 
 # ── 영구 저장 (report_drafts/reports/report_issues) ────────────
@@ -1299,6 +1440,11 @@ async def persist(state: ReportState) -> dict[str, Any]:
         "disability": state.get("disability_analysis", {}),  # 장해지급률·근거(P1)
         "errors": state.get("errors", []),
     }
+    # 리포트 수치(collect_metrics). 계산에 실패했으면 키 자체가 없다 — 읽는 쪽은 없음을 허용한다.
+    report_metrics = state.get("report_metrics")
+    if report_metrics:
+        draft["metrics"] = report_metrics
+    confidence_level = state.get("confidence_level")
     rid = uuid.UUID(state["report_id"])
     er = state.get("estimated_range", {})
     pool = db.get_pool()
@@ -1324,6 +1470,8 @@ async def persist(state: ReportState) -> dict[str, Any]:
                 er.get("min"),
                 er.get("max"),
             )
+            if confidence_level is not None and confidence_level in metrics.CONFIDENCE_LEVELS:
+                await _save_confidence_level(c, rid, confidence_level)
             await c.execute("DELETE FROM report_issues WHERE report_id = $1", rid)
             for it in state.get("issues", []):
                 await c.execute(
@@ -1337,6 +1485,34 @@ async def persist(state: ReportState) -> dict[str, Any]:
                     [str(t) for t in (it.get("tags") or [])],
                 )
     return {"errors": state.get("errors", [])}
+
+
+# reports.confidence_level은 backend 소유 컬럼이라 ai_owner에 이 컬럼 UPDATE 권한이 따로 필요하다
+# (deploy/schema_split*.sql). 다른 컬럼과 한 UPDATE로 묶으면 권한이 없을 때 리포트 저장 전체가 실패한다.
+_UPDATE_CONFIDENCE_LEVEL_SQL = "UPDATE reports SET confidence_level = $2 WHERE id = $1"
+
+
+async def _save_confidence_level(
+    conn: asyncpg.Connection, report_id: uuid.UUID, level: str
+) -> None:
+    """reports.confidence_level을 바깥 트랜잭션 안의 세이브포인트에서 쓴다.
+
+    컬럼 권한이 없으면(GRANT 적용 전 배포) 세이브포인트만 되돌리고 이 값만 건너뛴다. 바깥
+    트랜잭션(초안·reports·쟁점)은 그대로 커밋된다. GRANT를 적용하면 다음 리포트부터 채워진다.
+
+    Args:
+        conn: persist가 트랜잭션을 연 커넥션.
+        report_id: 리포트 id.
+        level: `HIGH`·`MEDIUM`·`LOW`.
+
+    Raises:
+        asyncpg.PostgresError: 권한 오류가 아닌 DB 오류. 지금처럼 persist_failed(하드 실패)가 된다.
+    """
+    try:
+        async with conn.transaction():  # 트랜잭션 안의 중첩 = SAVEPOINT
+            await conn.execute(_UPDATE_CONFIDENCE_LEVEL_SQL, report_id, level)
+    except asyncpg.exceptions.InsufficientPrivilegeError as exc:
+        logger.warning("report confidence level not saved", error_type=type(exc).__name__)
 
 
 # ── 차단 경로 저장 (초안 없음, reports.status만 갱신) ───────────

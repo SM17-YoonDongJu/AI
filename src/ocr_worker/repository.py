@@ -30,6 +30,7 @@ OCR·분류·추출·마스킹의 산출물을 ``ocr_results``(contracts.md §3)
 import json
 import uuid
 from dataclasses import dataclass, field
+from typing import Literal
 
 import asyncpg
 
@@ -52,6 +53,14 @@ logger = get_logger(__name__)
 # 커넥션(=다른 트랜잭션)이 잡혀, 한쪽만 커밋되고 다른 쪽이 실패하는 부분 성공이 생긴다.
 # asyncpg의 Pool·Connection은 fetch/fetchrow/execute 시그니처가 같아 그대로 대체된다.
 type Executor = asyncpg.Pool | asyncpg.Connection
+
+# 청구를 재업로드(reports.status='NEEDS_REUPLOAD')로 보낸 사유. ai.claim_readiness.reupload_reason
+# 값이고 Backend가 사용자 안내 문구를 고르는 근거다(Backend가 읽는 DB 교차 계약 — 마이그레이션
+# 013의 CHECK와 같은 집합). 판정 규칙은 pipeline._blocked_reason(위에서부터 먼저 맞는 것).
+#   unreadable        처리에 실패한 문서나 저품질 문서(ocr_quality=needs_reupload)가 있다
+#   off_domain        읽을 수 있지만 본문 단서로 보험·의료 문서 유형을 판정한 문서가 하나도 없다
+#   missing_required  보험 문서는 인식했지만 필수 유형(보험증권·진단서) 중 빠진 게 있다
+type ReuploadReason = Literal["unreadable", "off_domain", "missing_required"]
 
 # 진입부 멱등 단락(#15)용 조회 — 이미 처리된 job_id면 무거운 OCR을 건너뛰고
 # 기존 id·doc_type·ocr_quality로 ReportJob만 재발행한다.
@@ -252,16 +261,16 @@ RETURNING docs_terminal
 # 것이 이 조회의 목적이다. doc_index는 nullable이라(단독 문서 호환) NULLS LAST로
 # 뒤로 밀고, 그 안에서는 저장 순서(created_at)로 안정 정렬한다.
 _SELECT_CLAIM_DOCUMENTS_SQL = """
-SELECT id, doc_type, ocr_quality
+SELECT id, doc_type, doc_type_confidence, ocr_quality
 FROM ai.ocr_results
 WHERE claim_id = $1
 ORDER BY doc_index NULLS LAST, created_at
 """
 
-# 필수 문서 유형이 빠진 청구 — 리포트를 만들지 않고 사유(빠진 유형)를 남긴다.
+# 정상 리포트를 낼 수 없는 청구 — 리포트를 만들지 않고 빠진 유형과 재업로드 사유를 남긴다.
 _MARK_CLAIM_BLOCKED_SQL = """
 UPDATE ai.claim_readiness
-SET status = 'blocked', missing_doc_types = $2, judged_at = now()
+SET status = 'blocked', missing_doc_types = $2, reupload_reason = $3, judged_at = now()
 WHERE claim_id = $1
 """
 
@@ -269,7 +278,7 @@ WHERE claim_id = $1
 # 재전달돼도, 멱등 단락이 이 상태를 보고 같은 report_id로 안전하게 재발행한다.
 _MARK_CLAIM_PUBLISHED_SQL = """
 UPDATE ai.claim_readiness
-SET status = 'published', judged_at = now()
+SET status = 'published', reupload_reason = $2, judged_at = now()
 WHERE claim_id = $1
 """
 
@@ -339,12 +348,15 @@ class ClaimDocument:
     Attributes:
         ocr_result_id: ``ocr_results.id``(``ReportJob.ocr_result_id`` 후보).
         doc_type: 분류된 문서 유형(필수 유형 충족 판정 기준).
+        doc_type_confidence: 분류 신뢰도. 유형을 본문 단서로 판정했는지(hint만으로 채택한
+            유형이 아닌지) 가르는 데 쓴다(``classify.is_body_evidenced``).
         ocr_quality: 문서별 자동 품질 판정(``ok`` | ``needs_reupload``). 청구 대표값은
             이 값들의 집계다(하나라도 ``needs_reupload``면 전체가 그렇다).
     """
 
     ocr_result_id: str
     doc_type: DocType
+    doc_type_confidence: float
     ocr_quality: str
 
 
@@ -801,6 +813,9 @@ async def fetch_claim_documents(executor: Executor, claim_id: str) -> list[Claim
         ClaimDocument(
             ocr_result_id=str(row["id"]),
             doc_type=DocType(row["doc_type"]),
+            # prod ai.ocr_results는 Backend V1 테이블을 옮겨 온 것이라 NOT NULL이 보장되지 않는다.
+            # NULL은 본문 근거 없음(0.0)으로 읽는다 — 판정 전체가 TypeError로 멈추지 않게.
+            doc_type_confidence=float(row["doc_type_confidence"] or 0.0),
             ocr_quality=row["ocr_quality"],
         )
         for row in rows
@@ -808,7 +823,11 @@ async def fetch_claim_documents(executor: Executor, claim_id: str) -> list[Claim
 
 
 async def mark_claim_blocked(
-    executor: Executor, *, claim_id: str, missing_doc_types: list[str]
+    executor: Executor,
+    *,
+    claim_id: str,
+    missing_doc_types: list[str],
+    reupload_reason: ReuploadReason,
 ) -> None:
     """정상 리포트를 낼 수 없는 청구를 ``blocked``로 확정한다(운영 조회용 기록).
 
@@ -818,6 +837,8 @@ async def mark_claim_blocked(
     (b) 업로드된 문서 수보다 성공한 문서 수가 적음(``pipeline._judge_claim``의
     ``incomplete``) — 필수·비필수 안 가리고 하나 이상 결정적 실패했다는 뜻이다. 이
     경우 ``missing_doc_types``는 비어 있을 수 있다(필수 유형은 다 채워졌으니까).
+    사용자에게 안내할 대표 사유(판독 불가·도메인 부적합·필수 서류 누락)는
+    ``reupload_reason``에 남긴다(``pipeline._blocked_reason``, Backend가 읽는다).
 
     이 함수 자체는 Backend에 아무것도 알리지 않는다 — 실제 통지는 호출측
     (``_judge_claim``)이 뒤이어 ``ocr_quality='needs_reupload'``로 ``ReportJob``을
@@ -829,11 +850,14 @@ async def mark_claim_blocked(
         claim_id: 청구 식별자.
         missing_doc_types: 인식되지 않은 필수 ``DocType`` 값 목록(정렬된 문자열).
             incomplete만으로 막힌 경우 빈 리스트일 수 있다.
+        reupload_reason: 사용자에게 안내할 재업로드 사유(``ReuploadReason``).
     """
-    await executor.execute(_MARK_CLAIM_BLOCKED_SQL, claim_id, missing_doc_types)
+    await executor.execute(_MARK_CLAIM_BLOCKED_SQL, claim_id, missing_doc_types, reupload_reason)
 
 
-async def mark_claim_published(executor: Executor, claim_id: str) -> None:
+async def mark_claim_published(
+    executor: Executor, claim_id: str, *, reupload_reason: ReuploadReason | None
+) -> None:
     """청구 대표 ``ReportJob``을 발행했음을 기록한다(발행 **직전**에 호출).
 
     발행보다 먼저 찍는 이유: 발행 후 crash로 ack를 못 하면 메시지가 재전달되는데,
@@ -844,8 +868,10 @@ async def mark_claim_published(executor: Executor, claim_id: str) -> None:
         executor: asyncpg 연결 풀 또는 커넥션(core.db). 다른 쓰기와 원자적으로
             묶어야 하면 호출측이 ``pool.acquire()``로 얻은 커넥션을 넘긴다.
         claim_id: 청구 식별자.
+        reupload_reason: 저품질 문서가 섞여 대표 ``ReportJob``이 ``needs_reupload``로
+            나갈 때의 사유(``unreadable``). 정상 리포트면 None이다.
     """
-    await executor.execute(_MARK_CLAIM_PUBLISHED_SQL, claim_id)
+    await executor.execute(_MARK_CLAIM_PUBLISHED_SQL, claim_id, reupload_reason)
 
 
 async def fetch_claim_readiness(executor: Executor, claim_id: str) -> ClaimReadiness | None:
