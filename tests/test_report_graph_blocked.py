@@ -6,6 +6,7 @@ input_guardrail이 blocked를 반환하면 (a) diagnosis 등 LLM 노드가 호�
 """
 
 import uuid
+from collections.abc import Sequence
 
 from core.contracts import InputGuardResult
 from report_worker.graph import build_graph
@@ -61,7 +62,9 @@ class _FakePool:
         return _FakeAcquire(self._conn)
 
 
-async def _blocked_guard_input(text: str, *, question: str | None) -> InputGuardResult:
+async def _blocked_guard_input(
+    text: str, *, question: str | None, narratives: Sequence[str | None]
+) -> InputGuardResult:
     return InputGuardResult(masked_text=text, blocked=True, reason="off_domain")
 
 

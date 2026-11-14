@@ -7,8 +7,12 @@
 ```python
 import guardrail
 
-# 마스킹은 문서 본문에, 도메인 검사는 사용자 질문에만 건다(#103). question은 필수(None 가능)
-inp = await guardrail.guard_input(document_text, question=user_question)  # → InputGuardResult
+# 마스킹은 문서 본문에, 도메인 검사는 사용자가 쓴 글에만 건다(#103). 두 키워드 인자 모두 필수
+inp = await guardrail.guard_input(
+    document_text,
+    question=user_question,                              # 키워드 검사(None 가능)
+    narratives=(accident_description, additional_info),  # 서술용 검사(항목별, None 가능)
+)                                                       # → InputGuardResult
 if inp.blocked:
     ...                                             # 리포트: persist_blocked → reports.status=BLOCKED
 
@@ -33,7 +37,7 @@ guardrail.count_masked_pii(masked_text)             # → {"이름": 2, "주민�
 
 | 단계 | 함수 | 하는 일 |
 |---|---|---|
-| **입력** | `guard_input` (async) | 문서 본문(`text`)에 정규식 PII 마스킹(주민번호 **앞 6자리만 보존**, 전화, 계좌). 사용자 질문(`question`)에만 키워드 기반 보험·법률 외 주제 차단(부동산·주식·코인 등, 회사 표기 `주식회사`는 제외). 문서 본문과 사고 경위·추가 정보에는 이 단어들이 정상적으로 나와서(증권의 "○○보험 주식회사", 사고 경위의 "요리하다가") 도메인 검사를 걸지 않는다 |
+| **입력** | `guard_input` (async) | 문서 본문(`text`)에 정규식 PII 마스킹(주민번호 **앞 6자리만 보존**, 전화, 계좌). 보험·법률 외 주제 차단은 사용자가 쓴 글에만 건다(회사 표기 `주식회사`는 제외). 질문(`question`)은 키워드(부동산·주식·코인 등)가 있으면 막는다. 사고 경위·추가 정보(`narratives`)는 "요리하다가 데었다"처럼 키워드가 정상적으로 들어가는 사실 서술이라, 사안 표시(부상·질병·손해·보험·직업 등) 없이 도메인 밖 용건을 묻거나 부탁할 때만("코인 시세 알려주세요") 막는다. 문서 본문에는 걸지 않는다(증권의 "○○보험 주식회사") |
 | **생성** | `guard_generation` (sync) | "OO원을 받습니다/지급됩니다" 같은 단정적 금액 표현을 "참고 추정 범위(약 OO원 내외, 약관·근거 기준)"로 치환 |
 | **출력** | `guard_output` (async) | 법적 고지문(`DISCLAIMER`) 삽입. `run_judge=True`이고 `chunks`가 있으면 **LLM Judge**(`core.ai_client.chat_json`)로 리포트 주장이 근거 원문(약관·장해분류표·판례)과 맞는지 검증하고, Judge가 본 범위를 함께 돌려준다 |
 
@@ -109,7 +113,7 @@ async def guard_output(
 | 규칙 | OCR 입력단과 같음(정규식 + 설정 시 NER + 잔류 게이트) | 노션 06 명세 3종(주민번호·휴대폰·하이픈 계좌) |
 | 주민번호 | `[주민등록번호]`로 통째 치환(생년월일도 안 나감) | 앞 6자리 보존(`860312-*******`) |
 | 결과 형식 | `[분류]` 토큰(`[이름]`·`[주소]`·`[이메일]`…) | `***` 부분 가림 |
-| 실패 | 잔류 고민감 PII → `MaskingError` | 없음(`question`이 도메인 외 주제면 `blocked=True`) |
+| 실패 | 잔류 고민감 PII → `MaskingError` | 없음(`question`·`narratives`가 도메인 외 주제면 `blocked=True`) |
 
 `core.logging.mask_pii`는 이름만 같다. 그쪽은 로그 렌더링 직전의 부분 마스킹 방어선이라 외부 전송용으로 쓰지 않는다.
 

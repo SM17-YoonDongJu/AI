@@ -2,12 +2,15 @@
 
 보험증권에는 거의 항상 "○○보험 주식회사"가 찍혀 있다. input_guardrail이 청구 문서를 이은 OCR
 본문에 도메인 검사를 걸던 때는 이 "주식" 때문에 실사용 리포트가 BLOCKED로 끝났다. 정작 사용자가
-직접 쓴 질문(case_info의 question)은 검사하지 않았다. 여기서 고정하는 계약:
-  (a) 문서 본문의 키워드, 질문 속 회사 표기, 사고 경위·추가 정보(description·
-      additional_information)의 키워드로는 차단하지 않는다(route_after_input → diagnosis).
-      사고 경위·추가 정보는 사실 서술이라 "요리하다가 데었다"처럼 키워드가 정상적으로 들어간다.
-  (b) 질문에 도메인 밖 주제가 있으면 `input_blocked:보험·법률 외 질문({키워드})`로 차단한다.
-  (c) 그래프 전체로 돌리면 차단 시 LLM을 부르지 않고 reports.status='BLOCKED'만 남긴다.
+직접 쓴 글(case_info의 question·description·additional_information)은 검사하지 않았다.
+여기서 고정하는 계약:
+  (a) 문서 본문의 키워드, 질문 속 회사 표기, 사고 경위·추가 정보에 활동·직업으로 들어간
+      키워드로는 차단하지 않는다(route_after_input → diagnosis). 사고 경위·추가 정보는 사실
+      서술이라 "요리하다가 데었다"처럼 키워드가 정상적으로 들어간다.
+  (b) 질문에 도메인 밖 키워드가 있으면 `input_blocked:보험·법률 외 질문({키워드})`로 차단한다.
+  (c) 사고 경위·추가 정보에 도메인 밖 용건("비트코인 시세")만 있으면 `input_blocked:보험·법률
+      외 내용({키워드} {용건})`로 차단한다.
+  (d) 그래프 전체로 돌리면 차단 시 LLM을 부르지 않고 reports.status='BLOCKED'만 남긴다.
 
 마스커는 정규식 전용으로 고정한다(운영 report 설정 USE_NER=false). 보험사·문서는 가상이다.
 """
@@ -39,6 +42,8 @@ _CLAIM_DOCS = [
 ]
 _OFF_DOMAIN_TEXT = "코인 투자 손실도 보상되나요?"
 _BLOCKED_REASON = "input_blocked:보험·법률 외 질문(코인)"
+_OFF_DOMAIN_NARRATIVE = "비트코인 시세 전망이 궁금해서 적습니다."
+_BLOCKED_NARRATIVE_REASON = "input_blocked:보험·법률 외 내용(비트코인 시세)"
 
 
 @pytest.fixture(autouse=True)
@@ -143,7 +148,7 @@ async def _run_input_stage(state: dict[str, Any]) -> dict[str, Any]:
     return {**state, **await agents.input_guardrail(state)}
 
 
-# ── (a) 질문 밖의 키워드·질문 속 회사 표기는 차단 사유가 아니다 ─────────
+# ── (a) 문서·서술 속 키워드와 질문 속 회사 표기는 차단 사유가 아니다 ──────
 async def test_keywords_in_claim_documents_do_not_block(monkeypatch) -> None:
     # Arrange: 증권에 "누리손해보험 주식회사", 진단서에 "요리". 질문은 비었다
     _install(monkeypatch, _FakeConn())
@@ -202,7 +207,21 @@ async def test_off_domain_question_blocks(monkeypatch) -> None:
     assert agents.route_after_input(state) == "blocked"
 
 
-# ── (c) 그래프 전체: 차단이면 LLM 없이 BLOCKED만 기록 ──────────────
+# ── (c) 사고 경위·추가 정보에 도메인 밖 용건만 있으면 차단한다 ──────────
+@pytest.mark.parametrize("field", ["description", "additional_information"])
+async def test_off_domain_request_in_narrative_blocks(monkeypatch, field: str) -> None:
+    # Arrange: 사고 얘기 없이 도메인 밖 용건만 적은 서술
+    _install(monkeypatch, _FakeConn(**{field: _OFF_DOMAIN_NARRATIVE}))
+
+    # Act
+    state = await _run_input_stage(_state())
+
+    # Assert
+    assert state["errors"] == [_BLOCKED_NARRATIVE_REASON]
+    assert agents.route_after_input(state) == "blocked"
+
+
+# ── (d) 그래프 전체: 차단이면 LLM 없이 BLOCKED만 기록 ──────────────
 async def test_graph_blocks_off_domain_question_without_llm(monkeypatch) -> None:
     # Arrange
     conn = _FakeConn(question=_OFF_DOMAIN_TEXT)
