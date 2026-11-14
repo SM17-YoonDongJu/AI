@@ -65,11 +65,10 @@ def build_graph() -> CompiledStateGraph[ReportState, None, ReportState, ReportSt
     g.add_node("diagnosis", agents.diagnosis)
     g.add_node("terms_parse", agents.terms_parse)
     g.add_node("coverage_parse", agents.coverage_parse)
-    g.add_node("coverage_analysis", agents.coverage_analysis)
-    g.add_node("case_search", agents.case_search)
-    g.add_node("disability_rag", agents.disability_rag)
-    g.add_node("disability_verify", agents.disability_verify)
-    g.add_node("disability_calc", agents.disability_calc)
+    # 보장 줄기(coverage_analysis → case_search)와 장해 줄기(disability_rag → disability_verify →
+    # disability_calc)를 한 노드 안에서 동시에 돌린다(R6, agents.coverage_and_disability). 노드별
+    # 소요 시간·실패는 그대로 node_trace에 남는다.
+    g.add_node(agents.PARALLEL_GROUP, agents.coverage_and_disability)
     g.add_node("payment_calc", agents.payment_calc)
     g.add_node("report_compose", agents.report_compose)
     g.add_node("output_guardrail", agents.output_guardrail)
@@ -102,20 +101,10 @@ def build_graph() -> CompiledStateGraph[ReportState, None, ReportState, ReportSt
     )
     _edge(g, "terms_parse", "coverage_parse")
 
-    _edge(g, "coverage_parse", "coverage_analysis")
-    _edge(g, "coverage_analysis", "case_search")
-
-    # 분기: 후유장해 검토 필요 시 장해 서브그래프(분류·지급률 → 결정론 합산) 경유,
-    #   아니면 payment_calc 직행. 장해 경로는 payment_calc에서 재합류(2 incoming).
-    _branch(
-        g,
-        "case_search",
-        agents.route_after_case,
-        {"disability": "disability_rag", "payment_calc": "payment_calc"},
-    )
-    _edge(g, "disability_rag", "disability_verify")
-    _edge(g, "disability_verify", "disability_calc")
-    _edge(g, "disability_calc", "payment_calc")
+    # 후유장해 검토가 필요하면(진단만 보고 정한다) 장해 줄기도 함께 돈다.
+    # 두 줄기가 끝나면 payment_calc.
+    _edge(g, "coverage_parse", agents.PARALLEL_GROUP)
+    _edge(g, agents.PARALLEL_GROUP, "payment_calc")
 
     _edge(g, "payment_calc", "report_compose")
     _edge(g, "report_compose", "output_guardrail")

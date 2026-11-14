@@ -339,6 +339,27 @@ def _judge_metrics(state: ReportState) -> dict[str, Any]:
     }
 
 
+def critical_path_ms(entries: Sequence[Mapping[str, Any]]) -> int:
+    """node_trace 항목들의 임계 경로 소요 시간(ms).
+
+    묶음(``group``) 안의 노드는 줄기(``lane``)끼리 동시에 돌았다(R6). 묶음마다 가장 긴 줄기의
+    합만 더하고, 묶음 밖 노드는 그대로 더한다. 모든 항목을 단순 합하면 동시에 돈 시간을 두 번
+    세어 그래프 벽시계보다 커진다(노드 밖 시간이 음수가 된다).
+    """
+    total = 0
+    lanes: dict[str, dict[str, int]] = {}
+    for entry in entries:
+        ms = _count(entry.get("ms"))
+        group = entry.get("group")
+        if group:
+            per_lane = lanes.setdefault(str(group), {})
+            lane = str(entry.get("lane") or "")
+            per_lane[lane] = per_lane.get(lane, 0) + ms
+        else:
+            total += ms
+    return total + sum(max(per_lane.values()) for per_lane in lanes.values() if per_lane)
+
+
 def _pipeline_metrics(state: ReportState) -> dict[str, Any]:
     """노드 소요 시간. collect_metrics 자신과 persist는 아직 끝나지 않아 들어가지 않는다."""
     nodes = [
@@ -355,7 +376,7 @@ def _pipeline_metrics(state: ReportState) -> dict[str, Any]:
         "failed_nodes": [
             str(entry.get("node")) for entry in nodes if entry.get("status") == "failed"
         ],
-        "total_ms": sum(_count(entry.get("ms")) for entry in nodes),
+        "total_ms": critical_path_ms(list(_dicts(state.get("node_trace")))),
     }
 
 

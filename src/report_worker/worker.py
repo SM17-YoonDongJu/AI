@@ -31,6 +31,7 @@ from report_worker.failure_journal import (
     record_report_failure,
 )
 from report_worker.graph import build_graph
+from report_worker.metrics import critical_path_ms
 from report_worker.nodes.agents import (
     CONTEXT_FAILURE_PREFIXES,
     LLM_REFUSED,
@@ -133,7 +134,8 @@ def _log_graph_finished(final: dict[str, Any], *, wall_ms: int | None = None) ->
     for entry in trace:
         name = str(entry.get("node") or "")
         node_ms[name] = node_ms.get(name, 0) + int(entry.get("ms") or 0)
-    total_ms = sum(node_ms.values())
+    # 동시에 돈 노드(R6 묶음)는 가장 긴 줄기만 센다 — 단순 합은 벽시계보다 커진다
+    total_ms = critical_path_ms(trace)
     log_event(
         logger,
         "report.graph.finished",
