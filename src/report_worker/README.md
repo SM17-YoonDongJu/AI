@@ -61,15 +61,24 @@ uv run python -m report_worker       # uv 없이: PYTHONPATH=src python -m repor
 load_context → input_guardrail ─┬─▶ persist_blocked → END                    (1)
                                 └─▶ diagnosis ─┬─▶ terms_parse ─┐            (2)
                                                └────────────────┴─▶ coverage_parse
- → coverage_analysis → case_search ─┬─▶ disability_rag → disability_verify → disability_calc ─┐
-                                    └───────────────────────────────────────────────────────┤  (3)
- payment_calc ◀─────────────────────────────────────────────────────────────────────────────┘
- → report_compose → output_guardrail → collect_metrics → persist → END                       (4)
+ → coverage_and_disability ┌ 보장: coverage_analysis → case_search                             (3)
+                           └ 장해: disability_rag → disability_verify → disability_calc   (동시에)
+ → payment_calc → report_compose → output_guardrail → collect_metrics → persist → END        (4)
 ```
 
 1. 입력 가드레일이 차단하면(보험·법률 외 질문, 또는 `load_context`의 PII 복호화 실패) 초안 없이 `reports.status = 'BLOCKED'`만 기록한다.
 2. 가입 약관이 `policy_chunks`에 없을 때만 런타임 파싱(`terms_parse`)을 거친다.
-3. 후유장해 검토가 필요하면 장해 서브그래프를 거친다. 지급률 합산은 LLM이 아니라 `disability_rules.py`의 **순수 함수**가 한다.
+3. `coverage_and_disability` 한 노드가 보장 줄기와 장해 줄기를 **동시에** 돌린다(성능 실험 R6).
+   - 장해 줄기는 진단이 후유장해 검토 대상일 때만 돈다(`route_after_case` — 진단만 본다). 지급률 합산은 LLM이 아니라
+     `disability_rules.py`의 **순수 함수**가 한다.
+   - 두 줄기는 서로의 결과를 쓰지 않는다. 장해 노드가 보장 쪽에서 읽는 것은 인용 청크를 이어 붙일
+     `retrieved_clauses`뿐이다. 결과는 순차 실행(보장 → 장해)과 같은 순서로 합친다.
+     - `errors`·`node_trace`는 줄기 순서대로 잇는다
+     - 청크는 보장 결과 뒤에 장해가 새로 더한 것만 붙인다
+   - 한 줄기가 LLM 시스템 실패·거절로 멈추면 다른 줄기를 바로 취소한다. 순차였다면 부르지 않았을 Claude 호출이
+     결과를 버릴 채로 과금되지 않게 하기 위해서다. 다음 간선의 실패 단락이 그래프를 멈춘다.
+   - 노드별 시간은 그대로 `node_trace`에 남고 `group`·`lane` 표식이 붙는다. 총 소요 시간(`total_ms`)은 묶음마다 가장
+     긴 줄기만 더한 임계 경로다(`metrics.critical_path_ms`).
 4. `collect_metrics`는 LLM·DB 없이 리포트 수치와 신뢰도 등급을 계산한다(아래 "리포트 수치"). 실패해도 소프트 실패로 저장까지 간다.
 
 ### 실패 단락

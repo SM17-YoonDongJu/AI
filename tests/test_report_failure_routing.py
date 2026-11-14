@@ -218,14 +218,28 @@ class _ScriptedLlm:
     출력 가드레일 Judge도 같은 모듈 함수(ai_client.chat_json)를 부르므로 함께 세어진다.
     """
 
-    def __init__(self, fail_at: int | None = None, error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        fail_at: int | None = None,
+        error: Exception | None = None,
+        *,
+        fail_node: str | None = None,
+    ) -> None:
         self._fail_at = fail_at
+        self._fail_node = fail_node
         self._error = error
         self.system_prompts: list[str] = []  # 호출 순서대로 system 메시지
 
     async def _record(self, messages: list[dict[str, str]]) -> None:
         self.system_prompts.append(messages[0]["content"])
-        if len(self.system_prompts) == self._fail_at and self._error is not None:
+        if self._error is None:
+            return
+        if len(self.system_prompts) == self._fail_at:
+            raise self._error
+        # 노드 지정: 보장·장해 줄기가 동시에 돌아(R6) 몇 번째 호출이 어느 노드인지 정해져 있지 않다
+        if self._fail_node is not None and _call_sites(self.system_prompts[-1:]) == [
+            self._fail_node
+        ]:
             raise self._error
 
     async def chat(self, messages: list[dict[str, str]], **opts: Any) -> str:
@@ -264,9 +278,27 @@ class _FakeSearch:
 
 
 def _calls_through_node(node: str) -> list[str]:
-    """그 노드의 마지막 호출까지의 호출 노드 목록 — 노드 안 호출은 동시에 나갈 수 있다(R1)."""
+    """그 노드의 마지막 호출까지의 호출 노드 목록(정렬) — 노드 안 호출(R1)과 보장·장해 줄기(R6)는
+    동시에 나가 순서가 정해져 있지 않아 정렬해 비교한다."""
     end = max(i for i, (name, _) in enumerate(_LLM_CALL_ORDER) if name == node) + 1
-    return [name for name, _ in _LLM_CALL_ORDER[:end]]
+    return sorted(name for name, _ in _LLM_CALL_ORDER[:end])
+
+
+# 보장·장해 줄기(R6, agents.coverage_and_disability)의 LLM 노드 — 줄기 안에서는 순서대로 돈다
+_LANES = (("coverage_analysis", "case_search"), ("disability_rag", "disability_verify"))
+
+
+def _allowed_calls_after_failure(node: str) -> set[str]:
+    """그 노드가 시스템 실패로 멈췄을 때 나갈 수 있는 LLM 호출 노드.
+
+    병렬 묶음 밖 노드는 순차대로 그 노드까지다. 묶음 안 노드면 진단 + 다른 줄기(실패 시점에 이미
+    나간 호출) + 자기 줄기의 그 노드까지다 — 자기 줄기의 다음 노드와 묶음 뒤 노드는 0회다.
+    """
+    lane = next((lane for lane in _LANES if node in lane), None)
+    if lane is None:
+        return set(_calls_through_node(node))
+    others = {name for other in _LANES if other is not lane for name in other}
+    return {"diagnosis", *others, *lane[: lane.index(node) + 1]}
 
 
 def _call_sites(system_prompts: list[str]) -> list[str]:
@@ -468,7 +500,8 @@ async def test_success_path_saves_and_acks(monkeypatch: pytest.MonkeyPatch) -> N
     await _consumer(sqs)._process(_message(_job()))
 
     # Assert: LLM 8곳을 순서대로 전부 타고(마지막이 Judge) 저장·ack했다
-    assert _call_sites(llm.system_prompts) == [node for node, _ in _LLM_CALL_ORDER]
+    # 보장·장해 줄기(R6)는 동시에 돌아 그 사이 순서는 정해져 있지 않다 — 정렬해 비교한다
+    assert sorted(_call_sites(llm.system_prompts)) == sorted(node for node, _ in _LLM_CALL_ORDER)
     assert any("status = 'AWAITING_ADOPTION'" in q for q, _ in conn.executed)
     assert _drafts(conn)[0]["errors"] == []
     assert sqs.deleted == ["rh-1"]
@@ -510,35 +543,34 @@ async def test_context_failure_ends_graph_before_any_llm_or_write(
 async def test_claude_rate_limit_stops_at_first_failure_and_redelivers(
     monkeypatch: pytest.MonkeyPatch, claude_api: _ClaudeApi
 ) -> None:
-    # Arrange: 진단은 성공, 두 번째 호출(특약 분석)이 429
+    # Arrange: 진단은 성공, 그다음 호출(보장·장해 줄기가 동시에 출발 — R6)이 429
     conn = _install_db(monkeypatch)
     _install_search(monkeypatch, _FakeSearch())
-    claude_api.replies = [_claude_ok, _claude_rate_limited]
+    claude_api.replies = [_claude_ok, _claude_rate_limited, _claude_rate_limited]
     sqs = _FakeSqs()
 
     # Act
     await _consumer(sqs)._process(_message(_job()))
 
-    # Assert: 429 뒤로는 요청이 없고, 아무것도 저장하지 않았고, 메시지는 재전달된다(삭제 안 함)
-    assert len(claude_api.requests) == 2
+    # Assert: 429 뒤로 다음 단계 요청이 없다 — 진단 1 + 두 줄기의 첫 호출뿐이다. 아무것도 저장하지
+    # 않았고, 메시지는 재전달된다(삭제 안 함)
+    assert len(claude_api.requests) <= 3
     assert conn.executed == []
     assert sqs.deleted == []
 
 
 @pytest.mark.parametrize(
-    ("fail_at", "node"),
-    [
-        pytest.param(position, node, id=f"{position}-{node}")
-        for position, (node, _) in enumerate(_LLM_CALL_ORDER[:-1], start=1)
-    ],
+    "node",
+    [pytest.param(node, id=node) for node in dict.fromkeys(n for n, _ in _LLM_CALL_ORDER[:-1])],
 )
 async def test_llm_system_failure_anywhere_stops_further_llm_calls_and_saves_nothing(
-    monkeypatch: pytest.MonkeyPatch, fail_at: int, node: str
+    monkeypatch: pytest.MonkeyPatch, node: str
 ) -> None:
-    # Arrange: Judge 앞의 LLM 호출 하나가 시스템 실패(AiClientError)
+    # Arrange: Judge 앞의 LLM 노드 하나가 시스템 실패(AiClientError)
     conn = _install_db(monkeypatch)
     llm = _install_llm(
-        monkeypatch, _ScriptedLlm(fail_at=fail_at, error=ai_client.AiClientError("chat 호출 실패"))
+        monkeypatch,
+        _ScriptedLlm(fail_node=node, error=ai_client.AiClientError("chat 호출 실패")),
     )
     _install_search(monkeypatch, _FakeSearch())
 
@@ -546,9 +578,12 @@ async def test_llm_system_failure_anywhere_stops_further_llm_calls_and_saves_not
     with pytest.raises(worker.ReportWorkerError) as caught:
         await worker.handle_job(_job())
 
-    # Assert: 실패한 노드에서 멈췄고(이후 노드의 LLM 0회) 저장·상태 갱신이 없다. 재전달 대상이다.
-    # report_compose는 본문·쟁점을 동시에 부르므로(R1) 그 노드의 두 호출은 함께 나간다.
-    assert _call_sites(llm.system_prompts) == _calls_through_node(node)
+    # Assert: 실패한 노드에서 멈췄고(자기 줄기의 다음 노드·병렬 묶음 뒤 노드의 LLM 0회) 저장·상태
+    # 갱신이 없다. 재전달 대상이다. report_compose는 본문·쟁점을 동시에 부르므로(R1) 두 호출이
+    # 함께 나가고, 보장·장해 줄기(R6)는 동시에 돌아 다른 줄기의 호출은 실패 시점까지 나갈 수 있다.
+    sites = _call_sites(llm.system_prompts)
+    assert node in sites
+    assert set(sites) <= _allowed_calls_after_failure(node)
     assert conn.executed == []
     assert not isinstance(caught.value, NonRetryableError)
     assert f"{node}_failed:AiClientError" in str(caught.value)
@@ -628,7 +663,7 @@ async def test_refusal_after_partial_progress_still_blocks_without_draft(
 
     # Assert: 쟁점 추출은 본문과 동시에 출발했고(R1) Judge는 안 불렸다. 부분 결과도 저장하지 않고
     # 상태만 남겼다
-    assert _call_sites(llm.system_prompts) == _calls_through_node("report_compose")
+    assert sorted(_call_sites(llm.system_prompts)) == _calls_through_node("report_compose")
     assert [q for q, _ in conn.executed] == [agents._MARK_BLOCKED_SQL]
     assert isinstance(caught.value, NonRetryableError)
     assert "report_compose_failed:LlmRefusalError" in str(caught.value)
