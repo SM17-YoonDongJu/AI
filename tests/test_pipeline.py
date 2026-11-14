@@ -3315,12 +3315,14 @@ async def test_process_emits_stage_and_job_timing_events() -> None:
     with capture_logs() as logs:
         await pipeline.handle(_job(doc_total=None))
 
-    # Assert: 단계는 실행 순서대로 1건씩, VLM 단계는 트리거되지 않아 없다
+    # Assert: 단계는 1건씩, VLM 단계는 트리거되지 않아 없다. 이미지 트랙은 쪽 전사·품질 판정과
+    # 겹쳐 돌고(O5), 겹치지 못한 나머지를 기다린 시간이 image_wait다
     stages = [e for e in logs if e["event"] == "ocr.stage.finished"]
     assert [e["stage"] for e in stages] == [
         "analyze",
         "quality_check",
         "image_pipeline",
+        "image_wait",
         "db_save",
         "publish",
     ]
@@ -3590,3 +3592,189 @@ async def test_low_confidence_doc_with_failed_reread_is_verified_by_main_engine(
     assert ("delete", "uploads/x.pdf") not in s3.events
     [verify] = [e for e in logs if e["event"] == "ocr.stage.finished" and e["stage"] == "verify"]
     assert verify["engine"] == "main"
+
+
+# ── O5: 이미지 트랙의 CPU 작업을 쪽 전사(VLM 대기)와 겹친다 ──────────────────
+class _SignalS3(_RecordingS3):
+    """업로드가 일어났는지 이벤트로 알리는 S3 대역(겹침을 sleep 없이 관찰한다)."""
+
+    def __init__(self, *, upload_error: Exception | None = None) -> None:
+        super().__init__()
+        self.uploaded = asyncio.Event()
+        self._upload_error = upload_error
+
+    async def upload(self, key: str, data: bytes, content_type: str) -> None:
+        await super().upload(key, data, content_type)
+        self.uploaded.set()
+        if self._upload_error is not None:
+            raise self._upload_error
+
+
+def _overlap_pipeline(
+    s3: _RecordingS3,
+    vlm: Any,
+    *,
+    timeline: list[str] | None = None,
+    pool: FakePool | None = None,
+) -> OcrPipeline:
+    """저신뢰 문서(쪽 전사·재판독 대상)를 기본 이미지 트랙으로 처리하는 파이프라인."""
+
+    async def reread(images: Any, pages: Any) -> list[list[str | None]]:
+        if timeline is not None:
+            timeline.append("reread")
+        for _ in range(5):  # 실제 VLM 왕복처럼 루프에 양보한다(겹침이 있으면 여기서 끼어든다)
+            await asyncio.sleep(0)
+        if timeline is not None:
+            timeline.append("reread-done")
+        return [[line.text for line in page.lines] for page in pages]
+
+    return OcrPipeline(
+        pool=pool or FakePool(existing=None),
+        producer=FakeProducer(),  # type: ignore[arg-type]
+        processor=FakeProcessor(  # type: ignore[arg-type]
+            _multi_page_result("보험증권 계약자 홍길동", confidence=0.4),
+            engine=_FakeReocrEngine(""),
+        ),
+        image_masker=ImageMasker(
+            detect=_detect_name,
+            redactor=_fake_redactor,
+            reread=reread,
+            reread_confidence_threshold=0.9,
+        ),
+        coverage=_RecordingCoverage(ratio=1.0),
+        upload=s3.upload,
+        delete=s3.delete,
+        vlm_transcribe=vlm,
+        settings=Settings(ocr_low_confidence_threshold=0.9),
+    )
+
+
+async def test_image_track_runs_while_page_transcription_waits_for_vlm() -> None:
+    # Arrange: 쪽 전사(VLM 대기)와 이미지 트랙이 **동시에** 진행 중인지 본다. 둘이 서로를 기다리는
+    # 랑데부라 순차(어느 쪽이 먼저든)면 한쪽이 시한에 걸린다.
+    vlm_started = asyncio.Event()
+    met: dict[str, bool] = {}
+
+    class _RendezvousS3(_RecordingS3):
+        def __init__(self) -> None:
+            super().__init__()
+            self.uploaded = asyncio.Event()
+
+        async def upload(self, key: str, data: bytes, content_type: str) -> None:
+            await super().upload(key, data, content_type)
+            self.uploaded.set()
+            try:
+                await asyncio.wait_for(vlm_started.wait(), timeout=1.0)
+                met["upload_saw_vlm"] = True
+            except TimeoutError:
+                met["upload_saw_vlm"] = False
+
+    s3 = _RendezvousS3()
+
+    async def vlm(image: Any) -> str:
+        vlm_started.set()
+        try:
+            await asyncio.wait_for(s3.uploaded.wait(), timeout=1.0)
+            met["vlm_saw_upload"] = True
+        except TimeoutError:
+            met["vlm_saw_upload"] = False
+        return "보험증권"
+
+    pipeline = _overlap_pipeline(s3, vlm)
+
+    # Act
+    with capture_logs() as logs:
+        await pipeline.handle(_job())
+
+    # Assert: 쪽 전사가 진행 중일 때 트랙이 업로드했고, 트랙이 진행 중일 때 쪽 전사가 시작됐다
+    assert met == {"upload_saw_vlm": True, "vlm_saw_upload": True}
+    stages = [e["stage"] for e in logs if e["event"] == "ocr.stage.finished"]
+    assert {"vlm_pages", "vlm_reread", "verify", "image_wait"} <= set(stages)
+
+
+async def test_reread_finishes_before_page_transcription_starts() -> None:
+    # Arrange: 재판독과 쪽 전사는 같은 VLM 동시 요청 상한을 나눠 쓴다 — 겹치면 다쪽 문서에서
+    # 재판독이 예산 안에 다 못 읽는다. 재판독은 쪽 전사보다 먼저 끝나야 한다.
+    timeline: list[str] = []
+
+    async def vlm(image: Any) -> str:
+        timeline.append("page")
+        return "보험증권"
+
+    pipeline = _overlap_pipeline(_SignalS3(), vlm, timeline=timeline)
+
+    # Act
+    await pipeline.handle(_job())
+
+    # Assert
+    assert timeline == ["reread", "reread-done", "page"]
+
+
+async def test_page_transcription_failure_waits_for_image_track_then_raises() -> None:
+    # Arrange: 쪽 전사가 예상 밖 예외로 죽는다(VLM 실패가 아닌 버그). 트랙의 검증 스레드가
+    # 메모리를 쥔 채 남지 않도록, 트랙이 끝나기를 기다린 뒤 원래 예외를 올려야 한다.
+    s3 = _SignalS3()
+    pool = FakePool(existing=None)
+
+    async def vlm(image: Any) -> str:
+        raise RuntimeError("쪽 전사 버그")
+
+    pipeline = _overlap_pipeline(s3, vlm, pool=pool)
+
+    # Act / Assert: 원래 예외 그대로, 저장은 없다
+    with pytest.raises(RuntimeError, match="쪽 전사 버그"):
+        await pipeline.handle(_job())
+    assert s3.uploaded.is_set()  # 트랙은 끝까지 갔다(기다렸다)
+    assert pool.insert_calls() == []
+
+
+async def test_image_track_failure_propagates_after_page_transcription() -> None:
+    # Arrange: 쪽 전사는 정상인데 트랙의 업로드가 실패한다 — 순차일 때와 같은 예외로 끝나야 한다
+    s3 = _SignalS3(upload_error=OSError("S3 업로드 실패"))
+    pool = FakePool(existing=None)
+
+    async def vlm(image: Any) -> str:
+        return "보험증권"
+
+    pipeline = _overlap_pipeline(s3, vlm, pool=pool)
+
+    # Act / Assert
+    with pytest.raises(OSError, match="S3 업로드 실패"):
+        await pipeline.handle(_job())
+    assert pool.insert_calls() == []
+
+
+async def test_cancel_during_page_transcription_cancels_image_track() -> None:
+    # Arrange: 쪽 전사가 멈춰 있는 동안 작업이 취소된다(종료 등). 트랙도 함께 취소돼야 한다.
+    upload_gate = asyncio.Event()  # 열리지 않는다 — 트랙은 업로드에서 멈춘다
+    upload_started = asyncio.Event()
+    track_cancelled = asyncio.Event()
+    vlm_started = asyncio.Event()
+
+    class _StuckS3(_RecordingS3):
+        async def upload(self, key: str, data: bytes, content_type: str) -> None:
+            upload_started.set()
+            try:
+                await upload_gate.wait()
+            except asyncio.CancelledError:
+                track_cancelled.set()
+                raise
+
+    async def vlm(image: Any) -> str:
+        vlm_started.set()
+        await asyncio.Event().wait()  # 영원히 기다린다
+        return ""
+
+    pipeline = _overlap_pipeline(_StuckS3(), vlm)
+    task = asyncio.create_task(pipeline.handle(_job()))
+    # 쪽 전사도 시작했고 트랙도 업로드에서 멈춘 상태(둘 다 진행 중)를 만든다
+    await asyncio.wait_for(vlm_started.wait(), timeout=1.0)
+    await asyncio.wait_for(upload_started.wait(), timeout=1.0)
+
+    # Act
+    task.cancel()
+
+    # Assert
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.wait_for(track_cancelled.wait(), timeout=1.0)

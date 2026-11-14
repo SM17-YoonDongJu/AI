@@ -343,6 +343,16 @@ class _ClaimContext:
     report_id: uuid.UUID
 
 
+async def _settle(task: asyncio.Task[object]) -> None:
+    """task가 끝날 때까지 기다리되 결과·예외는 올리지 않는다(호출측이 다른 예외를 올리는 중).
+
+    예외는 회수만 해 둔다 — 안 그러면 "Task exception was never retrieved" 경고가 남는다.
+    """
+    await asyncio.wait({task})
+    if not task.cancelled():
+        task.exception()
+
+
 def _claim_context(job: OcrJob) -> _ClaimContext | None:
     """청구 fan-in 대상이면 컨텍스트를, 단독 문서/계약 이상이면 ``None``을 돌려준다.
 
@@ -495,6 +505,9 @@ class OcrPipeline:
         self._upload: UploadFn = upload or put_object
         self._delete: DeleteFn = delete or delete_object
         self._image_pipeline: ImagePipeline = image_pipeline or self._default_image_pipeline
+        # 주입된 트랙은 재판독을 안에서 하는지 알 수 없어 통째로 한 task로 돌린다
+        # (``_start_image_track``).
+        self._image_pipeline_injected = image_pipeline is not None
         self._verify_engine_override = verify_engine
         # 진행 중인 원본 삭제 task의 강한 참조(fire-and-forget · GC 방지).
         # 자세한 이유는 ``_schedule_original_delete`` 참고.
@@ -745,57 +758,32 @@ class OcrPipeline:
         entities = analysis.entities
         quality_source_text = result.full_text  # 최종 품질 판정 기준 원문(기본 OCR 엔진)
 
-        # 표 문서와 별개로, OCR 신뢰도가 낮으면 문서 유형 무관하게 VLM 보완을 시도한다. 임계값은
-        # 설정(ocr_low_confidence_threshold)이다 — surya 시절 실측(클린 PDF 0.951+ vs 폰카 사진
-        # 0.861-, 표본 3건)으로 정한 0.90을 PP-OCRv5 신뢰도 분포에 맞춰 PoC로 재보정한다.
-        low_confidence = result.mean_confidence < self._settings.ocr_low_confidence_threshold
-        needs_vlm = analysis.doc_type in _TABLE_DOC_TYPES or low_confidence
-        summary.update(
-            doc_type=analysis.doc_type.value, low_confidence=low_confidence, needs_vlm=needs_vlm
-        )
-        vlm_outcome = None
-        if needs_vlm and images:
-            with timed(logger, _STAGE_EVENT, stage="vlm_pages", pages=len(images)) as vlm_stage:
-                vlm_outcome = await self._extract_pages(images, result)
-                vlm_stage["adopted"] = vlm_outcome is not None
-            if vlm_outcome is not None:
-                masked_text, quality_source_text, table_markdown = vlm_outcome
-                # extract()는 OCR 엔진 원문에만 돌았던 상태라, 엔진이 못 뽑았거나(None)
-                # 잘못 뽑은 필드도 VLM이 더 깨끗하게 읽었으면 실제 값과 다를 수 있다.
-                # VLM 채택 원문에 extract()를 한 번 더 돌려, 있으면 VLM 쪽 값을
-                # 우선한다 — VLM은 이미 groundedness 검증을 통과했고 애초에 OCR
-                # 신뢰도가 낮거나 표 문서라서 호출된 것이므로, 둘 다 값이 있으면
-                # VLM 쪽을 더 신뢰할 근거가 있다(surya 시절 실측: 엔진이 금액을 숫자로 오독해
-                # 엉뚱한 값을 잘못 채운 사례 확인). 엔진만 값이 있으면 그대로 둔다.
-                # 재평가 필요(동작은 그대로 둔다): 이 우선 규칙의 근거 실측은 Qwen(Ollama) 시절
-                # 쪽 전사다. PaddleOCR-VL은 쪽 전체를 약 1MP로 줄여 받아 작은 숫자(입원일수·
-                # 수술 여부·KCD·금액)를 OCR 엔진보다 못 읽을 수 있고, 그 값이 엔진 값을 덮는다 —
-                # report가 지급액 산정에 쓰는 필드라 실문서로 OCR 엔진 vs VLM 엔티티를 비교해
-                # 규칙을 다시 정해야 한다(_workspace/17 D7).
-                vlm_entities = extract(analysis.doc_type, quality_source_text)
-                entities = {
-                    key: vlm_entities.get(key) if vlm_entities.get(key) is not None else value
-                    for key, value in entities.items()
-                }
-                entities["table_markdown"] = table_markdown
-
-        # "재확인 필요" 판정: OCR 신뢰도가 낮은데(문서 자체가 저품질) 사람 이름조차
-        # 못 찾았거나 도메인 정보가 하나도 없으면, 자동 처리로는 신뢰할 수 없다고 본다.
-        with timed(logger, _STAGE_EVENT, stage="quality_check"):
-            has_name = any(
-                span.label is PiiLabel.NAME for span in self._masker.detect(quality_source_text)
+        # 이미지 트랙(재판독 → 검은블록 → PNG → 업로드 → 삭제 게이트 검증)은 job·result·images만
+        # 쓰고 아래 쪽 전사·품질 판정의 결과를 쓰지 않는다. 쪽 전사는 대부분 VLM(GPU) 응답 대기라,
+        # 그동안 트랙의 CPU 작업(특히 재OCR 검증)을 함께 돌린다(성능 실험 O5). 트랙은 "원본을
+        # 지워도 되는가"를 **판정만** 하고 삭제는 하지 않는다(저장 이후 — 아래 참고).
+        image_track = await self._start_image_track(job, result, images)
+        try:
+            (
+                masked_text,
+                quality_source_text,
+                entities,
+                vlm_outcome,
+                ocr_quality,
+            ) = await self._vlm_and_quality(
+                images, result, analysis, masked_text, quality_source_text, entities, summary
             )
-        ocr_quality = (
-            "needs_reupload"
-            if low_confidence
-            and (not has_name or _missing_domain_info(analysis.doc_type, entities))
-            else "ok"
-        )
-
-        # 이미지 마스킹은 렌더한 페이지 이미지를 재사용한다(재다운로드/재렌더 없음).
-        # 트랙은 "원본을 지워도 되는가"를 **판정만** 하고 삭제는 하지 않는다(아래 참고).
-        with timed(logger, _STAGE_EVENT, stage="image_pipeline", pages=len(images)):
-            track = await self._image_pipeline(job, result, images)
+        except Exception:
+            # 트랙의 검증은 스레드에서 돈다 — 취소해도 스레드는 끝까지 돌며 OCR 메모리를 쥔다.
+            # 끝나기를 기다린 뒤 원래 예외를 올려, 재전달 처리와 OCR 두 벌이 겹치지 않게 한다.
+            await _settle(image_track)
+            raise
+        except BaseException:
+            image_track.cancel()  # 취소(종료)는 기다리지 않는다
+            raise
+        # 쪽 전사보다 트랙이 오래 걸렸다면 그 나머지만큼 여기서 기다린다(겹치지 못한 몫).
+        with timed(logger, _STAGE_EVENT, stage="image_wait"):
+            track = await image_track
         summary.update(vlm_adopted=vlm_outcome is not None, ocr_quality=ocr_quality)
 
         record = OcrResultRecord(
@@ -845,6 +833,97 @@ class OcrPipeline:
                 await self._judge_claim(job, claim, terminal_count)
             else:
                 await self._publish_report(job, ocr_result_id, analysis.doc_type, ocr_quality)
+
+    async def _start_image_track(
+        self, job: OcrJob, result: OcrResult, images: list[PageImage]
+    ) -> asyncio.Task[ImageTrackResult]:
+        """이미지 트랙을 task로 띄운다. 기본 트랙은 VLM 라인 재판독을 **먼저 끝낸 뒤** 띄운다.
+
+        재판독과 쪽 전사는 같은 VLM 동시 요청 상한(``vlm_concurrency``)을 나눠 쓴다. 쪽 전사는
+        페이지를 동시에 보내 다쪽 문서면 슬롯을 다 차지할 수 있어, 둘을 겹치면 재판독이 예산
+        (``vlm_reread_budget_seconds``) 안에 다 못 읽고 줄을 건너뛴다 — 1차 마스킹 보강이 약해진다.
+        그래서 재판독은 지금처럼 슬롯을 온전히 쓰고, 그 뒤의 CPU 작업만 쪽 전사와 겹친다.
+
+        주입된 트랙(테스트·대체 구현)은 안에서 무엇을 하는지 모르므로 통째로 task로 돌린다.
+        """
+        if self._image_pipeline_injected:
+            work = self._image_pipeline(job, result, images)
+        else:
+            reread_texts = await self._reread_lines(images, result)
+            work = self._image_track_after_reread(job, result, images, reread_texts)
+        return asyncio.create_task(self._timed_image_track(work, pages=len(images)))
+
+    @staticmethod
+    async def _timed_image_track(
+        work: Awaitable[ImageTrackResult], *, pages: int
+    ) -> ImageTrackResult:
+        """트랙 자체의 소요 시간을 ``image_pipeline`` 단계로 남긴다(겹친 시간 포함)."""
+        with timed(logger, _STAGE_EVENT, stage="image_pipeline", pages=pages):
+            return await work
+
+    async def _vlm_and_quality(
+        self,
+        images: list[PageImage],
+        result: OcrResult,
+        analysis: _Analysis,
+        masked_text: str,
+        quality_source_text: str,
+        entities: dict[str, object],
+        summary: dict[str, object],
+    ) -> tuple[str, str, dict[str, object], tuple[str, str, str] | None, str]:
+        """하이브리드 VLM 쪽 전사와 "재확인 필요" 품질 판정(이미지 트랙과 겹쳐 돈다).
+
+        Returns:
+            ``(masked_text, quality_source_text, entities, vlm_outcome, ocr_quality)``.
+        """
+        # 표 문서와 별개로, OCR 신뢰도가 낮으면 문서 유형 무관하게 VLM 보완을 시도한다. 임계값은
+        # 설정(ocr_low_confidence_threshold)이다 — surya 시절 실측(클린 PDF 0.951+ vs 폰카 사진
+        # 0.861-, 표본 3건)으로 정한 0.90을 PP-OCRv5 신뢰도 분포에 맞춰 PoC로 재보정한다.
+        low_confidence = result.mean_confidence < self._settings.ocr_low_confidence_threshold
+        needs_vlm = analysis.doc_type in _TABLE_DOC_TYPES or low_confidence
+        summary.update(
+            doc_type=analysis.doc_type.value, low_confidence=low_confidence, needs_vlm=needs_vlm
+        )
+        vlm_outcome = None
+        if needs_vlm and images:
+            with timed(logger, _STAGE_EVENT, stage="vlm_pages", pages=len(images)) as vlm_stage:
+                vlm_outcome = await self._extract_pages(images, result)
+                vlm_stage["adopted"] = vlm_outcome is not None
+            if vlm_outcome is not None:
+                masked_text, quality_source_text, table_markdown = vlm_outcome
+                # extract()는 OCR 엔진 원문에만 돌았던 상태라, 엔진이 못 뽑았거나(None)
+                # 잘못 뽑은 필드도 VLM이 더 깨끗하게 읽었으면 실제 값과 다를 수 있다.
+                # VLM 채택 원문에 extract()를 한 번 더 돌려, 있으면 VLM 쪽 값을
+                # 우선한다 — VLM은 이미 groundedness 검증을 통과했고 애초에 OCR
+                # 신뢰도가 낮거나 표 문서라서 호출된 것이므로, 둘 다 값이 있으면
+                # VLM 쪽을 더 신뢰할 근거가 있다(surya 시절 실측: 엔진이 금액을 숫자로 오독해
+                # 엉뚱한 값을 잘못 채운 사례 확인). 엔진만 값이 있으면 그대로 둔다.
+                # 재평가 필요(동작은 그대로 둔다): 이 우선 규칙의 근거 실측은 Qwen(Ollama) 시절
+                # 쪽 전사다. PaddleOCR-VL은 쪽 전체를 약 1MP로 줄여 받아 작은 숫자(입원일수·
+                # 수술 여부·KCD·금액)를 OCR 엔진보다 못 읽을 수 있고, 그 값이 엔진 값을 덮는다 —
+                # report가 지급액 산정에 쓰는 필드라 실문서로 OCR 엔진 vs VLM 엔티티를 비교해
+                # 규칙을 다시 정해야 한다(_workspace/17 D7).
+                vlm_entities = extract(analysis.doc_type, quality_source_text)
+                entities = {
+                    key: vlm_entities.get(key) if vlm_entities.get(key) is not None else value
+                    for key, value in entities.items()
+                }
+                entities["table_markdown"] = table_markdown
+
+        # "재확인 필요" 판정: OCR 신뢰도가 낮은데(문서 자체가 저품질) 사람 이름조차
+        # 못 찾았거나 도메인 정보가 하나도 없으면, 자동 처리로는 신뢰할 수 없다고 본다.
+        with timed(logger, _STAGE_EVENT, stage="quality_check"):
+            has_name = any(
+                span.label is PiiLabel.NAME for span in self._masker.detect(quality_source_text)
+            )
+        ocr_quality = (
+            "needs_reupload"
+            if low_confidence
+            and (not has_name or _missing_domain_info(analysis.doc_type, entities))
+            else "ok"
+        )
+
+        return masked_text, quality_source_text, entities, vlm_outcome, ocr_quality
 
     async def _save(
         self, job: OcrJob, record: OcrResultRecord, claim: _ClaimContext | None
@@ -1032,14 +1111,34 @@ class OcrPipeline:
         안착하기 전에는 원본을 지울 근거가 없다. 판정만 하고 삭제는 호출측(저장 이후)이
         수행한다(``ImageTrackResult`` 참고).
         """
+        reread_texts = await self._reread_lines(images, result)
+        return await self._image_track_after_reread(job, result, images, reread_texts)
+
+    async def _reread_lines(
+        self, images: list[PageImage], result: OcrResult
+    ) -> list[list[str | None]] | None:
+        """저신뢰도 문서의 VLM 라인 재판독(VLM I/O라 async). 쪽이 없거나 대상이 아니면 ``None``."""
         if not images:
-            return ImageTrackResult(keys=[], delete_original=False)
-        # 라인 재판독은 VLM I/O라 async로 먼저 끝내고(저신뢰도 문서만), 검출(정규식·NER)·PIL
-        # 렌더(CPU 바운드)는 to_thread로 격리한다 — redact_pages 자체는 동기 함수로 유지해
-        # 블로킹 규약(§7)을 지킨다.
+            return None
         with timed(logger, _STAGE_EVENT, stage="vlm_reread") as reread_stage:
             reread_texts = await self._image_masker.reread_pages(images, result)
             reread_stage["ran"] = reread_texts is not None
+        return reread_texts
+
+    async def _image_track_after_reread(
+        self,
+        job: OcrJob,
+        result: OcrResult,
+        images: list[PageImage],
+        reread_texts: list[list[str | None]] | None,
+    ) -> ImageTrackResult:
+        """재판독 결과로 검은블록 → PNG → 업로드 → 삭제 게이트 검증을 한다(CPU 위주).
+
+        검출(정규식·NER)·PIL 렌더(CPU 바운드)는 to_thread로 격리한다 — redact_pages 자체는 동기
+        함수로 유지해 블로킹 규약(§7)을 지킨다.
+        """
+        if not images:
+            return ImageTrackResult(keys=[], delete_original=False)
         with timed(logger, _STAGE_EVENT, stage="redact", pages=len(images)):
             redacted_pages = await asyncio.to_thread(
                 self._image_masker.redact_pages, images, result, reread_texts
