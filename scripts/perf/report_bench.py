@@ -332,6 +332,7 @@ async def _run(args: argparse.Namespace, picked: list[str], out_dir: Path) -> in
     agents.persist_blocked = persist_blocked
     agents.persist_refused = persist_refused
     from report_worker.graph import build_graph
+    from report_worker.metrics import critical_path_ms
 
     graph = build_graph()
     await db.init_pool()
@@ -375,7 +376,7 @@ async def _run(args: argparse.Namespace, picked: list[str], out_dir: Path) -> in
                     "wall_s": round(wall, 1),
                     "node_ms": {e["node"]: e["ms"] for e in final.get("node_trace") or []},
                     "outside_nodes_s": round(
-                        wall - sum(e["ms"] for e in final.get("node_trace") or []) / 1000, 1
+                        wall - critical_path_ms(final.get("node_trace") or []) / 1000, 1
                     ),
                     "llm_calls": len(chats),
                     "llm_errors": len(usage.events) - len(chats),

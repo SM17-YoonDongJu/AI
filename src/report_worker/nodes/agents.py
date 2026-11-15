@@ -1168,6 +1168,143 @@ def _is_fracture(dx_name: str, icd: str) -> bool:
     return any(c in codes for c in _FRACTURE_ICD)
 
 
+# ── 보장 분석 ∥ 후유장해 경로 (R6) ─────────────────────────────
+# 보장 줄기(약관 분석 → 판례 검색)와 장해 줄기(장해분류표 → 감수 → 합산)는 서로의 결과를 쓰지 않는다.
+# 장해 줄기의 진입 판정(route_after_case)은 진단만 보고, 장해 노드가 보장 쪽에서 읽는 것은 인용 청크를
+# 이어 붙일 retrieved_clauses뿐이다. 그래서 두 줄기를 동시에 돌리고 결과는 순차 실행과 같은 순서로 합친다.
+PARALLEL_GROUP = "coverage_and_disability"
+# 순서가 곧 순차 실행 순서다(보장 → 판례, 장해분류표 → 감수 → 합산).
+_COVERAGE_LANE: tuple[NodeFn, ...] = (coverage_analysis, case_search)
+_DISABILITY_LANE: tuple[NodeFn, ...] = (disability_rag, disability_verify, disability_calc)
+
+
+def _lanes() -> list[tuple[str, tuple[NodeFn, ...]]]:
+    """이 모듈의 줄기 정의(테스트가 대역으로 바꿔 끼울 수 있게 호출 시점에 읽는다)."""
+    return [("coverage", _COVERAGE_LANE), ("disability", _DISABILITY_LANE)]
+
+
+async def _run_lane(
+    state: ReportState, lane: str, nodes: Sequence[NodeFn]
+) -> tuple[list[dict[str, Any]], bool]:
+    """줄기 하나의 노드를 차례로 돌린다. 각 노드는 앞 노드의 갱신을 반영한 상태를 받는다.
+
+    노드가 남긴 node_trace 항목에 묶음·줄기 표식을 붙인다(임계 경로 합산용 — metrics).
+    노드 뒤 상태가 그래프를 멈춰야 하는 실패면(failure_route) 거기서 멈추고 실패를 알린다.
+
+    Returns:
+        ``(노드별 갱신 목록, 실패로 멈췄는가)``.
+    """
+    current: dict[str, Any] = dict(state)
+    updates: list[dict[str, Any]] = []
+    for node in nodes:
+        traced = len(current.get("node_trace") or [])
+        out = dict(await node(current))  # type: ignore[arg-type]
+        if "node_trace" in out:
+            out["node_trace"] = [
+                *out["node_trace"][:traced],
+                *(
+                    {**entry, "group": PARALLEL_GROUP, "lane": lane}
+                    for entry in out["node_trace"][traced:]
+                ),
+            ]
+        updates.append(out)
+        current.update(out)
+        if failure_route(current) is not None:  # type: ignore[arg-type]
+            return updates, True
+    return updates, False
+
+
+def _merge_lanes(
+    state: ReportState, lane_updates: Sequence[list[dict[str, Any]]]
+) -> dict[str, Any]:
+    """줄기별 갱신을 순차 실행(보장 → 장해)과 같은 결과가 되게 합친다.
+
+    - errors·node_trace: 노드마다 "지금까지 + 내 것" 전체 목록을 돌려준다. 줄기마다 입력 상태 뒤에
+      붙인 몫만 떼어 줄기 순서대로 잇는다.
+    - retrieved_clauses: 보장 노드는 덮어쓰고, 장해 노드는 기존 목록에 없는 청크만 덧붙인다
+      (disability_rag). 첫 줄기 값으로 덮어쓴 뒤 다음 줄기가 새로 더한 몫을 같은 규칙(source_ref
+      중복 제외)으로 덧붙인다 — 순차일 때와 순서·내용이 같다.
+    - 그 밖의 키는 줄기마다 겹치지 않는다. 줄기 순서대로 덮어쓴다.
+    """
+    base_errors = list(state.get("errors") or [])
+    base_trace = list(state.get("node_trace") or [])
+    base_clauses = list(state.get("retrieved_clauses") or [])
+    merged: dict[str, Any] = {}
+    errors = list(base_errors)
+    trace = list(base_trace)
+    clauses: list[dict[str, Any]] | None = None
+    for updates in lane_updates:
+        lane_errors: list[Any] | None = None
+        lane_trace: list[Any] | None = None
+        lane_clauses: list[dict[str, Any]] | None = None
+        for out in updates:
+            for key, value in out.items():
+                if key == "errors":
+                    lane_errors = list(value or [])
+                elif key == "node_trace":
+                    lane_trace = list(value or [])
+                elif key == "retrieved_clauses":
+                    lane_clauses = list(value or [])
+                else:
+                    merged[key] = value
+        if lane_errors is not None:
+            errors += lane_errors[len(base_errors) :]
+        if lane_trace is not None:
+            trace += lane_trace[len(base_trace) :]
+        if lane_clauses is not None:
+            if clauses is None:
+                clauses = lane_clauses
+            else:
+                seen = {c.get("source_ref") for c in clauses}
+                clauses += [
+                    c for c in lane_clauses[len(base_clauses) :] if c.get("source_ref") not in seen
+                ]
+    merged["errors"] = errors
+    merged["node_trace"] = trace
+    if clauses is not None:
+        merged["retrieved_clauses"] = clauses
+    return merged
+
+
+async def coverage_and_disability(state: ReportState) -> dict[str, Any]:
+    """보장 줄기와 (필요하면) 장해 줄기를 동시에 돌린다(R6).
+
+    장해 줄기는 진단이 후유장해 검토 대상일 때만 돈다(route_after_case — 진단만 본다).
+    한 줄기가 그래프를 멈춰야 하는 실패(LLM 시스템 실패·거절)로 멈추면 다른 줄기를 바로 취소한다 —
+    순차였다면 부르지 않았을 Claude 호출이 결과를 버릴 채로 끝까지 과금되지 않게 한다. 실패한 줄기와
+    이미 끝난 줄기의 갱신만 합친다. 다음 간선의 실패 단락(graph.py)이 그래프를 멈춘다.
+
+    노드 예외는 각 노드의 safe_node가 삼킨다. 여기서 예외가 나면(버그) 남은 줄기를 취소하고 올린다.
+    """
+    lanes = [
+        (name, nodes)
+        for name, nodes in _lanes()
+        if name == "coverage" or route_after_case(state) == "disability"
+    ]
+    tasks = {
+        asyncio.create_task(_run_lane(state, name, nodes)): index
+        for index, (name, nodes) in enumerate(lanes)
+    }
+    results: dict[int, list[dict[str, Any]]] = {}
+    pending: set[asyncio.Task[tuple[list[dict[str, Any]], bool]]] = set(tasks)
+    try:
+        while pending:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            failed = False
+            for task in done:
+                updates, lane_failed = task.result()
+                results[tasks[task]] = updates
+                failed = failed or lane_failed
+            if failed:
+                break
+    finally:
+        # 성공 경로에선 pending이 비어 아무 일도 없다. 실패·예외·취소면 남은 줄기를 끊고 정리를 기다린다.
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+    return _merge_lanes(state, [results[index] for index in sorted(results)])
+
+
 @safe_node
 async def payment_calc(state: ReportState) -> dict[str, Any]:
     """특약별 지급액을 항목화해 합산한다(정액 특약 + 후유장해).
