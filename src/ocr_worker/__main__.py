@@ -35,7 +35,7 @@ from core.config import (
 )
 from core.contracts import OcrJob
 from core.db import db_pool, run_migrations
-from core.logging import configure_logging, get_logger
+from core.logging import configure_logging, get_logger, log_event
 from core.sqs.consumer import SqsConsumer
 from core.sqs.producer import SqsProducer
 from ocr_worker.pipeline import OcrPipeline
@@ -103,7 +103,12 @@ async def _run() -> None:
         consumer: SqsConsumer[OcrJob] = SqsConsumer(
             queue_url=settings.sqs_ocr_job_queue_url,
             schema=OcrJob,
-            handler=_with_memory_release(pipeline.handle),
+            # 재활용 기준에 닿으면 소비를 멈춘다 — consumer는 아래에서 정해지므로 호출 시점에 읽는다
+            handler=_with_recycle(
+                _with_memory_release(pipeline.handle),
+                max_jobs=settings.ocr_max_jobs_per_process,
+                stop=lambda: consumer.stop(),
+            ),
             settings=settings,
             on_poison=_poison_journal(pool, pipeline),
         )
@@ -158,6 +163,37 @@ def _release_memory() -> None:
     except (OSError, AttributeError):
         return
     malloc_trim(0)
+
+
+def _with_recycle(
+    handler: Callable[[OcrJob], Awaitable[None]],
+    *,
+    max_jobs: int | None,
+    stop: Callable[[], None],
+) -> Callable[[OcrJob], Awaitable[None]]:
+    """``max_jobs``건을 처리하면 ``stop``을 불러 소비를 멈춘다(프로세스 재활용, M2).
+
+    문서를 거듭할수록 반납 뒤 메모리와 최고점이 함께 올라, prod와 같은 t3.large(4608m)에서 연속
+    처리 20건 안팎에 OOM으로 죽었다. 기준에 닿으면 이번 메시지를 끝까지 처리·삭제한 뒤 루프가
+    멈추고 프로세스가 정상 종료한다 — 컨테이너(restart: unless-stopped·k8s Deployment)가 새로
+    띄우면 메모리가 처음으로 돌아간다. 성공·실패 모두 센다(실패한 문서도 OCR 메모리를 썼다).
+    ``max_jobs``가 None이면 그대로 돌려준다.
+    """
+    if max_jobs is None:
+        return handler
+    handled = 0
+
+    async def handle(job: OcrJob) -> None:
+        nonlocal handled
+        try:
+            await handler(job)
+        finally:
+            handled += 1
+            if handled == max_jobs:
+                log_event(logger, "ocr.worker.recycle", jobs=handled)
+                stop()
+
+    return handle
 
 
 def _with_memory_release(

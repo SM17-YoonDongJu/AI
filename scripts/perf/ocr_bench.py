@@ -87,6 +87,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--reps", type=int, default=3, help="측정 반복 수(문서셋 전체 기준)")
     parser.add_argument("--warmup", type=int, default=1, help="측정 전 워밍업 문서 수(모델 로드)")
     parser.add_argument("--no-vlm", action="store_true", help="VLM을 부르지 않는다(즉시 폴백)")
+    # 프로세스 재활용(M2) 흉내: 바깥 스크립트가 (반복 x 문서) 순서를 잘라 프로세스마다 일부만 돌린다
+    parser.add_argument("--start", type=int, default=0, help="(반복x문서) 순서에서 시작 위치")
+    parser.add_argument("--count", type=int, default=None, help="이 프로세스가 처리할 건수")
     parser.add_argument("--compare", nargs=2, type=Path, metavar=("A", "B"), help="지문 비교")
     return parser.parse_args()
 
@@ -278,16 +281,17 @@ async def _run(args: argparse.Namespace, out_dir: Path) -> int:
     unstable: set[str] = set()
     wall: dict[str, list[float]] = {}
     started_at = datetime.now(UTC)
-    for rep in range(1, args.reps + 1):
-        for path in docs:
-            elapsed, fingerprint = await run_one(path, "measure", rep)
-            wall.setdefault(path.name, []).append(elapsed)
-            print(f"  rep{rep} {path.name}: {elapsed:.1f}s")
-            if fingerprint is None:
-                continue
-            previous = fingerprints.setdefault(path.name, fingerprint)
-            if previous != fingerprint:
-                unstable.add(path.name)  # 같은 입력인데 결과가 반복마다 다르다 — 비교 불가 표시
+    sequence = [(rep, path) for rep in range(1, args.reps + 1) for path in docs]
+    end = None if args.count is None else args.start + args.count
+    for rep, path in sequence[args.start : end]:
+        elapsed, fingerprint = await run_one(path, "measure", rep)
+        wall.setdefault(path.name, []).append(elapsed)
+        print(f"  rep{rep} {path.name}: {elapsed:.1f}s")
+        if fingerprint is None:
+            continue
+        previous = fingerprints.setdefault(path.name, fingerprint)
+        if previous != fingerprint:
+            unstable.add(path.name)  # 같은 입력인데 결과가 반복마다 다르다 — 비교 불가 표시
     ended_at = datetime.now(UTC)
 
     file_handler.flush()
@@ -315,6 +319,8 @@ async def _run(args: argparse.Namespace, out_dir: Path) -> int:
         "docs": [p.name for p in docs],
         "reps": args.reps,
         "warmup": args.warmup,
+        "start": args.start,
+        "count": args.count,
         "started_at": started_at.isoformat(),
         "ended_at": ended_at.isoformat(),
         "unstable_docs": sorted(unstable),

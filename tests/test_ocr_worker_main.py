@@ -627,3 +627,74 @@ async def test_run_wraps_consumer_handler_with_memory_release(
 
     # Assert
     assert released == [True]
+
+
+# ── 프로세스 재활용(M2) — N건 처리 뒤 소비를 멈춘다 ─────────────────────
+async def test_recycle_stops_after_max_jobs_counting_failures() -> None:
+    # Arrange: 3건마다 재활용. 두 번째 문서는 실패한다(실패한 문서도 OCR 메모리를 썼다)
+    stops: list[str] = []
+
+    async def handler(job: OcrJob) -> None:
+        if job.job_id.endswith("2"):
+            raise RuntimeError("OCR 실패")
+
+    wrapped = ocr_main._with_recycle(handler, max_jobs=3, stop=lambda: stops.append("stop"))
+
+    # Act
+    with capture_logs() as logs:
+        await wrapped(_job("11111111-1111-1111-1111-111111111111"))
+        with pytest.raises(RuntimeError):
+            await wrapped(_job("11111111-1111-1111-1111-111111111112"))
+        assert stops == []  # 아직 2건
+        await wrapped(_job("11111111-1111-1111-1111-111111111113"))
+
+    # Assert: 3건째가 끝난 뒤 한 번만 멈춘다(메시지는 소비 루프가 삭제한 뒤 루프가 멈춘다)
+    assert stops == ["stop"]
+    assert [e["jobs"] for e in logs if e.get("event_type") == "ocr.worker.recycle"] == [3]
+
+
+def test_recycle_disabled_returns_handler_as_is() -> None:
+    # Arrange
+    async def handler(job: OcrJob) -> None:
+        return None
+
+    # Act / Assert: None이면 감싸지 않는다(기존 동작 그대로)
+    assert ocr_main._with_recycle(handler, max_jobs=None, stop=lambda: None) is handler
+
+
+async def test_run_wires_recycle_to_consumer_stop(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Arrange: 2건마다 재활용. 소비자 대역이 받은 핸들러로 2건을 처리하면 stop()이 불려야 한다
+    recorder = _RunRecorder()
+    recorder.install(monkeypatch, Settings(_env_file=None, ocr_max_jobs_per_process=2))
+    stopped: list[bool] = []
+
+    class RecyclingConsumer:
+        def __init__(self, **kwargs: Any) -> None:
+            self._handler = kwargs["handler"]
+
+        def stop(self) -> None:
+            stopped.append(True)
+
+        async def run(self) -> None:
+            await self._handler(_job("11111111-1111-1111-1111-111111111111"))
+            await self._handler(_job("11111111-1111-1111-1111-111111111112"))
+
+    monkeypatch.setattr(ocr_main, "SqsConsumer", RecyclingConsumer)
+    monkeypatch.setattr(ocr_main, "_release_memory", lambda: None)
+
+    # Act
+    async with asyncio.timeout(_TIMEOUT_S):
+        await ocr_main._run()
+
+    # Assert: 기준 건수에서 소비자를 멈췄고, 종료 정리(삭제 흡수·VLM 클라이언트)는 그대로 돈다
+    assert stopped == [True]
+    assert recorder.events[-3:] == ["wait_for_pending_deletes", "close_vlm_client", "db_pool_close"]
+
+
+def test_ner_batch_and_recycle_defaults() -> None:
+    # Arrange / Act
+    settings = Settings(_env_file=None)
+
+    # Assert: M2 기본값 — NER 배치 4, 10건마다 재활용
+    assert settings.ner_batch_size == 4
+    assert settings.ocr_max_jobs_per_process == 10

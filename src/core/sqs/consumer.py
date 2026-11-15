@@ -110,6 +110,14 @@ class SqsConsumer[T: BaseModel]:
         finally:
             logger.info("sqs consumer stopped", queue=queue_name(self._queue_url))
 
+    def stop(self) -> None:
+        """소비를 멈춘다. 처리 중인 메시지는 끝까지 처리하고 삭제(ack)한 뒤 ``run``이 돌아온다.
+
+        종료 신호(SIGTERM)와 같은 경로다. 워커가 스스로 물러날 때(예: OCR 워커의 프로세스 재활용)
+        쓴다 — 같은 배치에서 아직 처리하지 않은 메시지는 삭제하지 않아 재전달된다(멱등 안전).
+        """
+        self._stopping.set()
+
     def _sqs(self) -> Any:
         """캐시된 boto3 SQS 클라이언트를 반환한다(첫 접근 시 lazy 생성).
 
