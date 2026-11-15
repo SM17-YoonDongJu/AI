@@ -477,3 +477,31 @@ async def test_poison_and_invalid_messages_emit_no_finished_event() -> None:
 
     # Assert
     assert [e for e in logs if e["event"] == "sqs.message.finished"] == []
+
+
+async def test_stop_from_handler_acks_current_message_and_leaves_rest() -> None:
+    # Arrange: 같은 배치에 2건. 첫 메시지 처리 중에 워커가 스스로 멈춘다(프로세스 재활용)
+    handled: list[int] = []
+    client = FakeSqsClient(
+        batches=[
+            [
+                _message('{"job_id": "j1", "value": 1}', handle="rh-1", msg_id="m-1"),
+                _message('{"job_id": "j2", "value": 2}', handle="rh-2", msg_id="m-2"),
+            ]
+        ]
+    )
+    consumer: SqsConsumer[_Job]
+
+    async def handler(job: _Job) -> None:
+        handled.append(job.value)
+        consumer.stop()
+
+    consumer = _consumer(handler, client=client)
+
+    # Act
+    async with asyncio.timeout(5):
+        await consumer.run()
+
+    # Assert: 처리 중이던 메시지는 끝까지 처리·삭제했고, 남은 메시지는 건드리지 않아 재전달된다
+    assert handled == [1]
+    assert client.deleted == ["rh-1"]

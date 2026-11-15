@@ -165,6 +165,14 @@ class Settings(BaseSettings):
     # 문서별 최고 RSS 중앙값 4,119→3,919MiB(5% 감소)·최대 4,334→4,145MiB였고 시간·결과 지문은
     # 같았다. None이면 PaddleOCR 기본값(10).
     ocr_mkldnn_cache_capacity: int | None = Field(2, ge=1)
+    # 워커 프로세스 재활용(M2): 이 건수만큼 메시지를 처리하면 소비를 멈추고 정상 종료한다.
+    # 컨테이너가 다시 띄운다(prod compose restart: unless-stopped, k8s Deployment).
+    # 문서를 거듭할수록 반납 뒤 메모리와 최고점이 함께 올라, prod와 같은 t3.large(4608m)에서
+    # 가장 이른 OOM이 20건째였다(2026-11-14 최종 측정). 그 절반을 기본값으로 둔다.
+    # 반납 뒤 RSS만으로는 OOM을 미리 알 수 없어(21건째 OOM 직전에도 1.6GB 아래) 건수로 정한다.
+    # None이면 재활용하지 않는다. k8s는 10분 안에 거듭 종료되는 컨테이너의 재시작을 점점
+    # 늦추므로(최대 5분), 짧은 문서가 몰리는 환경이면 값을 키운다.
+    ocr_max_jobs_per_process: int | None = Field(10, ge=1)
     # 검출 입력의 긴 변 상한(픽셀, PaddleOCR text_det_limit_type="max"). 검출 메모리는 입력 화소
     # 수에 비례하는데 PaddleOCR 기본값은 긴 변 4000까지 줄이지 않는다 — 1200만 화소 폰 사진
     # (3024x4032)이 7GiB 제한에서 OOM으로 죽었다(합성 측정 2026-11-08, 운영도 4.5Gi에서 OOMKilled).
@@ -193,7 +201,10 @@ class Settings(BaseSettings):
     # NER 확률 임계값. 마스킹은 recall 우선이라 낮게; 과잉 마스킹 시 상향(노션 §2).
     ner_score_threshold: float = 0.5
     # NER 배치 크기(라인 수) — 파이프라인은 batch_size 없이 리스트를 받으면 1건씩 추론한다(O1).
-    ner_batch_size: int = Field(16, ge=1)
+    # 16이면 배치 추론 작업 메모리가 문서 최고점을 약 150~250MiB 올려, prod와 같은
+    # t3.large(4608m)에서 연속 처리 20건 안팎에 OOM으로 죽었다(M2, 2026-11-14 최종 측정).
+    # 1로 줄여도 분석 단계가 0.6초 느는 정도라 4로 둔다.
+    ner_batch_size: int = Field(4, ge=1)
 
     # --- AI 서빙 — 챗·임베딩 provider 스위치(env), 모델·엔드포인트도 env 주입 ---
     # 챗 기본값은 Claude(anthropic — 공식 SDK, ai_base_url 미사용, 키는 ai_api_key)다. 로컬 Ollama
