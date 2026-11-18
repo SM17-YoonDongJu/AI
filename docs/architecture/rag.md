@@ -307,16 +307,37 @@ def extract_content_tokens(query: str) -> list[str]:
 ```
 
 - `token.form`(화면에 보이는 그대로의 글자 = 표면형)만 취하고, `token.tag`(품사)가 `_CONTENT_POS_PREFIXES`로 **시작**하면 내용어로 채택한다(`str.startswith`가 튜플을 받아 OR 매칭). 예: `NNG`, `NNP`, `VV`, `SL` 등이 모두 통과.
-- Kiwi 인스턴스는 지연 생성 싱글턴이다. 처음 필요할 때 딱 한 번만 만들어 두고 재사용한다(초기화 비용 1회).
+- Kiwi 인스턴스는 **프로세스당 한 벌**만 만들어 공유하는 싱글턴이다. 한 벌이 최고 RSS 약 550~580MB로 report 파드 메모리에서 가장 큰 몫이다. 2026-11-18(#113)부터 생성을 **이중 확인 락**으로 묶었다. 보장·장해 줄기(R6)가 동시에 첫 검색에 들어오면서, 락 없는 지연 생성에서는 두 스레드가 모두 빈 `_kiwi`를 보고 각자 만들었다. 두 벌이 겹쳐 report 파드가 OOMKilled(limit 768Mi)됐다.
+  > 쉽게 말하면: 공용 복합기가 없는 걸 보고 두 사람이 동시에 각자 한 대씩 사 온 셈이다. 이제는 사러 가는 사람이 문에 "구매 중" 팻말(락)을 건다. 팻말 앞에서 기다린 사람은 들어와서 이미 있는지 한 번 더 확인한다.
+- 만들 때 문장 하나를 미리 분석해 둔다(워밍업). Kiwi는 첫 분석 때 지연 초기화(약 0.4초, 메모리 +125MB)를 한다. 이걸 생성과 같은 락 안에서 끝내야 다른 스레드가 준비가 덜 된 인스턴스를 받지 않는다. 생성할 때마다 `kiwi_loaded` 로그(`duration_ms`·`peak_rss_mb`)를 1건 남긴다. 그래서 로그 수가 곧 생성 횟수다.
+- report_worker는 기동할 때(SQS 소비 전) `preload_kiwi()`로 미리 만들어 둔다. 첫 작업이 생성 시간을 떠안지 않고, 메모리가 모자라면 메시지를 받기 전에 죽는다.
 
 ```python
-# src/rag/typo.py:49-54
+# src/rag/typo.py (2026-11-18 기준 발췌, docstring 생략)
+_kiwi: Kiwi | None = None
+_kiwi_lock = threading.Lock()
+
+
 def _get_kiwi() -> Kiwi:
-    """Kiwi 인스턴스를 지연 생성해 재사용한다(초기화 비용 1회)."""
     global _kiwi
-    if _kiwi is None:
-        _kiwi = Kiwi()
-    return _kiwi
+    if _kiwi is not None:  # 이미 있으면 락 없이 돌려준다(검색마다 락을 잡지 않는다)
+        return _kiwi
+    with _kiwi_lock:
+        if _kiwi is None:  # 락을 기다리는 사이 다른 스레드가 만들었으면 그것을 쓴다
+            _kiwi = _load_kiwi()
+        return _kiwi
+
+
+def _load_kiwi() -> Kiwi:
+    started = perf_counter()
+    kiwi = Kiwi()
+    kiwi.tokenize(_WARMUP_TEXT)  # 첫 분석의 지연 초기화까지 락 안에서 끝낸다
+    logger.info("kiwi_loaded", duration_ms=elapsed_ms(started), peak_rss_mb=_peak_rss_mb())
+    return kiwi
+
+
+def preload_kiwi() -> None:  # 워커 기동 때 asyncio.to_thread로 부른다
+    _get_kiwi()
 ```
 
 ### 3.4 정규 용어 치환
