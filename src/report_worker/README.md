@@ -9,8 +9,9 @@ uv sync --extra report               # langgraph·langchain-core·boto3
 uv run python -m report_worker       # uv 없이: PYTHONPATH=src python -m report_worker
 ```
 
-- 진입점 `__main__.py`: `configure_logging` → `init_pool` → `run_migrations(pool, "migrations/ai")` → `SqsConsumer(SQS_REPORT_JOB_QUEUE_URL, ReportJob, journaled_handler(pool), on_poison=_poison_journal(pool)).run()` → `close_pool`
+- 진입점 `__main__.py`: `configure_logging` → `init_pool` → `run_migrations(pool, "migrations/ai")` → `preload_kiwi()` → `SqsConsumer(SQS_REPORT_JOB_QUEUE_URL, ReportJob, journaled_handler(pool), on_poison=_poison_journal(pool)).run()` → `close_pool`
 - 소비·검증·ack·재전달·poison 스킵·우아한 종료는 `core.sqs.SqsConsumer`가 맡는다.
+- **소비 전에 Kiwi(형태소 분석기)를 한 벌 올린다**(`rag.preload_kiwi`, 1초 안팎, 최고 RSS 약 550~580MB). 보장·장해 줄기가 동시에 첫 검색에 들어가며 두 벌이 만들어져 파드가 OOMKilled된 적이 있다(#113). 생성 횟수는 `rag.typo`의 락이 1회로 묶고, 여기서는 그 1회를 첫 작업 전으로 당긴다. 기동 로그 `kiwi_loaded`(`duration_ms`·`peak_rss_mb`)가 파드당 1번 찍힌다.
 - **기동 때 `migrations/ai`를 적용한다**(ai_owner, OCR과 같은 디렉터리). GPU EC2의 `ocr_worker`가 꺼져 있어도 이 워커가 자기 테이블(`ai.report_job_failures`)을 보장하기 위해서다. 두 워커가 동시에 기동해도 `core.db.run_migrations`의 디렉터리별 advisory lock이 한 번에 하나만 적용한다. 디렉터리가 없거나 적용이 실패하면 기동하지 않는다. `core.*`(`reports` 등)는 backend Flyway가 관리한다.
 
 ## 처리 흐름 (`worker.journaled_handler` → `worker.handle_job`)
@@ -79,6 +80,7 @@ load_context → input_guardrail ─┬─▶ persist_blocked → END           
      결과를 버릴 채로 과금되지 않게 하기 위해서다. 다음 간선의 실패 단락이 그래프를 멈춘다.
    - 노드별 시간은 그대로 `node_trace`에 남고 `group`·`lane` 표식이 붙는다. 총 소요 시간(`total_ms`)은 묶음마다 가장
      긴 줄기만 더한 임계 경로다(`metrics.critical_path_ms`).
+   - 두 줄기가 동시에 검색해도 Kiwi는 한 벌뿐이다. 기동 때 미리 올리고, 생성은 `rag.typo`의 락이 1회로 묶는다(#113).
 4. `collect_metrics`는 LLM·DB 없이 리포트 수치와 신뢰도 등급을 계산한다(아래 "리포트 수치"). 실패해도 소프트 실패로 저장까지 간다.
 
 ### 실패 단락

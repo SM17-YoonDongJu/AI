@@ -768,7 +768,7 @@ async def test_poison_hook_failure_keeps_message_for_next_delivery() -> None:
 
 # ── (d) 기동 배선 ─────────────────────────────────────────────
 class _BootRecorder:
-    """``__main__.main``의 외부 의존(풀·마이그레이션·컨슈머) 대역. 호출 순서를 쌓는다."""
+    """``__main__.main``의 외부 의존(풀·마이그레이션·Kiwi·컨슈머) 대역. 호출 순서를 쌓는다."""
 
     def __init__(self, pool: _JournalPool, migration_error: Exception | None = None) -> None:
         self.pool = pool
@@ -791,6 +791,9 @@ class _BootRecorder:
     async def close_pool(self) -> None:
         self.events.append("close_pool")
 
+    def preload_kiwi(self) -> None:
+        self.events.append("preload_kiwi")  # 진짜는 1초 안팎·약 550MB — 순서만 본다
+
     def consumer(self, *args: Any, **kwargs: Any) -> SimpleNamespace:
         self.events.append("consumer")
         self.consumer_kwargs = {"args": args, **kwargs}
@@ -809,6 +812,7 @@ def _install_boot(monkeypatch: pytest.MonkeyPatch, recorder: _BootRecorder) -> N
     monkeypatch.setattr(report_main, "init_pool", recorder.init_pool)
     monkeypatch.setattr(report_main, "run_migrations", recorder.run_migrations)
     monkeypatch.setattr(report_main, "close_pool", recorder.close_pool)
+    monkeypatch.setattr(report_main, "preload_kiwi", recorder.preload_kiwi)
     monkeypatch.setattr(report_main, "SqsConsumer", recorder.consumer)
 
 
@@ -821,8 +825,16 @@ async def test_boot_applies_ai_migrations_before_consuming(monkeypatch: pytest.M
     # Act
     await report_main.main()
 
-    # Assert: 자기 스키마 디렉터리만(§14), 같은 풀로, 소비 전에 적용하고 끝에 풀을 닫는다
-    assert recorder.events == ["init_pool", "run_migrations", "consumer", "consume", "close_pool"]
+    # Assert: 자기 스키마 디렉터리만(§14), 같은 풀로, 소비 전에 적용하고 끝에 풀을 닫는다.
+    # Kiwi도 소비 전에 한 벌 올린다 — 두 줄기가 첫 검색에서 각자 만들면 OOMKilled였다(#113)
+    assert recorder.events == [
+        "init_pool",
+        "run_migrations",
+        "preload_kiwi",
+        "consumer",
+        "consume",
+        "close_pool",
+    ]
     assert recorder.migrations == [(recorder.pool, "migrations/ai")]
     assert (_REPO_ROOT / report_main._MIGRATIONS_DIR / _MIGRATION.name).is_file()
 

@@ -1,6 +1,6 @@
 # rag — Hybrid RAG 검색 파이프라인 (04)
 
-`report_worker`가 **함수 호출**로 쓰는 공용 모듈이다. 독립 서비스가 아니다. 공개 진입점은 `search()` 하나이고, 결과 모델(`Chunk`·`Citation`·`RagResult`)은 `core.contracts`가 단일 출처다.
+`report_worker`가 **함수 호출**로 쓰는 공용 모듈이다. 독립 서비스가 아니다. 공개 진입점은 `search()` 하나이고(워커 기동용 `preload_kiwi()`는 아래 "형태소 분석기"), 결과 모델(`Chunk`·`Citation`·`RagResult`)은 `core.contracts`가 단일 출처다.
 
 ## 사용
 
@@ -45,6 +45,13 @@ result.citations      # list[Citation] — clause_no(조항/사례 번호)·exhi
   - `openai_compat`(Ollama qwen3-embedding 등): 쿼리에 instruction 프리픽스(`_QUERY_INSTRUCT`)를 붙인다. 문서는 원문으로 색인한다.
 - 임베딩이 실패하면(`AiClientError`, 차원 불일치 포함) **키워드 검색만으로 degrade**한다. 경고 로그 `rag.embed.failed`에는 예외 타입만 남기고, 완료 로그(`rag.search.completed`)에 `degraded=True`를 남긴다. 검색 자체는 실패시키지 않는다.
 - **다른 모델로 폴백하지 않는다.** 색인 모델과 다른 모델로 쿼리를 임베딩하면 둘 다 1024d라 차원 검사는 통과하지만 벡터 공간이 달라 결과가 조용히 틀어진다. 그래서 예전의 BGE-M3 폴백을 없앴다.
+
+## 형태소 분석기(Kiwi) — 프로세스당 한 벌
+
+- 오타 보정(`typo.py`)이 쓰는 Kiwi는 프로세스당 **한 벌**만 만든다. 한 벌이 최고 RSS 약 550~580MB(kiwipiepy 0.23.2)로 report 파드 메모리에서 가장 큰 몫이다.
+- 생성은 이중 확인 락(`_get_kiwi`)이 1회로 묶는다. 토큰화가 `asyncio.to_thread`로 돌아서, 동시에 돈 검색(보장·장해 줄기, R6)이 함께 첫 생성에 들어오기 때문이다. 락이 없던 때는 두 벌이 만들어져 report 파드가 OOMKilled됐다(#113).
+- 만들 때 문장 하나를 분석해 첫 분석의 지연 초기화(약 0.4초, RSS +125MB)까지 락 안에서 끝낸다. 생성할 때마다 `kiwi_loaded`(`duration_ms`·`peak_rss_mb`)를 남긴다. 이 로그가 파드당 1번이어야 한다.
+- report 워커는 기동 때 SQS 소비 전에 `preload_kiwi()`를 스레드로 불러 미리 올린다(`report_worker/__main__.py`). 다른 진입점(스크립트 등)은 첫 검색 때 만든다.
 
 ## 임베딩 모델 전환 (⚠ 순서)
 

@@ -7,8 +7,15 @@
 init_pool()로 초기화한다.
 
 수명 순서(진입 시 자원 확보, 종료 시 역순 정리):
-  init_pool → run_migrations("migrations/ai") → SqsConsumer(journaled_handler, on_poison).run()
-  → close_pool
+  init_pool → run_migrations("migrations/ai") → preload_kiwi
+  → SqsConsumer(journaled_handler, on_poison).run() → close_pool
+
+Kiwi 선로딩: 검색(rag)의 오타 보정이 쓰는 형태소 분석기를 소비 전에 한 벌 올려 둔다. 한 벌이 최고
+RSS 약 550~580MB로 이 파드 메모리에서 가장 큰 몫이다. 보장·장해 줄기(R6)가 동시에 첫 검색에
+들어가면서 두 벌이 만들어져 OOMKilled가 났다(#113). 생성 횟수는 `rag.typo`의 락이 1회로 묶는다.
+여기서는 그 1회를 작업 전으로 당긴다 — 첫 작업이 생성 시간(1초 안팎)을 떠안지 않고, 메모리가
+모자라면 메시지를 받기 전에 죽는다. 마이그레이션 뒤에 두는 건 설정·DB 문제를 무거운 적재 전에
+드러내려는 것이다.
 
 마이그레이션: GPU EC2의 OCR 워커가 꺼져 있어도 report가 자기 테이블(`ai.report_job_failures`)을
 보장하도록 기동 때 `migrations/ai`를 적용한다(OCR과 같은 디렉터리 — 둘이 동시에 기동해도
@@ -31,6 +38,7 @@ from core.contracts import ReportJob
 from core.db import close_pool, init_pool, run_migrations
 from core.logging import configure_logging, get_logger
 from core.sqs import SqsConsumer
+from rag import preload_kiwi
 from report_worker.failure_journal import Executor, mark_report_failure_terminal
 from report_worker.worker import journaled_handler
 
@@ -66,6 +74,7 @@ async def main() -> None:
     try:
         applied = await run_migrations(pool, _MIGRATIONS_DIR)
         logger.info("migrations applied", files=applied)
+        await asyncio.to_thread(preload_kiwi)  # 소비 전에 한 벌만(#113, 모듈 docstring)
         consumer = SqsConsumer(
             settings.sqs_report_job_queue_url,
             ReportJob,
